@@ -250,17 +250,21 @@ def _trace_legacy_result(
 ) -> None:
     """Trace the legacy V1 rejection sampler used by older nightlies."""
     output_histories = getattr(sampling_metadata, "output_token_ids", None)
-    if output_histories is not None and all(
-        len(history) == 0 for history in output_histories
-    ):
-        # vLLM warms the rejection sampler with synthetic empty histories.
-        return
 
     target_logits = logits[metadata.target_logits_indices]
     target_candidates = _as_int_list(target_logits.argmax(dim=-1))
     drafts = _as_int_list(metadata.draft_token_ids)
     counts = [int(item) for item in metadata.num_draft_tokens]
     sampled_rows = _nested_int_lists(sampler_output.sampled_token_ids)
+
+    if (
+        drafts
+        and all(token == 0 for token in drafts)
+        and output_histories is not None
+        and all(len(history) == 0 for history in output_histories)
+    ):
+        # vLLM profiles the sampler using zero-filled synthetic draft tokens.
+        return
 
     offset = 0
     for index, num_drafts in enumerate(counts):

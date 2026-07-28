@@ -2,16 +2,16 @@
 
 这个仓库只做一件事：用 vLLM 启动 `Qwen/Qwen3.5-4B` 的 MTP，并在服务端终端逐轮打印：
 
-1. 上一轮目标模型提交的 token；
-2. MTP 草稿 token；
-3. 目标模型对每个草稿位置给出的验证 token；
-4. 接受、拒绝和最终提交结果。
+1. MTP 草稿 token；
+2. 目标模型对每个草稿位置生成的 token；
+3. 每个草稿 token 的接受或拒绝；
+4. 这一轮最终提交到输出序列的 token。
 
 Trace 代码不修改 vLLM，也不改变解码结果，只在 `temperature=0` 的最小示例中读取中间张量并打印。默认配置面向单张 RTX 4090。
 
 ## 1. 安装
 
-要求 Linux、Python 3.10–3.13、可用的 NVIDIA GPU，以及与当前 vLLM nightly 所带 CUDA 版本兼容的驱动。
+要求 Linux、Python 3.10–3.13 和可用的 NVIDIA GPU。仓库固定使用已经在 RTX 4090、NVIDIA 535.247 驱动上实测通过的 `vLLM 0.18.0`。
 
 ```bash
 git clone https://github.com/GladiolusZhang/ReMTP.git
@@ -25,10 +25,10 @@ cd ReMTP
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U uv
-uv pip install -U vllm \
-  --torch-backend=auto \
-  --extra-index-url https://wheels.vllm.ai/nightly
+uv pip install 'vllm==0.18.0' --torch-backend=auto
 ```
+
+不要在这台 535 驱动的机器上直接换成当前 x86 nightly：截至本仓库验证时，nightly wheel 使用 CUDA 13，启动后会报 `CUDA driver version is insufficient for CUDA runtime version`。
 
 ## 2. 单独下载模型
 
@@ -110,15 +110,10 @@ vllm serve ./models/Qwen3.5-4B \
   --max-model-len 4096 \
   --max-num-seqs 1 \
   --gpu-memory-utilization 0.82 \
+  --worker-cls remtp.worker.ReMTPWorker \
   --language-model-only \
   --enforce-eager \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
-```
-
-如果当前 nightly 不识别 `mtp`，改用 Qwen 模型卡中的旧名称：
-
-```bash
-MTP_METHOD=qwen3_next_mtp ./scripts/serve.sh
 ```
 
 只验证单步 MTP：
@@ -145,11 +140,10 @@ MODEL_PATH=/data/models/Qwen3.5-4B ./scripts/serve.sh
 
 ```text
 [ReMTP][round 001][request cmpl-...]
-  TARGET previous : 785("The")
-  MTP draft       : D0=3891(" future")  D1=315(" of")
-  TARGET verify   : T0=3891(" future")  T1=315(" of")  bonus=1492(" AI")
+  MTP draft       : D0=3891(' future')  D1=315(' of')
+  TARGET verify   : T0=3891(' future')  T1=315(' of')  bonus=1492(' AI')
   VERIFY          : D0==T0 ✓  D1==T1 ✓  -> accepted 2/2
-  COMMIT          : 3891(" future") 315(" of") 1492(" AI")
+  COMMIT          : 3891(' future') 315(' of') 1492(' AI')
 ```
 
 若第二个草稿不匹配：
@@ -165,11 +159,11 @@ MODEL_PATH=/data/models/Qwen3.5-4B ./scripts/serve.sh
 
 ## 5. 常见问题
 
-- 服务启动时报 MTP method 不支持：先尝试 `MTP_METHOD=qwen3_next_mtp`，仍失败则升级 nightly。
+- 服务启动时报 MTP method 不支持：确认安装的是仓库固定的 `vLLM 0.18.0`，并保持默认 `MTP_METHOD=mtp`。
 - 启动提示 `Local model not found`：先运行 `./scripts/download_model.sh`，或通过 `MODEL_PATH=/实际目录` 指定本地 snapshot。
-- CUDA/驱动报错：nightly 的 CUDA 构建会变化；先升级 NVIDIA 驱动，再重装 `.venv`。
+- CUDA/驱动报错：确认 `python -c 'import vllm; print(vllm.__version__)'` 输出 `0.18.0`；若不是，删除并重建 `.venv`。
 - 显存不足：保持 `--language-model-only`，再将 `GPU_MEMORY_UTILIZATION=0.75` 或 `MAX_MODEL_LEN=2048`。
-- 没有 Trace 日志：必须通过 `./scripts/serve.sh` 启动；该脚本会设置 `PYTHONPATH` 和 `REMTP_TRACE=1`，使 hook 进入 vLLM worker 子进程。
+- 没有 Trace 日志：必须通过 `./scripts/serve.sh` 启动；该脚本会加载 `remtp.worker.ReMTPWorker`，使只读 hook 进入实际执行 GPU 验证的 EngineCore 进程。
 
 完成一次可运行实验后，建议记录确切版本：
 
@@ -178,4 +172,4 @@ python -c 'import vllm; print(vllm.__version__)'
 uv pip freeze > environment.lock.txt
 ```
 
-nightly 接口会变化，论文实验应固定 vLLM wheel/commit、模型 revision 和启动参数。
+论文实验应固定 vLLM wheel/commit、模型 revision 和启动参数。
