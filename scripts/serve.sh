@@ -34,6 +34,7 @@ vllm serve "$MODEL_PATH" \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-seqs 1 \
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+  --worker-cls remtp.worker.ReMTPWorker \
   --language-model-only \
   --enforce-eager \
   --speculative-config \
