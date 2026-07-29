@@ -314,9 +314,10 @@ CASCADE_RULE=token_v3 CASCADE_ALPHA=0.5 \
 ./scripts/benchmark_spec_cascade.sh
 ```
 
-完整 `q` 的单次固定种子实验中，TokenV3 相对标准概率 MTP 的整体 decode
-吞吐为 `149.30 → 149.37 tok/s`（基本持平），平均接受长度为
-`2.519 → 2.564`，草稿接受率为 `75.97% → 78.18%`。完整机制说明见
+统一三方法、同一批 80 条样本的固定种子实验中，TokenV3 相对标准概率 MTP
+的整体 decode 吞吐为 `149.371 → 150.029 tok/s`（`+0.44%`，基本持平），
+平均接受长度为 `2.519 → 2.564`，草稿接受率为
+`75.97% → 78.18%`。完整机制说明见
 [docs/speculative_cascade_mtp.md](docs/speculative_cascade_mtp.md)，逐任务结果和
 实验限制见
 [reports/spec_cascade_mtp_specbench_t0.7.md](reports/spec_cascade_mtp_specbench_t0.7.md)。
@@ -346,12 +347,22 @@ CACTUS_DELTA=1.0 MTP_TOKENS=2 ./scripts/serve_cactus_mtp.sh
 CACTUS_DELTA=1.0 ./scripts/benchmark_cactus_mtp.sh
 ```
 
-相同 80 条样本的配对实验中，Cactus 相对标准概率 MTP 的整体 decode
-吞吐为 `149.205 → 164.110 tok/s`（`+9.99%`），e2e 吞吐为
-`136.879 → 149.463 tok/s`（`+9.19%`），平均接受长度为
-`2.508 → 2.780`。机制和适配说明见
+统一三方法、同一批 80 条样本的固定种子实验中，Cactus 相对标准概率 MTP
+的整体 decode 吞吐为 `149.371 → 163.999 tok/s`（`+9.79%`），e2e
+吞吐为 `128.957 → 139.747 tok/s`（`+8.37%`），平均接受长度为
+`2.519 → 2.784`。机制和适配说明见
 [docs/cactus_mtp.md](docs/cactus_mtp.md)，逐任务结果和实验限制见
 [reports/cactus_mtp_specbench_t0.7.md](reports/cactus_mtp_specbench_t0.7.md)。
+
+三种方法的统一协议对比表见
+[reports/three_way_mtp_specbench_t0.7.md](reports/three_way_mtp_specbench_t0.7.md)。
+当前总体结果如下：
+
+| 方法 | decode tok/s | e2e tok/s | 平均接受长度 | 草稿接受率 |
+|---|---:|---:|---:|---:|
+| 标准概率 MTP | 149.371 | 128.957 | 2.519 | 75.97% |
+| SpecCascade [TokenV3] | 150.029 | 129.174 | 2.564 | 78.18% |
+| Cactus + MTP | **163.999** | **139.747** | **2.784** | **89.18%** |
 
 完成一次可运行实验后，建议记录确切版本：
 
