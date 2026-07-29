@@ -2,6 +2,9 @@
 set -euo pipefail
 
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.5-4B}"
+TEMPERATURE="${TEMPERATURE:-0}"
+SEED="${SEED:-42}"
+MAX_TOKENS="${MAX_TOKENS:-64}"
 
 curl --fail-with-body --silent --show-error \
   http://localhost:8000/v1/chat/completions \
@@ -18,8 +21,9 @@ curl --fail-with-body --silent --show-error \
   "chat_template_kwargs": {
     "enable_thinking": false
   },
-  "temperature": 0,
-  "max_tokens": 64
+  "temperature": ${TEMPERATURE},
+  "seed": ${SEED},
+  "max_tokens": ${MAX_TOKENS}
 }
 JSON
 printf '\n'
