@@ -22,6 +22,7 @@ _EAGLE_MODULE = "vllm.v1.spec_decode.eagle"
 _REJECTION_MODULE = "vllm.v1.sample.rejection_sampler"
 _LAST_DRAFT_PROBS: torch.Tensor | None = None
 _LAST_DRAFT_TOKEN_IDS: torch.Tensor | None = None
+_LAST_GENERATOR_ROWS: tuple[int, ...] = ()
 _PROPOSAL_COUNT = 0
 _DIAGNOSTIC_EMITTED = False
 
@@ -79,6 +80,8 @@ def _sample_from_full_mtp_distribution(
     self: Any,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
+    global _LAST_GENERATOR_ROWS
+
     original = getattr(
         _sample_from_full_mtp_distribution,
         "_remtp_original",
@@ -112,6 +115,7 @@ def _sample_from_full_mtp_distribution(
         temperatures,
         sampling_metadata.generators,
     )
+    _LAST_GENERATOR_ROWS = tuple(sorted(sampling_metadata.generators))
     self._remtp_current_draft_probs.append(probs.contiguous())
     return sampled
 
@@ -204,6 +208,7 @@ def _forward_with_mtp_probs(
             print(
                 "[ReMTP][ProbMTP][diagnostic] "
                 f"full_q=1 ids_match={ids_match} "
+                f"seeded_rows={list(_LAST_GENERATOR_ROWS)} "
                 f"draft_ids={ids.tolist()} "
                 f"q(D)={q_at_draft.tolist()} "
                 f"max(q)={q_max.tolist()} "

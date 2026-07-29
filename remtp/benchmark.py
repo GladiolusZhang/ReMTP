@@ -392,7 +392,7 @@ def main() -> int:
             [{"role": "user", "content": str(warmup["turns"][0])}],
             args.temperature,
             args.generation_seed,
-            min(16, args.max_tokens),
+            min(32, args.max_tokens),
             args.timeout,
         )
 

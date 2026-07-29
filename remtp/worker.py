@@ -45,3 +45,15 @@ class SpecCascadeMTPWorker(Worker):
         install_probabilistic_mtp()
         install_speculative_cascade()
         return super().init_device(*args, **kwargs)
+
+
+class CactusMTPWorker(Worker):
+    """CUDA worker that installs Cactus over probabilistic MTP."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.cactus_mtp import install_cactus_mtp
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_cactus_mtp()
+        return super().init_device(*args, **kwargs)

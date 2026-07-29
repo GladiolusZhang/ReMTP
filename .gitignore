@@ -6,4 +6,5 @@ __pycache__/
 .pytest_cache/
 data/spec_bench/question.jsonl
 results/
+logs/
 参考论文/

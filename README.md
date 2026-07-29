@@ -321,6 +321,38 @@ CASCADE_RULE=token_v3 CASCADE_ALPHA=0.5 \
 实验限制见
 [reports/spec_cascade_mtp_specbench_t0.7.md](reports/spec_cascade_mtp_specbench_t0.7.md)。
 
+## 8. Cactus + 概率 MTP
+
+本分支还将 ICLR 2026 论文 *Cactus: Accelerating Auto-Regressive
+Decoding with Constrained Acceptance Speculative Sampling* 适配到完整概率
+MTP。对当前草稿 token `D`：
+
+```text
+gamma = min(p(D) + sqrt(2 delta p(D)(1-p(D))), 1)
+h(D) = gamma，其余 p(v) 按比例缩放
+接受率 = min(1, h(D) / q_mtp(D))
+拒绝恢复分布 = normalize(max(h - q_mtp, 0))
+```
+
+`delta=0` 精确恢复第 7 节的标准非松弛概率 MTP。论文在 Spec-Bench
+使用 `delta=1` 且不做任务级调参，本仓库也将其作为默认值。
+
+启动和测试：
+
+```bash
+CACTUS_DELTA=1.0 MTP_TOKENS=2 ./scripts/serve_cactus_mtp.sh
+
+# 另一个终端
+CACTUS_DELTA=1.0 ./scripts/benchmark_cactus_mtp.sh
+```
+
+相同 80 条样本的配对实验中，Cactus 相对标准概率 MTP 的整体 decode
+吞吐为 `149.205 → 164.110 tok/s`（`+9.99%`），e2e 吞吐为
+`136.879 → 149.463 tok/s`（`+9.19%`），平均接受长度为
+`2.508 → 2.780`。机制和适配说明见
+[docs/cactus_mtp.md](docs/cactus_mtp.md)，逐任务结果和实验限制见
+[reports/cactus_mtp_specbench_t0.7.md](reports/cactus_mtp_specbench_t0.7.md)。
+
 完成一次可运行实验后，建议记录确切版本：
 
 ```bash
