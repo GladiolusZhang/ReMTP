@@ -218,15 +218,17 @@ wc -l data/spec_bench/question.jsonl
 最后一条命令应显示 480 行。
 
 测速时不要使用逐轮 Trace，因为打印中间 tensor 会触发 GPU 到 CPU
-同步，也不要使用 `--enforce-eager`。先停止当前观察用服务，再在终端 1
-启动原生 vLLM MTP：
+同步。测速脚本保留 `torch.compile`，但会关闭当前软件栈中与 Qwen3.5 GDN
+不兼容的 CUDA Graph；它没有使用 `--enforce-eager`。先停止当前观察用
+服务，再在终端 1 启动原生 vLLM MTP：
 
 ```bash
 source .venv/bin/activate
 MTP_TOKENS=2 ./scripts/serve_benchmark.sh
 ```
 
-首次启动可能需要编译和 CUDA Graph 预热。看到服务监听 8000 端口后，
+首次启动需要完成 `torch.compile` 和 Triton kernel 预热。看到服务监听
+8000 端口后，
 在终端 2 运行：
 
 ```bash
@@ -267,6 +269,13 @@ MAX_TOKENS=128 MTP_TOKENS=2 \
 ```bash
 SPEC_BENCH_DATA=/data/spec_bench/question.jsonl \
 ./scripts/benchmark_specbench.sh
+```
+
+如需显式写出测速脚本的稳定编译配置：
+
+```bash
+REMTP_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}' \
+MTP_TOKENS=2 ./scripts/serve_benchmark.sh
 ```
 
 完成一次可运行实验后，建议记录确切版本：
