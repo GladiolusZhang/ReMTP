@@ -12,6 +12,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}"
 REMTP_TRACE="${REMTP_TRACE:-1}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
+REMTP_COMPILATION_CONFIG="${REMTP_COMPILATION_CONFIG:-}"
 
 if ! command -v vllm >/dev/null 2>&1; then
   echo "vllm is not installed. Run: ./scripts/install.sh" >&2
@@ -46,6 +47,10 @@ fi
 
 if [[ "$ENFORCE_EAGER" == "1" ]]; then
   vllm_args+=(--enforce-eager)
+fi
+
+if [[ -n "$REMTP_COMPILATION_CONFIG" ]]; then
+  vllm_args+=(--compilation-config "$REMTP_COMPILATION_CONFIG")
 fi
 
 echo "[ReMTP] model=$MODEL_PATH method=$MTP_METHOD draft_tokens=$MTP_TOKENS trace=$REMTP_TRACE eager=$ENFORCE_EAGER"
