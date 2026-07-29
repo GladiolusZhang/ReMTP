@@ -321,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mtp-tokens", type=int, default=2)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--run-name", default="native_mtp")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--skip-warmup", action="store_true")
@@ -362,7 +363,11 @@ def main() -> int:
     output_dir = args.output_dir
     if output_dir is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path("results") / f"spec_bench_mtp_t{args.temperature:g}_{stamp}"
+        safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", args.run_name)
+        output_dir = (
+            Path("results")
+            / f"spec_bench_{safe_run_name}_t{args.temperature:g}_{stamp}"
+        )
     output_dir.mkdir(parents=True, exist_ok=False)
 
     manifest = [
@@ -475,6 +480,7 @@ def main() -> int:
         "mtp_tokens": args.mtp_tokens,
         "base_url": base_url,
         "model": args.model,
+        "run_name": args.run_name,
     }
     with (output_dir / "requests.jsonl").open(
         "w",

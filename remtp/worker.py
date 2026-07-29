@@ -23,3 +23,13 @@ class ReMTPWorker(Worker):
         os.environ["REMTP_MODEL"] = self.model_config.tokenizer
         install_import_hook()
         return super().init_device(*args, **kwargs)
+
+
+class SpecCascadeMTPWorker(Worker):
+    """CUDA worker that installs speculative-cascade MTP verification."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.speculative_cascade import install_speculative_cascade
+
+        install_speculative_cascade()
+        return super().init_device(*args, **kwargs)

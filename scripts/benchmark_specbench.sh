@@ -13,4 +13,5 @@ python -m remtp.benchmark \
   --generation-seed "${SEED:-42}" \
   --max-tokens "${MAX_TOKENS:-128}" \
   --mtp-tokens "${MTP_TOKENS:-2}" \
+  --run-name "${RUN_NAME:-native_mtp}" \
   "$@"

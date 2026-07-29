@@ -278,6 +278,42 @@ REMTP_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}' \
 MTP_TOKENS=2 ./scripts/serve_benchmark.sh
 ```
 
+## 7. Speculative Cascade + MTP
+
+实验分支还实现了论文 *Faster Cascades via Speculative Decoding*
+的 TokenV3 机制，并继续使用 Qwen3.5 自带的 MTP 作为草稿器。
+
+当前 vLLM 0.18 的 Qwen3.5 hybrid runner 只向验证器提供 MTP argmax
+草稿 token，因此实现采用确定性提议 `q(D)=1`。对每个草稿 `D`：
+
+```text
+如果 p_unscaled(D) >= (1 - alpha) * max(p_unscaled)：
+    接受 MTP 草稿 D
+否则：
+    按目标模型 p 做标准验证和恢复采样
+```
+
+启动 TokenV3、`alpha=0.5` 的服务：
+
+```bash
+CASCADE_RULE=token_v3 CASCADE_ALPHA=0.5 \
+MTP_TOKENS=2 ./scripts/serve_spec_cascade.sh
+```
+
+在另一个终端运行与原生 MTP 完全相同的 Spec-Bench 子集：
+
+```bash
+CASCADE_RULE=token_v3 CASCADE_ALPHA=0.5 \
+./scripts/benchmark_spec_cascade.sh
+```
+
+本机单次固定种子实验中，整体 decode 吞吐从 `152.48` 提升到
+`165.48 tok/s`（`+8.53%`），平均接受长度从 `2.403` 提升到
+`2.637`。完整机制说明见
+[docs/speculative_cascade_mtp.md](docs/speculative_cascade_mtp.md)，逐任务结果和
+实验限制见
+[reports/spec_cascade_mtp_specbench_t0.7.md](reports/spec_cascade_mtp_specbench_t0.7.md)。
+
 完成一次可运行实验后，建议记录确切版本：
 
 ```bash
