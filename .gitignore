@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 data/spec_bench/question.jsonl
+data/gsm8k/test.jsonl
 results/
 logs/
 参考论文/

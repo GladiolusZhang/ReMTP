@@ -364,6 +364,50 @@ CACTUS_DELTA=1.0 ./scripts/benchmark_cactus_mtp.sh
 | SpecCascade [TokenV3] | 150.029 | 129.174 | 2.564 | 78.18% |
 | Cactus + MTP | **163.999** | **139.747** | **2.784** | **89.18%** |
 
+## 9. GSM8K 子集质量—效率评测
+
+下载 OpenAI 官方 GSM8K test split：
+
+```bash
+mkdir -p data/gsm8k
+curl -L \
+  https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl \
+  -o data/gsm8k/test.jsonl
+```
+
+启动任意一种服务后，在另一个终端运行对应入口：
+
+```bash
+# 标准概率 MTP
+./scripts/benchmark_gsm8k_probabilistic_mtp.sh
+
+# SpecCascade [TokenV3]
+./scripts/benchmark_gsm8k_spec_cascade.sh
+
+# Cactus
+./scripts/benchmark_gsm8k_cactus_mtp.sh
+```
+
+默认从 test split 固定抽样 100 条，使用 `temperature=0.7`、
+`MTP_TOKENS=2` 和 384-token 上限。可覆盖参数：
+
+```bash
+SAMPLES=200 SAMPLE_SEED=20260730 TEMPERATURE=0.7 \
+SEED=42 MAX_TOKENS=384 MTP_TOKENS=2 \
+./scripts/benchmark_gsm8k_probabilistic_mtp.sh
+```
+
+当前 100 条统一子集结果：
+
+| 方法 | 准确率 | decode tok/s | e2e tok/s | 平均接受长度 |
+|---|---:|---:|---:|---:|
+| 标准概率 MTP | **89.0%** | 151.222 | 144.663 | 2.548 |
+| SpecCascade [TokenV3] | 88.0% | 153.602 | 146.389 | 2.611 |
+| Cactus + MTP | 88.0% | **166.779** | **158.784** | **2.819** |
+
+完整协议、置信区间、截断率与配对质量检查见
+[reports/gsm8k_three_way_t0.7.md](reports/gsm8k_three_way_t0.7.md)。
+
 完成一次可运行实验后，建议记录确切版本：
 
 ```bash
