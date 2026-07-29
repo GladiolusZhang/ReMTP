@@ -7,7 +7,7 @@
 3. 每个草稿 token 的接受或拒绝；
 4. 这一轮最终提交到输出序列的 token。
 
-Trace 代码不修改 vLLM，也不改变解码结果，只在 `temperature=0` 的最小示例中读取中间张量并打印。默认配置面向单张 RTX 4090。
+Trace 代码不修改 vLLM，也不改变解码结果，可观察贪心和非贪心验证。默认配置面向单张 RTX 4090。
 
 ## 1. 安装
 
@@ -187,6 +187,87 @@ TEMPERATURE=0.8 SEED=42 ./scripts/request.sh
 - CUDA/驱动报错：确认 `python -c 'import vllm; print(vllm.__version__)'` 输出 `0.18.0`；若不是，删除并重建 `.venv`。
 - 显存不足：保持 `--language-model-only`，再将 `GPU_MEMORY_UTILIZATION=0.75` 或 `MAX_MODEL_LEN=2048`。
 - 没有 Trace 日志：必须通过 `./scripts/serve.sh` 启动；该脚本会加载 `remtp.worker.ReMTPWorker`，使只读 hook 进入实际执行 GPU 验证的 EngineCore 进程。
+
+## 6. Spec-Bench 子集测速
+
+测试默认固定为：
+
+- `temperature=0.7`；
+- `MTP_TOKENS=2`；
+- `translation`、`summarization`、`math_reasoning`、`rag` 四个任务；
+- 每个任务用固定随机种子抽样 20 条，共 80 条；
+- 每条最多生成 128 tokens，单请求串行运行。
+
+数据集不包含在本仓库中。你只需自行把 Spec-Bench 官方
+`data/spec_bench/question.jsonl` 放到：
+
+```text
+data/spec_bench/question.jsonl
+```
+
+例如可自行执行：
+
+```bash
+mkdir -p data/spec_bench
+curl -L \
+  https://raw.githubusercontent.com/hemingkx/Spec-Bench/refs/heads/main/data/spec_bench/question.jsonl \
+  -o data/spec_bench/question.jsonl
+wc -l data/spec_bench/question.jsonl
+```
+
+最后一条命令应显示 480 行。
+
+测速时不要使用逐轮 Trace，因为打印中间 tensor 会触发 GPU 到 CPU
+同步，也不要使用 `--enforce-eager`。先停止当前观察用服务，再在终端 1
+启动原生 vLLM MTP：
+
+```bash
+source .venv/bin/activate
+MTP_TOKENS=2 ./scripts/serve_benchmark.sh
+```
+
+首次启动可能需要编译和 CUDA Graph 预热。看到服务监听 8000 端口后，
+在终端 2 运行：
+
+```bash
+./scripts/benchmark_specbench.sh
+```
+
+脚本会先做一次不计入结果的短预热，然后逐条请求。结果写到
+`results/spec_bench_mtp_t0.7_时间戳/`：
+
+```text
+summary.md             人类可读汇总
+summary.csv            每个任务及 overall 的表格
+summary.json           配置和完整汇总
+requests.jsonl         每个请求的输出、耗时和指标增量
+sample_manifest.json   实际抽到的 question_id
+```
+
+汇总同时报告三个核心指标：
+
+- `decode tok/s`：vLLM 生成 token 增量 ÷ 服务端 decode 时间增量，作为原生
+  MTP 解码吞吐；
+- `e2e output tok/s`：输出 token 数 ÷ 客户端墙钟时间，包含 prefill、调度和
+  HTTP 开销；
+- `mean acceptance length`：`1 + 接受的草稿 token 数 / MTP 验证轮数`。
+  其中 `1` 是每轮目标模型保证产生的 token，因此它的范围是
+  `[1, MTP_TOKENS + 1]`；当 `MTP_TOKENS=2` 时范围为 `[1, 3]`。
+
+常用覆盖参数：
+
+```bash
+SAMPLES_PER_TASK=20 TEMPERATURE=0.7 SEED=42 \
+MAX_TOKENS=128 MTP_TOKENS=2 \
+./scripts/benchmark_specbench.sh
+```
+
+如果数据放在其他位置：
+
+```bash
+SPEC_BENCH_DATA=/data/spec_bench/question.jsonl \
+./scripts/benchmark_specbench.sh
+```
 
 完成一次可运行实验后，建议记录确切版本：
 

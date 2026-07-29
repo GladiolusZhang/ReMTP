@@ -10,6 +10,8 @@ MTP_METHOD="${MTP_METHOD:-mtp}"
 MTP_TOKENS="${MTP_TOKENS:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}"
+REMTP_TRACE="${REMTP_TRACE:-1}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 
 if ! command -v vllm >/dev/null 2>&1; then
   echo "vllm is not installed. Run: ./scripts/install.sh" >&2
@@ -22,20 +24,30 @@ if ! python -m remtp.checkpoint "$MODEL_PATH"; then
   exit 1
 fi
 
-export REMTP_TRACE=1
 export REMTP_MODEL="$MODEL_PATH"
 
-echo "[ReMTP] model=$MODEL_PATH method=$MTP_METHOD draft_tokens=$MTP_TOKENS"
-
-vllm serve "$MODEL_PATH" \
-  --served-model-name "$SERVED_MODEL_NAME" \
-  --tensor-parallel-size 1 \
-  --dtype bfloat16 \
-  --max-model-len "$MAX_MODEL_LEN" \
-  --max-num-seqs 1 \
-  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-  --worker-cls remtp.worker.ReMTPWorker \
-  --language-model-only \
-  --enforce-eager \
-  --speculative-config \
+vllm_args=(
+  serve "$MODEL_PATH"
+  --served-model-name "$SERVED_MODEL_NAME"
+  --tensor-parallel-size 1
+  --dtype bfloat16
+  --max-model-len "$MAX_MODEL_LEN"
+  --max-num-seqs 1
+  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+  --language-model-only
+  --speculative-config
   "{\"method\":\"${MTP_METHOD}\",\"num_speculative_tokens\":${MTP_TOKENS}}"
+)
+
+if [[ "$REMTP_TRACE" == "1" ]]; then
+  export REMTP_TRACE
+  vllm_args+=(--worker-cls remtp.worker.ReMTPWorker)
+fi
+
+if [[ "$ENFORCE_EAGER" == "1" ]]; then
+  vllm_args+=(--enforce-eager)
+fi
+
+echo "[ReMTP] model=$MODEL_PATH method=$MTP_METHOD draft_tokens=$MTP_TOKENS trace=$REMTP_TRACE eager=$ENFORCE_EAGER"
+
+vllm "${vllm_args[@]}"
