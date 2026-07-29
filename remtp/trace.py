@@ -11,6 +11,7 @@ import importlib.abc
 import importlib.machinery
 import os
 import sys
+import threading
 from collections.abc import Sequence
 from types import ModuleType
 from typing import Any
@@ -48,6 +49,21 @@ def _nested_int_lists(value: Any) -> list[list[int]]:
     if hasattr(value, "tolist"):
         value = value.tolist()
     return [[int(item) for item in row] for row in value]
+
+
+def _as_float_list(value: Any) -> list[float]:
+    """Copy a small tensor/array/sequence to a plain list of floats."""
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "float"):
+        value = value.float()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    return [float(item) for item in value]
 
 
 def _get_tokenizer() -> Any | None:
@@ -149,6 +165,76 @@ def format_round(
     return "\n".join(lines)
 
 
+def format_stochastic_round(
+    round_number: int,
+    request_id: str,
+    draft_tokens: Sequence[int],
+    target_probabilities: Sequence[float],
+    draft_probabilities: Sequence[float],
+    uniform_probabilities: Sequence[float],
+    emitted_tokens: Sequence[int],
+    accepted_count: int,
+    recovery_token: int | None,
+    bonus_token: int | None,
+    deterministic_draft: bool,
+) -> str:
+    """Format one probabilistic speculative-verification round."""
+    draft_tokens = list(draft_tokens)
+    target_probabilities = list(target_probabilities)
+    draft_probabilities = list(draft_probabilities)
+    uniform_probabilities = list(uniform_probabilities)
+    emitted_tokens = list(emitted_tokens)
+
+    lines = [
+        f"[ReMTP][round {round_number:03d}]"
+        f"[request {request_id}][stochastic]"
+    ]
+    draft_text = "  ".join(
+        f"D{index}={token_label(token)}"
+        for index, token in enumerate(draft_tokens)
+    )
+    lines.append(f"  MTP draft       : {draft_text or '(none)'}")
+
+    target_text = "  ".join(
+        f"p(D{index})={probability:.4f}"
+        for index, probability in enumerate(target_probabilities)
+    )
+    lines.append(f"  TARGET verify   : {target_text or '(none)'}")
+
+    mismatch_seen = False
+    for index, (target_p, draft_q, uniform_u) in enumerate(
+        zip(
+            target_probabilities,
+            draft_probabilities,
+            uniform_probabilities,
+        )
+    ):
+        if mismatch_seen:
+            lines.append(f"  VERIFY D{index}       : skipped after rejection")
+            continue
+        alpha = min(1.0, target_p / draft_q) if draft_q > 0 else 0.0
+        accepted = index < accepted_count
+        decision = "ACCEPT ✓" if accepted else "REJECT ✗"
+        lines.append(
+            f"  VERIFY D{index}       : q={draft_q:.4f}  "
+            f"α=min(1,p/q)={alpha:.4f}  u={uniform_u:.4f}  "
+            f"-> {decision}"
+        )
+        mismatch_seen = not accepted
+
+    if deterministic_draft:
+        lines.append("  DRAFT q         : deterministic MTP proposal, q(Dk)=1")
+    if recovery_token is not None:
+        lines.append(f"  RECOVER         : {token_label(recovery_token)}")
+    if bonus_token is not None:
+        lines.append(f"  BONUS           : {token_label(bonus_token)}")
+    lines.append(
+        "  COMMIT          : "
+        + (" ".join(token_label(token) for token in emitted_tokens) or "(none)")
+    )
+    return "\n".join(lines)
+
+
 def _next_round() -> int | None:
     global _round_number, _limit_reported
     limit = max(0, int(os.getenv("REMTP_TRACE_MAX_ROUNDS", "64")))
@@ -184,6 +270,39 @@ def _emit_round(
             target_tokens,
             emitted_tokens,
             accepted_count,
+        ),
+        flush=True,
+    )
+
+
+def _emit_stochastic_round(
+    request_id: str,
+    draft_tokens: Sequence[int],
+    target_probabilities: Sequence[float],
+    draft_probabilities: Sequence[float],
+    uniform_probabilities: Sequence[float],
+    emitted_tokens: Sequence[int],
+    accepted_count: int,
+    recovery_token: int | None,
+    bonus_token: int | None,
+    deterministic_draft: bool,
+) -> None:
+    round_number = _next_round()
+    if round_number is None:
+        return
+    print(
+        format_stochastic_round(
+            round_number,
+            request_id,
+            draft_tokens,
+            target_probabilities,
+            draft_probabilities,
+            uniform_probabilities,
+            emitted_tokens,
+            accepted_count,
+            recovery_token,
+            bonus_token,
+            deterministic_draft,
         ),
         flush=True,
     )
@@ -242,20 +361,46 @@ def _patch_gpu_rejection_sampler(module: ModuleType) -> None:
     print(f"[ReMTP] tracing {_GPU_REJECTION_MODULE}", flush=True)
 
 
-def _trace_legacy_result(
-    metadata: Any,
-    logits: Any,
-    sampler_output: Any,
-    sampling_metadata: Any,
-) -> None:
-    """Trace the legacy V1 rejection sampler used by older nightlies."""
-    output_histories = getattr(sampling_metadata, "output_token_ids", None)
+def _is_greedy_request(sampling_metadata: Any, request_index: int) -> bool:
+    if bool(getattr(sampling_metadata, "all_greedy", False)):
+        return True
+    if bool(getattr(sampling_metadata, "all_random", False)):
+        return False
+    temperatures = _as_float_list(sampling_metadata.temperature)
+    return request_index >= len(temperatures) or temperatures[request_index] == 0.0
 
-    target_logits = logits[metadata.target_logits_indices]
+
+def _selected_probabilities(logits: Any, token_ids: Any) -> list[float]:
+    probabilities = logits.float().softmax(dim=-1)
+    selected = probabilities.gather(1, token_ids.long().view(-1, 1)).view(-1)
+    return _as_float_list(selected)
+
+
+def _selected_values(probabilities: Any, token_ids: Any) -> list[float]:
+    selected = probabilities.float().gather(
+        1,
+        token_ids.long().view(-1, 1),
+    ).view(-1)
+    return _as_float_list(selected)
+
+
+def _trace_legacy_rejection_result(
+    draft_token_ids: Any,
+    num_draft_tokens: Sequence[int],
+    draft_probs: Any,
+    target_logits: Any,
+    bonus_token_ids: Any,
+    sampling_metadata: Any,
+    output_token_ids: Any,
+    uniform_probs: Any | None,
+) -> None:
+    """Trace the exact inputs and outputs of vLLM's rejection sampler."""
+    output_histories = getattr(sampling_metadata, "output_token_ids", None)
     target_candidates = _as_int_list(target_logits.argmax(dim=-1))
-    drafts = _as_int_list(metadata.draft_token_ids)
-    counts = [int(item) for item in metadata.num_draft_tokens]
-    sampled_rows = _nested_int_lists(sampler_output.sampled_token_ids)
+    drafts = _as_int_list(draft_token_ids)
+    counts = [int(item) for item in num_draft_tokens]
+    sampled_rows = _nested_int_lists(output_token_ids)
+    bonuses = _as_int_list(bonus_token_ids.view(-1))
 
     if (
         drafts
@@ -266,63 +411,142 @@ def _trace_legacy_result(
         # vLLM profiles the sampler using zero-filled synthetic draft tokens.
         return
 
+    target_selected_probs: list[float] | None = None
+    draft_selected_probs: list[float] | None = None
+    uniforms: list[float] | None = None
+    if not bool(getattr(sampling_metadata, "all_greedy", False)):
+        target_selected_probs = _selected_probabilities(
+            target_logits,
+            draft_token_ids,
+        )
+        if draft_probs is None:
+            draft_selected_probs = [1.0] * len(drafts)
+        else:
+            draft_selected_probs = _selected_values(
+                draft_probs,
+                draft_token_ids,
+            )
+        if uniform_probs is not None:
+            uniforms = _as_float_list(uniform_probs)
+
     offset = 0
     for index, num_drafts in enumerate(counts):
         if num_drafts == 0:
             continue
         request_drafts = drafts[offset : offset + num_drafts]
-        request_targets = target_candidates[offset : offset + num_drafts]
-        offset += num_drafts
         emitted = [token for token in sampled_rows[index] if token >= 0]
-        accepted = max(0, min(num_drafts, len(emitted) - 1))
-        if accepted == num_drafts and emitted:
-            # The last emitted token is target-only when every draft is
-            # accepted. The legacy API does not expose its logits separately.
-            request_targets.append(emitted[-1])
-        previous = None
-        if output_histories is not None and index < len(output_histories):
-            history = output_histories[index]
-            if history:
-                previous = int(history[-1])
-        _emit_round(
-            str(index),
-            previous,
-            request_drafts,
-            request_targets,
-            emitted,
-            accepted,
-        )
+        if _is_greedy_request(sampling_metadata, index):
+            request_targets = target_candidates[offset : offset + num_drafts]
+            accepted = max(0, min(num_drafts, len(emitted) - 1))
+            if accepted == num_drafts and index < len(bonuses):
+                request_targets.append(bonuses[index])
+            previous = None
+            if output_histories is not None and index < len(output_histories):
+                history = output_histories[index]
+                if history:
+                    previous = int(history[-1])
+            _emit_round(
+                str(index),
+                previous,
+                request_drafts,
+                request_targets,
+                emitted,
+                accepted,
+            )
+        elif (
+            target_selected_probs is not None
+            and draft_selected_probs is not None
+            and uniforms is not None
+        ):
+            request_target_probs = target_selected_probs[
+                offset : offset + num_drafts
+            ]
+            request_draft_probs = draft_selected_probs[
+                offset : offset + num_drafts
+            ]
+            request_uniforms = uniforms[offset : offset + num_drafts]
+            # A rejection round emits the accepted prefix plus one recovered
+            # token; an all-accepted round emits every draft plus one bonus.
+            accepted = max(0, min(num_drafts, len(emitted) - 1))
+            recovery = emitted[accepted] if accepted < num_drafts else None
+            bonus = (
+                emitted[-1]
+                if accepted == num_drafts and len(emitted) > num_drafts
+                else None
+            )
+            _emit_stochastic_round(
+                str(index),
+                request_drafts,
+                request_target_probs,
+                request_draft_probs,
+                request_uniforms,
+                emitted,
+                accepted,
+                recovery,
+                bonus,
+                draft_probs is None,
+            )
+        offset += num_drafts
 
 
 def _patch_legacy_rejection_sampler(module: ModuleType) -> None:
-    rejection_sampler = getattr(module, "RejectionSampler", None)
-    if rejection_sampler is None or getattr(rejection_sampler, "_remtp_traced", False):
+    rejection_sample = getattr(module, "rejection_sample", None)
+    generate_uniform_probs = getattr(module, "generate_uniform_probs", None)
+    if (
+        rejection_sample is None
+        or generate_uniform_probs is None
+        or getattr(rejection_sample, "_remtp_traced", False)
+    ):
         return
 
-    original_forward = rejection_sampler.forward
+    trace_context = threading.local()
+    original_rejection_sample = rejection_sample
+    original_generate_uniform_probs = generate_uniform_probs
 
-    def traced_forward(
-        self: Any,
-        metadata: Any,
+    def traced_generate_uniform_probs(*args: Any, **kwargs: Any):
+        output = original_generate_uniform_probs(*args, **kwargs)
+        trace_context.uniform_probs = output
+        return output
+
+    def traced_rejection_sample(
+        draft_token_ids: Any,
+        num_draft_tokens: Sequence[int],
+        max_spec_len: int,
+        cu_num_draft_tokens: Any,
         draft_probs: Any,
-        logits: Any,
+        target_logits: Any,
+        bonus_token_ids: Any,
         sampling_metadata: Any,
     ):
-        output = original_forward(
-            self,
-            metadata,
+        trace_context.uniform_probs = None
+        output = original_rejection_sample(
+            draft_token_ids,
+            num_draft_tokens,
+            max_spec_len,
+            cu_num_draft_tokens,
             draft_probs,
-            logits,
+            target_logits,
+            bonus_token_ids,
             sampling_metadata,
         )
         try:
-            _trace_legacy_result(metadata, logits, output, sampling_metadata)
+            _trace_legacy_rejection_result(
+                draft_token_ids,
+                num_draft_tokens,
+                draft_probs,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+                output,
+                trace_context.uniform_probs,
+            )
         except Exception as exc:
             _report_trace_error(exc)
         return output
 
-    rejection_sampler.forward = traced_forward
-    rejection_sampler._remtp_traced = True
+    traced_rejection_sample._remtp_traced = True
+    module.generate_uniform_probs = traced_generate_uniform_probs
+    module.rejection_sample = traced_rejection_sample
     print(f"[ReMTP] tracing {_LEGACY_REJECTION_MODULE}", flush=True)
 
 

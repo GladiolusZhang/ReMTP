@@ -157,6 +157,29 @@ MODEL_PATH=/data/models/Qwen3.5-4B ./scripts/serve.sh
 
 为了让 `Dk==Tk` 的对照关系完全直观，示例请求固定使用 `temperature=0`，且不设置惩罚项、top-k 或 top-p。Trace 最多打印 64 轮，可通过 `REMTP_TRACE_MAX_ROUNDS=10` 调小。
 
+### 非贪心验证
+
+服务端启动方式不变。在终端 2 设置非零温度和固定随机种子：
+
+```bash
+TEMPERATURE=0.8 SEED=42 ./scripts/request.sh
+```
+
+终端 1 会直接显示概率接受过程：
+
+```text
+[ReMTP][round 001][request 0][stochastic]
+  MTP draft       : D0=1558(' model')  D1=1179(' then')
+  TARGET verify   : p(D0)=0.8000  p(D1)=0.3500
+  VERIFY D0       : q=1.0000  α=min(1,p/q)=0.8000  u=0.3000  -> ACCEPT ✓
+  VERIFY D1       : q=1.0000  α=min(1,p/q)=0.3500  u=0.6000  -> REJECT ✗
+  DRAFT q         : deterministic MTP proposal, q(Dk)=1
+  RECOVER         : 264(' can')
+  COMMIT          : 1558(' model') 264(' can')
+```
+
+其中 `p(Dk)` 是目标模型给草稿 token 的概率，`q(Dk)` 是草稿分布给它的概率，`α=min(1,p/q)` 是接受概率，`u` 是本轮均匀随机数。当前 vLLM 的 MTP proposer 固定取草稿 top-1，等价于确定性草稿分布，所以日志中的 `q(Dk)=1`。若 `u≤α` 就接受；首次拒绝后从残差分布采样 `RECOVER` 并停止验证后续草稿。两个草稿全接受时则显示并提交 `BONUS`。
+
 ## 5. 常见问题
 
 - 服务启动时报 MTP method 不支持：确认安装的是仓库固定的 `vLLM 0.18.0`，并保持默认 `MTP_METHOD=mtp`。
