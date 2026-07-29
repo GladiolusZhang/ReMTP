@@ -178,7 +178,7 @@ TEMPERATURE=0.8 SEED=42 ./scripts/request.sh
   COMMIT          : 1558(' model') 264(' can')
 ```
 
-其中 `p(Dk)` 是目标模型给草稿 token 的概率，`q(Dk)` 是草稿分布给它的概率，`α=min(1,p/q)` 是接受概率，`u` 是本轮均匀随机数。当前 vLLM 的 MTP proposer 固定取草稿 top-1，等价于确定性草稿分布，所以日志中的 `q(Dk)=1`。若 `u≤α` 就接受；首次拒绝后从残差分布采样 `RECOVER` 并停止验证后续草稿。两个草稿全接受时则显示并提交 `BONUS`。
+其中 `p(Dk)` 是目标模型给草稿 token 的概率，`q(Dk)` 是草稿分布给它的概率，`α=min(1,p/q)` 是接受概率，`u` 是本轮均匀随机数。原生 `serve.sh` 路径中的 vLLM MTP proposer 固定取草稿 top-1，等价于确定性草稿分布，所以日志中的 `q(Dk)=1`。若 `u≤α` 就接受；首次拒绝后从残差分布采样 `RECOVER` 并停止验证后续草稿。两个草稿全接受时则显示并提交 `BONUS`。需要完整 MTP 分布时使用第 7 节新增的概率 MTP 路径。
 
 ## 5. 常见问题
 
@@ -283,17 +283,24 @@ MTP_TOKENS=2 ./scripts/serve_benchmark.sh
 实验分支还实现了论文 *Faster Cascades via Speculative Decoding*
 的 TokenV3 机制，并继续使用 Qwen3.5 自带的 MTP 作为草稿器。
 
-当前 vLLM 0.18 的 Qwen3.5 hybrid runner 只向验证器提供 MTP argmax
-草稿 token，因此实现采用确定性提议 `q(D)=1`。对每个草稿 `D`：
+当前 vLLM 0.18 的 Qwen3.5 hybrid runner 默认只向验证器提供 MTP argmax
+草稿 token。本分支新增了完整分布适配：
 
 ```text
-如果 p_unscaled(D) >= (1 - alpha) * max(p_unscaled)：
-    接受 MTP 草稿 D
-否则：
-    按目标模型 p 做标准验证和恢复采样
+MTP logits -> q=softmax(logits/temperature) -> D~q
+标准 MTP：min(1, p(D)/q(D))
+TokenV3：先由完整 p、q 构造 π，再用 min(1, π(D)/q(D))
 ```
 
-启动 TokenV3、`alpha=0.5` 的服务：
+先测试完整 `q` 的标准概率 MTP：
+
+```bash
+MTP_TOKENS=2 ./scripts/serve_probabilistic_mtp.sh
+# 另一个终端
+./scripts/benchmark_probabilistic_mtp.sh
+```
+
+再启动 TokenV3、`alpha=0.5` 的服务：
 
 ```bash
 CASCADE_RULE=token_v3 CASCADE_ALPHA=0.5 \
@@ -307,9 +314,9 @@ CASCADE_RULE=token_v3 CASCADE_ALPHA=0.5 \
 ./scripts/benchmark_spec_cascade.sh
 ```
 
-本机单次固定种子实验中，整体 decode 吞吐从 `152.48` 提升到
-`165.48 tok/s`（`+8.53%`），平均接受长度从 `2.403` 提升到
-`2.637`。完整机制说明见
+完整 `q` 的单次固定种子实验中，TokenV3 相对标准概率 MTP 的整体 decode
+吞吐为 `149.30 → 149.37 tok/s`（基本持平），平均接受长度为
+`2.519 → 2.564`，草稿接受率为 `75.97% → 78.18%`。完整机制说明见
 [docs/speculative_cascade_mtp.md](docs/speculative_cascade_mtp.md)，逐任务结果和
 实验限制见
 [reports/spec_cascade_mtp_specbench_t0.7.md](reports/spec_cascade_mtp_specbench_t0.7.md)。

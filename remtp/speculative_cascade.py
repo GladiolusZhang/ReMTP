@@ -281,9 +281,10 @@ def _cascade_rejection_sample_v1(
 ) -> torch.Tensor:
     """Adapt the sampler used by Qwen3.5's hybrid-model runner.
 
-    vLLM 0.18's Qwen3.5 MTP proposer emits argmax tokens without the full
-    proposal distribution.  In that path q is the deterministic point mass at
-    each MTP token, matching vLLM's native ``NO_DRAFT_PROBS`` convention.
+    ``SpecCascadeMTPWorker`` installs the probabilistic-MTP adapter first, so
+    every real stochastic request reaches this function with the complete
+    proposal distribution. The ``None`` branch below only preserves vLLM's
+    startup profiling and compatibility behavior.
     """
     global _DIAGNOSTIC_EMITTED
 
@@ -386,8 +387,8 @@ def _cascade_rejection_sample_v1(
             _DIAGNOSTIC_EMITTED = True
 
     # The upstream sampler applies softmax internally, so log(pi) supplies the
-    # desired target distribution. Keep draft_probs unchanged: None means the
-    # deterministic q(D)=1 proposal used by vLLM's MTP path.
+    # desired target distribution. For real benchmark requests draft_probs is
+    # the complete probabilistic-MTP q; the None case is startup/compatibility.
     cascade_logits = torch.log(cascade_probs.clamp_min(1e-30))
     return original(
         draft_token_ids,
