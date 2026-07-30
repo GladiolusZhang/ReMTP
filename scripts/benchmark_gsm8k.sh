@@ -5,13 +5,13 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$PROJECT_DIR/.venv/bin/activate"
 cd "$PROJECT_DIR"
 
-python -m remtp.benchmark \
-  --data "${SPEC_BENCH_DATA:-data/spec_bench/question.jsonl}" \
-  --tasks translation summarization math_reasoning rag \
-  --samples-per-task "${SAMPLES_PER_TASK:-20}" \
+python -m remtp.gsm8k_benchmark \
+  --data "${GSM8K_DATA:-data/gsm8k/test.jsonl}" \
+  --samples "${SAMPLES:-100}" \
+  --sample-seed "${SAMPLE_SEED:-20260730}" \
   --temperature "${TEMPERATURE:-0.7}" \
   --generation-seed "${SEED:-42}" \
-  --max-tokens "${MAX_TOKENS:-128}" \
+  --max-tokens "${MAX_TOKENS:-384}" \
   --mtp-tokens "${MTP_TOKENS:-2}" \
   --run-name "${RUN_NAME:-native_mtp}" \
   "$@"

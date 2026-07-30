@@ -178,7 +178,7 @@ TEMPERATURE=0.8 SEED=42 ./scripts/request.sh
   COMMIT          : 1558(' model') 264(' can')
 ```
 
-其中 `p(Dk)` 是目标模型给草稿 token 的概率，`q(Dk)` 是草稿分布给它的概率，`α=min(1,p/q)` 是接受概率，`u` 是本轮均匀随机数。当前 vLLM 的 MTP proposer 固定取草稿 top-1，等价于确定性草稿分布，所以日志中的 `q(Dk)=1`。若 `u≤α` 就接受；首次拒绝后从残差分布采样 `RECOVER` 并停止验证后续草稿。两个草稿全接受时则显示并提交 `BONUS`。
+其中 `p(Dk)` 是目标模型给草稿 token 的概率，`q(Dk)` 是草稿分布给它的概率，`α=min(1,p/q)` 是接受概率，`u` 是本轮均匀随机数。原生 `serve.sh` 路径中的 vLLM MTP proposer 固定取草稿 top-1，等价于确定性草稿分布，所以日志中的 `q(Dk)=1`。若 `u≤α` 就接受；首次拒绝后从残差分布采样 `RECOVER` 并停止验证后续草稿。两个草稿全接受时则显示并提交 `BONUS`。需要完整 MTP 分布时使用第 7 节新增的概率 MTP 路径。
 
 ## 5. 常见问题
 
@@ -277,6 +277,136 @@ SPEC_BENCH_DATA=/data/spec_bench/question.jsonl \
 REMTP_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}' \
 MTP_TOKENS=2 ./scripts/serve_benchmark.sh
 ```
+
+## 7. Speculative Cascade + MTP
+
+实验分支还实现了论文 *Faster Cascades via Speculative Decoding*
+的 TokenV3 机制，并继续使用 Qwen3.5 自带的 MTP 作为草稿器。
+
+当前 vLLM 0.18 的 Qwen3.5 hybrid runner 默认只向验证器提供 MTP argmax
+草稿 token。本分支新增了完整分布适配：
+
+```text
+MTP logits -> q=softmax(logits/temperature) -> D~q
+标准 MTP：min(1, p(D)/q(D))
+TokenV3：先由完整 p、q 构造 π，再用 min(1, π(D)/q(D))
+```
+
+先测试完整 `q` 的标准概率 MTP：
+
+```bash
+MTP_TOKENS=2 ./scripts/serve_probabilistic_mtp.sh
+# 另一个终端
+./scripts/benchmark_probabilistic_mtp.sh
+```
+
+再启动 TokenV3、`alpha=0.5` 的服务：
+
+```bash
+CASCADE_RULE=token_v3 CASCADE_ALPHA=0.5 \
+MTP_TOKENS=2 ./scripts/serve_spec_cascade.sh
+```
+
+在另一个终端运行与原生 MTP 完全相同的 Spec-Bench 子集：
+
+```bash
+CASCADE_RULE=token_v3 CASCADE_ALPHA=0.5 \
+./scripts/benchmark_spec_cascade.sh
+```
+
+统一三方法、同一批 80 条样本的固定种子实验中，TokenV3 相对标准概率 MTP
+的整体 decode 吞吐为 `149.371 → 150.029 tok/s`（`+0.44%`，基本持平），
+平均接受长度为 `2.519 → 2.564`，草稿接受率为
+`75.97% → 78.18%`。完整机制说明见
+[docs/speculative_cascade_mtp.md](docs/speculative_cascade_mtp.md)，逐任务结果和
+实验限制见
+[reports/spec_cascade_mtp_specbench_t0.7.md](reports/spec_cascade_mtp_specbench_t0.7.md)。
+
+## 8. Cactus + 概率 MTP
+
+本分支还将 ICLR 2026 论文 *Cactus: Accelerating Auto-Regressive
+Decoding with Constrained Acceptance Speculative Sampling* 适配到完整概率
+MTP。对当前草稿 token `D`：
+
+```text
+gamma = min(p(D) + sqrt(2 delta p(D)(1-p(D))), 1)
+h(D) = gamma，其余 p(v) 按比例缩放
+接受率 = min(1, h(D) / q_mtp(D))
+拒绝恢复分布 = normalize(max(h - q_mtp, 0))
+```
+
+`delta=0` 精确恢复第 7 节的标准非松弛概率 MTP。论文在 Spec-Bench
+使用 `delta=1` 且不做任务级调参，本仓库也将其作为默认值。
+
+启动和测试：
+
+```bash
+CACTUS_DELTA=1.0 MTP_TOKENS=2 ./scripts/serve_cactus_mtp.sh
+
+# 另一个终端
+CACTUS_DELTA=1.0 ./scripts/benchmark_cactus_mtp.sh
+```
+
+统一三方法、同一批 80 条样本的固定种子实验中，Cactus 相对标准概率 MTP
+的整体 decode 吞吐为 `149.371 → 163.999 tok/s`（`+9.79%`），e2e
+吞吐为 `128.957 → 139.747 tok/s`（`+8.37%`），平均接受长度为
+`2.519 → 2.784`。机制和适配说明见
+[docs/cactus_mtp.md](docs/cactus_mtp.md)，逐任务结果和实验限制见
+[reports/cactus_mtp_specbench_t0.7.md](reports/cactus_mtp_specbench_t0.7.md)。
+
+三种方法的统一协议对比表见
+[reports/three_way_mtp_specbench_t0.7.md](reports/three_way_mtp_specbench_t0.7.md)。
+当前总体结果如下：
+
+| 方法 | decode tok/s | e2e tok/s | 平均接受长度 | 草稿接受率 |
+|---|---:|---:|---:|---:|
+| 标准概率 MTP | 149.371 | 128.957 | 2.519 | 75.97% |
+| SpecCascade [TokenV3] | 150.029 | 129.174 | 2.564 | 78.18% |
+| Cactus + MTP | **163.999** | **139.747** | **2.784** | **89.18%** |
+
+## 9. GSM8K 子集质量—效率评测
+
+下载 OpenAI 官方 GSM8K test split：
+
+```bash
+mkdir -p data/gsm8k
+curl -L \
+  https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl \
+  -o data/gsm8k/test.jsonl
+```
+
+启动任意一种服务后，在另一个终端运行对应入口：
+
+```bash
+# 标准概率 MTP
+./scripts/benchmark_gsm8k_probabilistic_mtp.sh
+
+# SpecCascade [TokenV3]
+./scripts/benchmark_gsm8k_spec_cascade.sh
+
+# Cactus
+./scripts/benchmark_gsm8k_cactus_mtp.sh
+```
+
+默认从 test split 固定抽样 100 条，使用 `temperature=0.7`、
+`MTP_TOKENS=2` 和 384-token 上限。可覆盖参数：
+
+```bash
+SAMPLES=200 SAMPLE_SEED=20260730 TEMPERATURE=0.7 \
+SEED=42 MAX_TOKENS=384 MTP_TOKENS=2 \
+./scripts/benchmark_gsm8k_probabilistic_mtp.sh
+```
+
+当前 100 条统一子集结果：
+
+| 方法 | 准确率 | decode tok/s | e2e tok/s | 平均接受长度 |
+|---|---:|---:|---:|---:|
+| 标准概率 MTP | **89.0%** | 151.222 | 144.663 | 2.548 |
+| SpecCascade [TokenV3] | 88.0% | 153.602 | 146.389 | 2.611 |
+| Cactus + MTP | 88.0% | **166.779** | **158.784** | **2.819** |
+
+完整协议、置信区间、截断率与配对质量检查见
+[reports/gsm8k_three_way_t0.7.md](reports/gsm8k_three_way_t0.7.md)。
 
 完成一次可运行实验后，建议记录确切版本：
 

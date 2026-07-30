@@ -23,3 +23,37 @@ class ReMTPWorker(Worker):
         os.environ["REMTP_MODEL"] = self.model_config.tokenizer
         install_import_hook()
         return super().init_device(*args, **kwargs)
+
+
+class ProbabilisticMTPWorker(Worker):
+    """CUDA worker that samples MTP drafts from and exposes the full q."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        return super().init_device(*args, **kwargs)
+
+
+class SpecCascadeMTPWorker(Worker):
+    """CUDA worker that installs speculative-cascade MTP verification."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+        from remtp.speculative_cascade import install_speculative_cascade
+
+        install_probabilistic_mtp()
+        install_speculative_cascade()
+        return super().init_device(*args, **kwargs)
+
+
+class CactusMTPWorker(Worker):
+    """CUDA worker that installs Cactus over probabilistic MTP."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.cactus_mtp import install_cactus_mtp
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_cactus_mtp()
+        return super().init_device(*args, **kwargs)

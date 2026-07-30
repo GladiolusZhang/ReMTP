@@ -13,6 +13,8 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}"
 REMTP_TRACE="${REMTP_TRACE:-1}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 REMTP_COMPILATION_CONFIG="${REMTP_COMPILATION_CONFIG:-}"
+REMTP_WORKER_CLS="${REMTP_WORKER_CLS:-}"
+MTP_REJECTION_SAMPLE_METHOD="${MTP_REJECTION_SAMPLE_METHOD:-}"
 
 if ! command -v vllm >/dev/null 2>&1; then
   echo "vllm is not installed. Run: ./scripts/install.sh" >&2
@@ -27,6 +29,12 @@ fi
 
 export REMTP_MODEL="$MODEL_PATH"
 
+speculative_config="\"method\":\"${MTP_METHOD}\",\"num_speculative_tokens\":${MTP_TOKENS}"
+if [[ -n "$MTP_REJECTION_SAMPLE_METHOD" ]]; then
+  speculative_config+=",\"rejection_sample_method\":\"${MTP_REJECTION_SAMPLE_METHOD}\""
+fi
+speculative_config="{${speculative_config}}"
+
 vllm_args=(
   serve "$MODEL_PATH"
   --served-model-name "$SERVED_MODEL_NAME"
@@ -37,12 +45,15 @@ vllm_args=(
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --language-model-only
   --speculative-config
-  "{\"method\":\"${MTP_METHOD}\",\"num_speculative_tokens\":${MTP_TOKENS}}"
+  "$speculative_config"
 )
 
 if [[ "$REMTP_TRACE" == "1" ]]; then
   export REMTP_TRACE
-  vllm_args+=(--worker-cls remtp.worker.ReMTPWorker)
+  worker_cls="${REMTP_WORKER_CLS:-remtp.worker.ReMTPWorker}"
+  vllm_args+=(--worker-cls "$worker_cls")
+elif [[ -n "$REMTP_WORKER_CLS" ]]; then
+  vllm_args+=(--worker-cls "$REMTP_WORKER_CLS")
 fi
 
 if [[ "$ENFORCE_EAGER" == "1" ]]; then
@@ -53,6 +64,6 @@ if [[ -n "$REMTP_COMPILATION_CONFIG" ]]; then
   vllm_args+=(--compilation-config "$REMTP_COMPILATION_CONFIG")
 fi
 
-echo "[ReMTP] model=$MODEL_PATH method=$MTP_METHOD draft_tokens=$MTP_TOKENS trace=$REMTP_TRACE eager=$ENFORCE_EAGER"
+echo "[ReMTP] model=$MODEL_PATH method=$MTP_METHOD draft_tokens=$MTP_TOKENS trace=$REMTP_TRACE eager=$ENFORCE_EAGER rejection=${MTP_REJECTION_SAMPLE_METHOD:-default}"
 
 vllm "${vllm_args[@]}"
