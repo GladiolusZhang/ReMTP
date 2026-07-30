@@ -416,3 +416,43 @@ uv pip freeze > environment.lock.txt
 ```
 
 论文实验应固定 vLLM wheel/commit、模型 revision 和启动参数。
+
+## 10. Target-Anchored Exact-TV MTP（MTP=4）
+
+本分支用目标模型 margin、MTP head 可靠度和当前 hidden cosine 分配
+CACTUS 的块级 TV；未来位置仅能否决前部预算。实现不再计算词表级 JS、
+top-K 并集或 tail bucket。
+
+四路消融入口依次测试：
+
+```text
+CACTUS
+CACTUS + h(y) <= q(y)
+上述上限 + 精确 TV 块重分配 + head reliability
+上述方法 + 当前 hidden cosine + future target-support veto
+```
+
+一次运行相同的 200 条 GSM8K 样本：
+
+```bash
+SAMPLES=200 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=4 \
+./scripts/run_gsm8k_target_anchored_ablation.sh
+```
+
+只启动完整方法：
+
+```bash
+TARGET_ANCHORED_VARIANT=tv_hidden_veto \
+MTP_TOKENS=4 ./scripts/serve_target_anchored_mtp.sh
+```
+
+默认 head 先验为 `1.0,0.85,0.70,0.55`，可用
+`HEAD_RELIABILITY=a,b,c,d` 替换为校准集统计值。对一份独立校准集的
+标准概率 MTP=4 服务日志，可直接计算四个 head 的条件可靠度：
+
+```bash
+python -m remtp.head_reliability logs/calibration_server.log
+```
+
+实验输出仅写入本地 `results/` 和 `logs/`，这两个目录不会上传到
+GitHub。

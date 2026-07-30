@@ -7,10 +7,10 @@ cd "$PROJECT_DIR"
 
 usage() {
   cat <<'EOF'
-Run Cactus and three P/Q distribution MTP=4 ablations on one GPU.
+Run Cactus and three target-anchored MTP=4 ablations on one GPU.
 
 Usage:
-  ./scripts/run_gsm8k_block_feature_ablation.sh
+  ./scripts/run_gsm8k_target_anchored_ablation.sh
 
 Optional environment variables:
   SAMPLES=200                 Number of shared GSM8K samples
@@ -20,12 +20,13 @@ Optional environment variables:
   MAX_TOKENS=384              Per-answer token limit
   MTP_TOKENS=4                Must remain four for this method
   CACTUS_DELTA=1.0            Cactus per-position delta
-  BLOCK_DELTA_BUDGET=4.0      Total closed-form delta for one MTP=4 block
-  BLOCK_KL_BUDGET=4.0         Legacy alias for BLOCK_DELTA_BUDGET
-  BLOCK_DISTRIBUTION_TOP_K=8  Target top-K used by JS agreement
-  BLOCK_MIN_TARGET_PROBABILITY=0.001  Extreme-tail safety floor
-  BLOCK_COMPILE=1             Fuse the serving fast path with torch.compile
-  BLOCK_AUDIT_INTERVAL=0      Aggregate exact KL/TV every N rounds; 0 disables
+  HEAD_RELIABILITY=1,.85,.70,.55  Calibrated MTP-head prior
+  TARGET_LOG_GAP_SCALE=2.0    Target-margin soft support scale
+  MAX_TARGET_LOG_GAP=8.0      Single extreme-tail cutoff
+  FUTURE_VETO_FLOOR=0.20      Minimum multiplier from future veto
+  HIDDEN_RELIABILITY_FLOOR=.25 Minimum hidden multiplier
+  TARGET_ANCHORED_COMPILE=1   Fuse the scalar verifier path
+  TARGET_ANCHORED_AUDIT_INTERVAL=0  Print TV audit every N rounds
   PROGRESS_EVERY=10           Print one sample row every N requests
   SERVER_START_TIMEOUT=180    Startup timeout in seconds
   RUN_TAG=<timestamp>         Optional local output suffix
@@ -52,9 +53,12 @@ SEED="${SEED:-42}"
 MAX_TOKENS="${MAX_TOKENS:-384}"
 MTP_TOKENS="${MTP_TOKENS:-4}"
 CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
-BLOCK_DELTA_BUDGET="${BLOCK_DELTA_BUDGET:-${BLOCK_KL_BUDGET:-4.0}}"
-BLOCK_DISTRIBUTION_TOP_K="${BLOCK_DISTRIBUTION_TOP_K:-8}"
-BLOCK_AUDIT_INTERVAL="${BLOCK_AUDIT_INTERVAL:-0}"
+HEAD_RELIABILITY="${HEAD_RELIABILITY:-1.0,0.85,0.70,0.55}"
+TARGET_LOG_GAP_SCALE="${TARGET_LOG_GAP_SCALE:-2.0}"
+MAX_TARGET_LOG_GAP="${MAX_TARGET_LOG_GAP:-8.0}"
+FUTURE_VETO_FLOOR="${FUTURE_VETO_FLOOR:-0.20}"
+HIDDEN_RELIABILITY_FLOOR="${HIDDEN_RELIABILITY_FLOOR:-0.25}"
+TARGET_ANCHORED_AUDIT_INTERVAL="${TARGET_ANCHORED_AUDIT_INTERVAL:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
@@ -65,8 +69,8 @@ if [[ "$MTP_TOKENS" != "4" ]]; then
   exit 2
 fi
 
-RUN_ROOT="$PROJECT_DIR/results/gsm8k_block_feature_${RUN_TAG}"
-LOG_ROOT="$PROJECT_DIR/logs/gsm8k_block_feature_${RUN_TAG}"
+RUN_ROOT="$PROJECT_DIR/results/gsm8k_target_anchored_${RUN_TAG}"
+LOG_ROOT="$PROJECT_DIR/logs/gsm8k_target_anchored_${RUN_TAG}"
 server_pid=""
 
 cleanup_server() {
@@ -120,15 +124,15 @@ run_method() {
   local result_name="$2"
   local serve_script="$3"
   local benchmark_script="$4"
-  local variant="${5:-full}"
+  local variant="${5:-tv_hidden_veto}"
   local server_log="$LOG_ROOT/${result_name}_server.log"
   local benchmark_log="$LOG_ROOT/${result_name}_benchmark.log"
 
   echo
   echo "===== ${label} ====="
   echo "Starting server; log: $server_log"
-  BLOCK_FEATURE_VARIANT="$variant" \
-  BLOCK_AUDIT_INTERVAL="$BLOCK_AUDIT_INTERVAL" \
+  TARGET_ANCHORED_VARIANT="$variant" \
+  TARGET_ANCHORED_AUDIT_INTERVAL="$TARGET_ANCHORED_AUDIT_INTERVAL" \
   setsid "$serve_script" >"$server_log" 2>&1 &
   server_pid=$!
   wait_for_server "$server_log"
@@ -141,10 +145,13 @@ run_method() {
   MAX_TOKENS="$MAX_TOKENS" \
   MTP_TOKENS="$MTP_TOKENS" \
   CACTUS_DELTA="$CACTUS_DELTA" \
-  BLOCK_DELTA_BUDGET="$BLOCK_DELTA_BUDGET" \
-  BLOCK_DISTRIBUTION_TOP_K="$BLOCK_DISTRIBUTION_TOP_K" \
-  BLOCK_AUDIT_INTERVAL="$BLOCK_AUDIT_INTERVAL" \
-  BLOCK_FEATURE_VARIANT="$variant" \
+  HEAD_RELIABILITY="$HEAD_RELIABILITY" \
+  TARGET_LOG_GAP_SCALE="$TARGET_LOG_GAP_SCALE" \
+  MAX_TARGET_LOG_GAP="$MAX_TARGET_LOG_GAP" \
+  FUTURE_VETO_FLOOR="$FUTURE_VETO_FLOOR" \
+  HIDDEN_RELIABILITY_FLOOR="$HIDDEN_RELIABILITY_FLOOR" \
+  TARGET_ANCHORED_AUDIT_INTERVAL="$TARGET_ANCHORED_AUDIT_INTERVAL" \
+  TARGET_ANCHORED_VARIANT="$variant" \
   "$benchmark_script" \
     --base-url "$BASE_URL" \
     --output-dir "$RUN_ROOT/$result_name" \
@@ -166,13 +173,15 @@ fi
 mkdir -p "$LOG_ROOT"
 mkdir "$RUN_ROOT"
 
-export MTP_TOKENS CACTUS_DELTA BLOCK_DELTA_BUDGET
-export BLOCK_DISTRIBUTION_TOP_K
+export MTP_TOKENS CACTUS_DELTA HEAD_RELIABILITY
+export TARGET_LOG_GAP_SCALE MAX_TARGET_LOG_GAP
+export FUTURE_VETO_FLOOR HIDDEN_RELIABILITY_FLOOR
 
-echo "GSM8K block-feature ablation"
+echo "GSM8K target-anchored exact-TV ablation"
 echo "samples=$SAMPLES sample_seed=$SAMPLE_SEED temperature=$TEMPERATURE"
 echo "generation_seed=$SEED max_tokens=$MAX_TOKENS mtp_tokens=$MTP_TOKENS"
-echo "block_delta_budget=$BLOCK_DELTA_BUDGET top_k=$BLOCK_DISTRIBUTION_TOP_K"
+echo "cactus_delta=$CACTUS_DELTA head_reliability=$HEAD_RELIABILITY"
+echo "gap_scale=$TARGET_LOG_GAP_SCALE max_gap=$MAX_TARGET_LOG_GAP"
 echo "local_results=$RUN_ROOT"
 
 run_method \
@@ -182,24 +191,24 @@ run_method \
   "$PROJECT_DIR/scripts/benchmark_gsm8k_cactus_mtp.sh"
 
 run_method \
-  "Token support only" \
-  "token_only" \
-  "$PROJECT_DIR/scripts/serve_block_feature_mtp.sh" \
-  "$PROJECT_DIR/scripts/benchmark_gsm8k_block_feature_mtp.sh" \
-  "token_only"
+  "Cactus capped at q(y)" \
+  "cactus_cap" \
+  "$PROJECT_DIR/scripts/serve_target_anchored_mtp.sh" \
+  "$PROJECT_DIR/scripts/benchmark_gsm8k_target_anchored_mtp.sh" \
+  "cactus_cap"
 
 run_method \
-  "Token + current target-led JS" \
-  "distribution" \
-  "$PROJECT_DIR/scripts/serve_block_feature_mtp.sh" \
-  "$PROJECT_DIR/scripts/benchmark_gsm8k_block_feature_mtp.sh" \
-  "distribution"
+  "Exact-TV redistribution + head calibration" \
+  "tv_head" \
+  "$PROJECT_DIR/scripts/serve_target_anchored_mtp.sh" \
+  "$PROJECT_DIR/scripts/benchmark_gsm8k_target_anchored_mtp.sh" \
+  "tv_head"
 
 run_method \
-  "Token + current/future target-led JS" \
-  "full" \
-  "$PROJECT_DIR/scripts/serve_block_feature_mtp.sh" \
-  "$PROJECT_DIR/scripts/benchmark_gsm8k_block_feature_mtp.sh" \
-  "full"
+  "Exact-TV + head/hidden + future veto" \
+  "tv_hidden_veto" \
+  "$PROJECT_DIR/scripts/serve_target_anchored_mtp.sh" \
+  "$PROJECT_DIR/scripts/benchmark_gsm8k_target_anchored_mtp.sh" \
+  "tv_hidden_veto"
 
-python -m remtp.block_feature_compare "$RUN_ROOT"
+python -m remtp.target_anchored_compare "$RUN_ROOT"

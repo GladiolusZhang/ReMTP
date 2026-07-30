@@ -59,13 +59,17 @@ class CactusMTPWorker(Worker):
         return super().init_device(*args, **kwargs)
 
 
-class BlockFeatureMTPWorker(Worker):
-    """CUDA worker for block-aware, feature-consistent MTP verification."""
+class TargetAnchoredMTPWorker(Worker):
+    """CUDA worker for target-anchored exact-TV MTP verification."""
 
     def init_device(self, *args: Any, **kwargs: Any) -> Any:
-        from remtp.block_feature_mtp import install_block_feature_mtp
-        from remtp.probabilistic_mtp import install_probabilistic_mtp
+        from remtp.probabilistic_mtp import (
+            install_aligned_hidden_capture,
+            install_probabilistic_mtp,
+        )
+        from remtp.target_anchored_mtp import install_target_anchored_mtp
 
         install_probabilistic_mtp()
-        install_block_feature_mtp()
+        install_aligned_hidden_capture()
+        install_target_anchored_mtp()
         return super().init_device(*args, **kwargs)

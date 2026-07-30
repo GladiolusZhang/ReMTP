@@ -20,11 +20,15 @@ import torch
 
 _EAGLE_MODULE = "vllm.v1.spec_decode.eagle"
 _REJECTION_MODULE = "vllm.v1.sample.rejection_sampler"
+_GPU_RUNNER_MODULE = "vllm.v1.worker.gpu_model_runner"
 _LAST_DRAFT_PROBS: torch.Tensor | None = None
 _LAST_DRAFT_TOKEN_IDS: torch.Tensor | None = None
+_LAST_DRAFT_HIDDEN_STATES: torch.Tensor | None = None
+_LAST_TARGET_HIDDEN_STATES: torch.Tensor | None = None
 _LAST_GENERATOR_ROWS: tuple[int, ...] = ()
 _PROPOSAL_COUNT = 0
 _DIAGNOSTIC_EMITTED = False
+_CAPTURE_ALIGNED_HIDDEN_STATES = False
 
 
 def sample_mtp_logits(
@@ -117,6 +121,10 @@ def _sample_from_full_mtp_distribution(
     )
     _LAST_GENERATOR_ROWS = tuple(sorted(sampling_metadata.generators))
     self._remtp_current_draft_probs.append(probs.contiguous())
+    if _CAPTURE_ALIGNED_HIDDEN_STATES:
+        self._remtp_current_draft_hidden_states.append(
+            hidden_states.contiguous()
+        )
     return sampled
 
 
@@ -125,7 +133,8 @@ def _propose_with_full_distribution(
     *args: Any,
     **kwargs: Any,
 ) -> torch.Tensor:
-    global _LAST_DRAFT_PROBS, _LAST_DRAFT_TOKEN_IDS, _PROPOSAL_COUNT
+    global _LAST_DRAFT_HIDDEN_STATES, _LAST_DRAFT_PROBS
+    global _LAST_DRAFT_TOKEN_IDS, _PROPOSAL_COUNT
 
     original = getattr(
         _propose_with_full_distribution,
@@ -137,6 +146,8 @@ def _propose_with_full_distribution(
 
     self._remtp_sampling_metadata = sampling_metadata
     self._remtp_current_draft_probs = []
+    if _CAPTURE_ALIGNED_HIDDEN_STATES:
+        self._remtp_current_draft_hidden_states = []
     try:
         draft_token_ids = original(self, *args, **kwargs)
     finally:
@@ -160,8 +171,79 @@ def _propose_with_full_distribution(
 
     _LAST_DRAFT_PROBS = draft_probs.contiguous()
     _LAST_DRAFT_TOKEN_IDS = flattened_ids
+    if _CAPTURE_ALIGNED_HIDDEN_STATES:
+        collected_hidden_states = self._remtp_current_draft_hidden_states
+        del self._remtp_current_draft_hidden_states
+        if len(collected_hidden_states) != len(collected):
+            raise RuntimeError("MTP probability/hidden collection mismatch")
+        _LAST_DRAFT_HIDDEN_STATES = torch.cat(
+            collected_hidden_states,
+            dim=0,
+        ).contiguous()
     _PROPOSAL_COUNT += 1
     return draft_token_ids
+
+
+def _sample_tokens_with_target_hidden(
+    self: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Cache target hidden rows aligned with speculative verification logits."""
+    global _LAST_TARGET_HIDDEN_STATES
+
+    state = self.execute_model_state
+    _LAST_TARGET_HIDDEN_STATES = None
+    if state is not None and state.spec_decode_metadata is not None:
+        indices = state.spec_decode_metadata.target_logits_indices
+        _LAST_TARGET_HIDDEN_STATES = (
+            state.sample_hidden_states[indices].contiguous()
+        )
+
+    original = getattr(
+        _sample_tokens_with_target_hidden,
+        "_remtp_original",
+    )
+    return original(self, *args, **kwargs)
+
+
+def get_last_aligned_hidden_states(
+    expected_rows: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return MTP/target hidden rows when their block layouts are aligned."""
+    draft = _LAST_DRAFT_HIDDEN_STATES
+    target = _LAST_TARGET_HIDDEN_STATES
+    if draft is None or target is None:
+        return None, None
+    if draft.shape[0] < expected_rows or target.shape[0] < expected_rows:
+        return None, None
+    draft = draft[:expected_rows]
+    target = target[:expected_rows]
+    if draft.ndim != 2 or target.ndim != 2:
+        return None, None
+    if draft.shape != target.shape:
+        return None, None
+    return draft, target
+
+
+def install_aligned_hidden_capture() -> None:
+    """Enable hidden capture only for methods that actually consume it."""
+    global _CAPTURE_ALIGNED_HIDDEN_STATES
+
+    _CAPTURE_ALIGNED_HIDDEN_STATES = True
+    runner_module = importlib.import_module(_GPU_RUNNER_MODULE)
+    runner_cls = runner_module.GPUModelRunner
+    current_sample_tokens = runner_cls.sample_tokens
+    if not getattr(
+        current_sample_tokens,
+        "_remtp_target_hidden_cache",
+        False,
+    ):
+        _sample_tokens_with_target_hidden._remtp_target_hidden_cache = True
+        _sample_tokens_with_target_hidden._remtp_original = (
+            current_sample_tokens
+        )
+        runner_cls.sample_tokens = _sample_tokens_with_target_hidden
 
 
 def _forward_with_mtp_probs(

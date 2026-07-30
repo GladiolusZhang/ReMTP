@@ -1,4 +1,4 @@
-"""Compare local GSM8K outputs from the block-feature ablation runner."""
+"""Compare local GSM8K outputs from target-anchored TV ablations."""
 
 from __future__ import annotations
 
@@ -11,9 +11,12 @@ from typing import Any
 
 METHODS = (
     ("cactus", "Cactus + MTP"),
-    ("token_only", "Token support only"),
-    ("distribution", "Token + current target-led JS"),
-    ("full", "Token + current/future target-led JS"),
+    ("cactus_cap", "Cactus + h(y)<=q(y)"),
+    ("tv_head", "Exact-TV + head calibration"),
+    (
+        "tv_hidden_veto",
+        "Exact-TV + head/hidden + future veto",
+    ),
 )
 
 
@@ -66,7 +69,7 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
     lines = [
-        "# GSM8K block-feature ablation",
+        "# GSM8K target-anchored exact-TV ablation",
         "",
         "| method | accuracy | decode tok/s | e2e tok/s | "
         "mean acceptance length | draft acceptance |",
