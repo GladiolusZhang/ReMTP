@@ -231,6 +231,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default="native_mtp")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1,
+        help="print one progress row every N samples",
+    )
     parser.add_argument("--skip-warmup", action="store_true")
     return parser.parse_args()
 
@@ -245,8 +251,15 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    if args.samples <= 0 or args.max_tokens <= 0:
-        print("samples and max-tokens must be positive", file=sys.stderr)
+    if (
+        args.samples <= 0
+        or args.max_tokens <= 0
+        or args.progress_every <= 0
+    ):
+        print(
+            "samples, max-tokens, and progress-every must be positive",
+            file=sys.stderr,
+        )
         return 2
     if args.temperature <= 0:
         print("temperature must be > 0 for this stochastic benchmark", file=sys.stderr)
@@ -355,12 +368,17 @@ def main() -> int:
         }
         records.append(record)
         status = "✓" if correct else "✗"
-        print(
-            f"  [{sample_index:03d}/{len(selected):03d}] "
-            f"question={row['question_id']} "
-            f"output_tokens={record['output_tokens']} "
-            f"answer={predicted!s} gold={row['gold_answer']} {status}"
-        )
+        if (
+            sample_index == 1
+            or sample_index % args.progress_every == 0
+            or sample_index == len(selected)
+        ):
+            print(
+                f"  [{sample_index:03d}/{len(selected):03d}] "
+                f"question={row['question_id']} "
+                f"output_tokens={record['output_tokens']} "
+                f"answer={predicted!s} gold={row['gold_answer']} {status}"
+            )
 
     summary = add_accuracy(
         aggregate_records(records, "gsm8k", len(selected)),
@@ -378,6 +396,7 @@ def main() -> int:
         "base_url": base_url,
         "model": args.model,
         "run_name": args.run_name,
+        "progress_every": args.progress_every,
         "answer_metric": "normalized_numeric_exact_match",
         "answer_extraction": "####, then boxed, then last numeric token",
     }
