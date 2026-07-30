@@ -5,7 +5,7 @@ module uses that information to allocate one closed-form Cactus delta budget
 across the whole block instead of independently relaxing each token:
 
 * target top-k rank and target top-1 gap for the sampled draft token;
-* top-k overlap, aligned probability cosine, and JS similarity for q_d/p_d;
+* target-led top-k+candidate+tail JS similarity for q_d/p_d;
 * agreement at later positions in the sampled MTP block;
 * the number of later draft/bonus tokens unlocked by an accepted prefix.
 
@@ -27,6 +27,9 @@ import torch
 
 _V1_REJECTION_MODULE = "vllm.v1.sample.rejection_sampler"
 _DIAGNOSTIC_EMITTED = False
+_AUDIT_ROUND = 0
+_AUDIT_WINDOW: torch.Tensor | None = None
+_AUDIT_WINDOW_COUNT = 0
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -54,16 +57,17 @@ class BlockFeatureConfig:
     distribution_top_k: int = 8
     token_rank_scale: float = 4.0
     token_log_gap_scale: float = 2.0
-    overlap_weight: float = 0.4
-    probability_cosine_weight: float = 0.3
-    js_similarity_weight: float = 0.3
     token_signal_weight: float = 1.0
     current_distribution_weight: float = 1.0
     future_distribution_weight: float = 1.0
     reliability_power: float = 2.0
     min_reliability: float = 0.2
+    min_target_probability: float = 1e-3
     max_target_log_gap: float = 8.0
     min_prefix_reach_probability: float = 0.01
+    trust_token_reference: float = 0.25
+    trust_reliability_reference: float = 0.6
+    trust_acceptance_reference: float = 0.01
 
     def validate(self) -> None:
         if self.block_delta_budget < 0:
@@ -76,35 +80,33 @@ class BlockFeatureConfig:
             raise ValueError("distribution_top_k must be positive")
         if self.token_rank_scale <= 0 or self.token_log_gap_scale <= 0:
             raise ValueError("token support scales must be positive")
-        distribution_weights = (
-            self.overlap_weight,
-            self.probability_cosine_weight,
-            self.js_similarity_weight,
-        )
         signal_weights = (
             self.token_signal_weight,
             self.current_distribution_weight,
             self.future_distribution_weight,
         )
-        weights = distribution_weights + signal_weights
-        if any(weight < 0 for weight in weights):
+        if any(weight < 0 for weight in signal_weights):
             raise ValueError("signal weights must be non-negative")
-        if sum(distribution_weights) <= 0:
-            raise ValueError(
-                "at least one distribution-agreement weight must be positive"
-            )
         if self.token_signal_weight <= 0:
             raise ValueError("token_signal_weight must be positive")
         if self.reliability_power <= 0:
             raise ValueError("reliability_power must be positive")
         if not 0 <= self.min_reliability <= 1:
             raise ValueError("min_reliability must be in [0, 1]")
+        if not 0 <= self.min_target_probability < 1:
+            raise ValueError("min_target_probability must be in [0, 1)")
         if self.max_target_log_gap <= 0:
             raise ValueError("max_target_log_gap must be positive")
         if not 0 <= self.min_prefix_reach_probability <= 1:
             raise ValueError(
                 "min_prefix_reach_probability must be in [0, 1]"
             )
+        if self.trust_token_reference <= 0:
+            raise ValueError("trust_token_reference must be positive")
+        if self.trust_reliability_reference <= 0:
+            raise ValueError("trust_reliability_reference must be positive")
+        if not 0 < self.trust_acceptance_reference <= 1:
+            raise ValueError("trust_acceptance_reference must be in (0, 1]")
     @classmethod
     def from_env(cls) -> BlockFeatureConfig:
         delta_budget = os.getenv(
@@ -137,18 +139,6 @@ class BlockFeatureConfig:
             token_log_gap_scale=float(
                 os.getenv("REMTP_BLOCK_TOKEN_LOG_GAP_SCALE", "2.0")
             ),
-            overlap_weight=float(
-                os.getenv("REMTP_BLOCK_OVERLAP_WEIGHT", "0.4")
-            ),
-            probability_cosine_weight=float(
-                os.getenv("REMTP_BLOCK_PROBABILITY_COSINE_WEIGHT", "0.3")
-            ),
-            js_similarity_weight=float(
-                os.getenv(
-                    "REMTP_BLOCK_JS_WEIGHT",
-                    os.getenv("REMTP_BLOCK_ENTROPY_WEIGHT", "0.3"),
-                )
-            ),
             token_signal_weight=float(
                 os.getenv("REMTP_BLOCK_TOKEN_SIGNAL_WEIGHT", "1.0")
             ),
@@ -170,11 +160,29 @@ class BlockFeatureConfig:
             min_reliability=float(
                 os.getenv("REMTP_BLOCK_MIN_RELIABILITY", "0.2")
             ),
+            min_target_probability=float(
+                os.getenv("REMTP_BLOCK_MIN_TARGET_PROBABILITY", "0.001")
+            ),
             max_target_log_gap=float(
                 os.getenv("REMTP_BLOCK_MAX_TARGET_LOG_GAP", "8.0")
             ),
             min_prefix_reach_probability=float(
                 os.getenv("REMTP_BLOCK_MIN_PREFIX_REACH", "0.01")
+            ),
+            trust_token_reference=float(
+                os.getenv("REMTP_BLOCK_TRUST_TOKEN_REFERENCE", "0.25")
+            ),
+            trust_reliability_reference=float(
+                os.getenv(
+                    "REMTP_BLOCK_TRUST_RELIABILITY_REFERENCE",
+                    "0.6",
+                )
+            ),
+            trust_acceptance_reference=float(
+                os.getenv(
+                    "REMTP_BLOCK_TRUST_ACCEPTANCE_REFERENCE",
+                    "0.01",
+                )
             ),
         )
         config.validate()
@@ -191,9 +199,7 @@ class BlockFeatureResult:
     target_candidate_ranks: torch.Tensor
     target_candidate_log_gaps: torch.Tensor
     token_support: torch.Tensor
-    topk_overlap: torch.Tensor
-    topk_probability_cosine: torch.Tensor
-    topk_js_similarity: torch.Tensor
+    current_js_similarity: torch.Tensor
     current_distribution_consistency: torch.Tensor
     future_distribution_consistency: torch.Tensor
     reliability: torch.Tensor
@@ -203,8 +209,10 @@ class BlockFeatureResult:
     prefix_value: torch.Tensor
     priority: torch.Tensor
     delta_capacity: torch.Tensor
+    trusted_delta_capacity: torch.Tensor
     allocated_delta: torch.Tensor
-    realized_kl: torch.Tensor
+    realized_kl: torch.Tensor | None
+    realized_tv: torch.Tensor | None
 
 
 def bernoulli_kl(
@@ -225,41 +233,32 @@ def bernoulli_kl(
 
 
 @dataclass
-class DistributionAgreement:
+class TargetLedJSAgreement:
     target_top_ids: torch.Tensor
     target_top_probs: torch.Tensor
-    draft_top_ids: torch.Tensor
-    draft_top_probs: torch.Tensor
-    topk_overlap: torch.Tensor
-    probability_cosine: torch.Tensor
     js_similarity: torch.Tensor
-    combined: torch.Tensor
 
 
-def topk_distribution_agreement(
+def target_led_js_agreement(
     target_probs: torch.Tensor,
     draft_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
     top_k: int,
-    overlap_weight: float,
-    probability_cosine_weight: float,
-    js_similarity_weight: float,
-) -> DistributionAgreement:
-    """Compare MTP and target on their top-k union plus one tail bucket."""
+) -> TargetLedJSAgreement:
+    """Compare P/Q on target top-k, the candidate, and one tail bucket.
+
+    This target-led support needs only one top-k operation. If Q concentrates
+    on tokens outside target top-k, that mass appears in Q's tail bucket and
+    lowers JS similarity without separately computing Q top-k.
+    """
     if target_probs.shape != draft_probs.shape or target_probs.ndim != 2:
         raise ValueError("target_probs and draft_probs must share [rows, vocab]")
+    if draft_token_ids.ndim != 1:
+        raise ValueError("draft_token_ids must have shape [rows]")
+    if draft_token_ids.shape[0] != target_probs.shape[0]:
+        raise ValueError("draft token rows must match probability rows")
     if top_k < 1:
         raise ValueError("top_k must be positive")
-    weights = (
-        overlap_weight,
-        probability_cosine_weight,
-        js_similarity_weight,
-    )
-    if any(weight < 0 for weight in weights):
-        raise ValueError("distribution-agreement weights must be non-negative")
-    if sum(weights) <= 0:
-        raise ValueError(
-            "at least one distribution-agreement weight must be positive"
-        )
 
     k = min(top_k, target_probs.shape[-1])
     target_top_probs, target_top_ids = torch.topk(
@@ -268,41 +267,25 @@ def topk_distribution_agreement(
         dim=-1,
         sorted=True,
     )
-    draft_top_probs, draft_top_ids = torch.topk(
-        draft_probs,
-        k=k,
-        dim=-1,
-        sorted=True,
+    ids = draft_token_ids.to(
+        device=target_top_ids.device,
+        dtype=torch.int64,
     )
-
-    matches = (
-        target_top_ids.unsqueeze(2) == draft_top_ids.unsqueeze(1)
-    )
-    overlap = matches.any(dim=2).to(torch.float32).mean(dim=-1)
-
-    draft_is_new = ~matches.any(dim=1)
-    support_ids = torch.cat((target_top_ids, draft_top_ids), dim=-1)
+    candidate_is_new = ~(
+        target_top_ids == ids.unsqueeze(1)
+    ).any(dim=-1, keepdim=True)
+    support_ids = torch.cat((target_top_ids, ids.unsqueeze(1)), dim=-1)
     support_weights = torch.cat(
         (
             torch.ones_like(target_top_probs),
-            draft_is_new.to(target_top_probs.dtype),
+            candidate_is_new.to(target_top_probs.dtype),
         ),
         dim=-1,
     )
     target_vector = target_probs.gather(1, support_ids) * support_weights
     draft_vector = draft_probs.gather(1, support_ids) * support_weights
-    numerator = (target_vector * draft_vector).sum(dim=-1)
-    denominator = (
-        target_vector.square().sum(dim=-1).sqrt()
-        * draft_vector.square().sum(dim=-1).sqrt()
-    )
-    probability_cosine = (
-        numerator / denominator.clamp_min(1e-30)
-    ).clamp(0.0, 1.0)
 
-    # The union contains every unique P/Q top-k ID. One additional bucket
-    # preserves all probability mass outside that union, so JS still compares
-    # normalized distributions without a full-vocabulary log/reduction.
+    # One additional bucket preserves all mass outside the selected support.
     target_tail = (
         1.0 - target_vector.sum(dim=-1, keepdim=True)
     ).clamp_min(0.0)
@@ -336,26 +319,10 @@ def topk_distribution_agreement(
     js_similarity = (
         1.0 - js_divergence / 0.6931471805599453
     ).clamp(0.0, 1.0)
-
-    weight_sum = (
-        overlap_weight
-        + probability_cosine_weight
-        + js_similarity_weight
-    )
-    combined = (
-        overlap_weight * overlap
-        + probability_cosine_weight * probability_cosine
-        + js_similarity_weight * js_similarity
-    ) / weight_sum
-    return DistributionAgreement(
+    return TargetLedJSAgreement(
         target_top_ids=target_top_ids,
         target_top_probs=target_top_probs,
-        draft_top_ids=draft_top_ids,
-        draft_top_probs=draft_top_probs,
-        topk_overlap=overlap,
-        probability_cosine=probability_cosine,
         js_similarity=js_similarity,
-        combined=combined,
     )
 
 
@@ -477,6 +444,7 @@ def block_feature_distribution(
     *,
     assume_normalized: bool = False,
     construct_probs: bool = True,
+    compute_shift_metrics: bool = True,
 ) -> BlockFeatureResult:
     """Construct block-conditioned temporary verifier distributions."""
     config.validate()
@@ -519,20 +487,16 @@ def block_feature_distribution(
         or config.use_future_distribution
     )
     if needs_distribution:
-        agreement = topk_distribution_agreement(
+        agreement = target_led_js_agreement(
             target,
             draft,
+            ids,
             config.distribution_top_k,
-            config.overlap_weight,
-            config.probability_cosine_weight,
-            config.js_similarity_weight,
         )
         target_top_ids = agreement.target_top_ids
         target_top_probs = agreement.target_top_probs
-        topk_overlap = agreement.topk_overlap
-        topk_probability_cosine = agreement.probability_cosine
-        topk_js_similarity = agreement.js_similarity
-        current_distribution = agreement.combined
+        current_js_similarity = agreement.js_similarity
+        current_distribution = current_js_similarity
     else:
         topk_size = min(config.distribution_top_k, target.shape[-1])
         target_top_probs, target_top_ids = torch.topk(
@@ -541,9 +505,7 @@ def block_feature_distribution(
             dim=-1,
             sorted=True,
         )
-        topk_overlap = torch.zeros_like(target_candidate)
-        topk_probability_cosine = torch.zeros_like(target_candidate)
-        topk_js_similarity = torch.zeros_like(target_candidate)
+        current_js_similarity = torch.zeros_like(target_candidate)
         current_distribution = torch.zeros_like(target_candidate)
 
     candidate_matches = target_top_ids == ids.unsqueeze(1)
@@ -634,16 +596,21 @@ def block_feature_distribution(
         prefix_value = torch.ones_like(target_candidate)
 
     safe = (
-        (candidate_log_gaps <= config.max_target_log_gap)
+        (target_candidate >= config.min_target_probability)
+        & (candidate_log_gaps <= config.max_target_log_gap)
         & (reliability >= config.min_reliability)
     )
     if config.use_prefix_value:
         safe &= reach_probability >= config.min_prefix_reach_probability
 
+    rescue_opportunity = (
+        strict_acceptance.sqrt() * strict_rejection_probability
+    )
     priority = torch.where(
         safe,
-        strict_rejection_probability
+        rescue_opportunity
         * prefix_value
+        * token_support
         * reliability.pow(config.reliability_power),
         torch.zeros_like(strict_rejection_probability),
     )
@@ -665,8 +632,23 @@ def block_feature_distribution(
         delta_capacity,
         torch.zeros_like(delta_capacity),
     )
+    # A low-A candidate is more likely to be a genuine MTP error than a useful
+    # alternate expression. Restrict its maximum spend even when it is the only
+    # active position, so relative priority normalization cannot give it the
+    # whole block budget.
+    token_gate = (
+        token_support / config.trust_token_reference
+    ).clamp(0.0, 1.0)
+    reliability_gate = (
+        reliability / config.trust_reliability_reference
+    ).clamp(0.0, 1.0).pow(config.reliability_power)
+    acceptance_gate = (
+        strict_acceptance / config.trust_acceptance_reference
+    ).clamp(0.0, 1.0)
+    trust_gate = token_gate * reliability_gate * acceptance_gate
+    trusted_delta_capacity = delta_capacity * trust_gate
     allocated_delta = _allocate_capped_delta_fast(
-        delta_capacity,
+        trusted_delta_capacity,
         priority,
         config.block_delta_budget,
     )
@@ -691,7 +673,12 @@ def block_feature_distribution(
         relaxed = relaxed.clamp_min(0.0)
         relaxed /= relaxed.sum(dim=-1, keepdim=True).clamp_min(1e-30)
         realized_boosted = relaxed[rows, ids]
-    realized_kl = bernoulli_kl(realized_boosted, target_candidate)
+    if compute_shift_metrics:
+        realized_kl = bernoulli_kl(realized_boosted, target_candidate)
+        realized_tv = (realized_boosted - target_candidate).abs()
+    else:
+        realized_kl = None
+        realized_tv = None
     return BlockFeatureResult(
         probs=relaxed,
         safe=safe,
@@ -701,9 +688,7 @@ def block_feature_distribution(
         target_candidate_ranks=candidate_ranks,
         target_candidate_log_gaps=candidate_log_gaps,
         token_support=token_support,
-        topk_overlap=topk_overlap,
-        topk_probability_cosine=topk_probability_cosine,
-        topk_js_similarity=topk_js_similarity,
+        current_js_similarity=current_js_similarity,
         current_distribution_consistency=current_distribution,
         future_distribution_consistency=future_distribution,
         reliability=reliability,
@@ -713,8 +698,32 @@ def block_feature_distribution(
         prefix_value=prefix_value,
         priority=priority,
         delta_capacity=delta_capacity,
+        trusted_delta_capacity=trusted_delta_capacity,
         allocated_delta=allocated_delta,
         realized_kl=realized_kl,
+        realized_tv=realized_tv,
+    )
+
+
+def block_feature_candidate_probs(
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    config: BlockFeatureConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return only p(y) and h(y) for the compiled serving fast path."""
+    result = block_feature_distribution(
+        target_probs,
+        draft_probs,
+        draft_token_ids,
+        config,
+        assume_normalized=True,
+        construct_probs=False,
+        compute_shift_metrics=False,
+    )
+    return (
+        result.target_candidate_probs,
+        result.boosted_candidate_probs,
     )
 
 
@@ -738,9 +747,13 @@ def boost_candidate_logits(
     draft_token_ids: torch.Tensor,
     original_candidate_probs: torch.Tensor,
     boosted_candidate_probs: torch.Tensor,
+    *,
+    copy: bool = True,
 ) -> torch.Tensor:
     """Apply one-token boosts while preserving other-token logit gaps."""
-    logits = target_logits.to(torch.float32).clone()
+    logits = target_logits.to(torch.float32)
+    if copy:
+        logits = logits.clone()
     ids = draft_token_ids.to(device=logits.device, dtype=torch.int64)
     rows = torch.arange(logits.shape[0], device=logits.device)
     original = original_candidate_probs.clamp(1e-12, 1.0 - 1e-6)
@@ -760,6 +773,7 @@ def _block_feature_rejection_sample_v1(
     sampling_metadata: Any,
 ) -> torch.Tensor:
     """Replace p by a full-block-informed h before standard verification."""
+    global _AUDIT_ROUND, _AUDIT_WINDOW, _AUDIT_WINDOW_COUNT
     global _DIAGNOSTIC_EMITTED
 
     original = getattr(
@@ -786,6 +800,14 @@ def _block_feature_rejection_sample_v1(
         _block_feature_rejection_sample_v1,
         "_remtp_config",
     )
+    audit_interval = getattr(
+        _block_feature_rejection_sample_v1,
+        "_remtp_audit_interval",
+    )
+    diagnostics_enabled = getattr(
+        _block_feature_rejection_sample_v1,
+        "_remtp_diagnostics_enabled",
+    )
     if max_spec_len != config.expected_draft_tokens:
         raise RuntimeError(
             "BlockFeature MTP was configured for "
@@ -795,20 +817,44 @@ def _block_feature_rejection_sample_v1(
 
     logits = target_logits.to(torch.float32)
     target_probs = torch.softmax(logits, dim=-1)
-    result = block_feature_distribution(
-        target_probs,
-        draft_probs,
-        draft_token_ids,
-        config,
-        assume_normalized=True,
-        construct_probs=False,
+    need_details = (
+        audit_interval > 0
+        or (diagnostics_enabled and not _DIAGNOSTIC_EMITTED)
     )
+    result: BlockFeatureResult | None = None
+    if need_details:
+        result = block_feature_distribution(
+            target_probs,
+            draft_probs,
+            draft_token_ids,
+            config,
+            assume_normalized=True,
+            construct_probs=False,
+            compute_shift_metrics=True,
+        )
+        target_candidate_probs = result.target_candidate_probs
+        boosted_candidate_probs = result.boosted_candidate_probs
+    else:
+        fast_candidate_probs = getattr(
+            _block_feature_rejection_sample_v1,
+            "_remtp_fast_candidate_probs",
+        )
+        target_candidate_probs, boosted_candidate_probs = (
+            fast_candidate_probs(
+                target_probs,
+                draft_probs,
+                draft_token_ids,
+            )
+        )
 
     if (
-        not _DIAGNOSTIC_EMITTED
-        and os.getenv("REMTP_BLOCK_DIAGNOSTICS", "1") == "1"
-        and result.target_candidate_probs.sum().item() > 0
+        result is not None
+        and not _DIAGNOSTIC_EMITTED
+        and diagnostics_enabled
+        and result.allocated_delta.sum().item() > 0
     ):
+        assert result.realized_kl is not None
+        assert result.realized_tv is not None
         print(
             "[ReMTP][BlockFeature][diagnostic] "
             f"draft_ids={draft_token_ids.tolist()} "
@@ -819,9 +865,7 @@ def _block_feature_rejection_sample_v1(
             f"target_topk_rank={result.target_candidate_ranks.tolist()} "
             f"log_gap={result.target_candidate_log_gaps.tolist()} "
             f"token_support={result.token_support.tolist()} "
-            f"topk_overlap={result.topk_overlap.tolist()} "
-            f"prob_cos={result.topk_probability_cosine.tolist()} "
-            f"js_similarity={result.topk_js_similarity.tolist()} "
+            f"js_similarity={result.current_js_similarity.tolist()} "
             f"current_dist={result.current_distribution_consistency.tolist()} "
             f"future_dist={result.future_distribution_consistency.tolist()} "
             f"reliability={result.reliability.tolist()} "
@@ -829,21 +873,105 @@ def _block_feature_rejection_sample_v1(
             f"prefix_reach={result.prefix_reach_probability.tolist()} "
             f"prefix_value={result.prefix_value.tolist()} "
             f"priority={result.priority.tolist()} "
+            f"delta_cap={result.delta_capacity.tolist()} "
+            f"trusted_delta_cap={result.trusted_delta_capacity.tolist()} "
             f"delta_alloc={result.allocated_delta.tolist()} "
             f"KL_realized={result.realized_kl.tolist()} "
-            f"KL_total={result.realized_kl.sum().item():.6f}",
+            f"TV_realized={result.realized_tv.tolist()} "
+            f"KL_total={result.realized_kl.sum().item():.6f} "
+            f"TV_total={result.realized_tv.sum().item():.6f}",
             flush=True,
         )
         _DIAGNOSTIC_EMITTED = True
 
+    if audit_interval > 0:
+        assert result is not None
+        assert result.realized_kl is not None
+        assert result.realized_tv is not None
+        _AUDIT_ROUND += 1
+        _AUDIT_WINDOW_COUNT += 1
+        budgeted = result.allocated_delta > 0
+        low_target = result.target_candidate_probs < 1e-3
+        low_target_delta = torch.where(
+            budgeted & low_target,
+            result.allocated_delta,
+            torch.zeros_like(result.allocated_delta),
+        ).sum()
+        total_delta = result.allocated_delta.sum()
+        total_kl = result.realized_kl.sum()
+        total_tv = result.realized_tv.sum()
+        min_budgeted_p = torch.where(
+            budgeted,
+            result.target_candidate_probs,
+            torch.ones_like(result.target_candidate_probs),
+        ).min()
+        max_budgeted_gap = torch.where(
+            budgeted,
+            result.target_candidate_log_gaps,
+            torch.zeros_like(result.target_candidate_log_gaps),
+        ).max()
+        round_audit = torch.stack(
+            (
+                total_delta,
+                total_kl,
+                total_tv,
+                low_target_delta,
+                min_budgeted_p,
+                max_budgeted_gap,
+                total_kl,
+                total_tv,
+            )
+        )
+        if _AUDIT_WINDOW is None:
+            _AUDIT_WINDOW = round_audit
+        else:
+            _AUDIT_WINDOW[:4] += round_audit[:4]
+            _AUDIT_WINDOW[4] = torch.minimum(
+                _AUDIT_WINDOW[4],
+                round_audit[4],
+            )
+            _AUDIT_WINDOW[5] = torch.maximum(
+                _AUDIT_WINDOW[5],
+                round_audit[5],
+            )
+            _AUDIT_WINDOW[6:] = torch.maximum(
+                _AUDIT_WINDOW[6:],
+                round_audit[6:],
+            )
+        if _AUDIT_WINDOW_COUNT == audit_interval:
+            audit = _AUDIT_WINDOW.tolist()
+            count = _AUDIT_WINDOW_COUNT
+            print(
+                "[ReMTP][BlockFeature][audit_window] "
+                f"rounds={_AUDIT_ROUND - count + 1}-{_AUDIT_ROUND} "
+                f"mean_delta={audit[0] / count:.6f} "
+                "mean_sum_position_KL="
+                f"{audit[1] / count:.6f} "
+                f"max_sum_position_KL={audit[6]:.6f} "
+                "mean_sum_position_TV="
+                f"{audit[2] / count:.6f} "
+                f"max_sum_position_TV={audit[7]:.6f} "
+                "low_p_delta_fraction="
+                f"{audit[3] / max(audit[0], 1e-30):.6f} "
+                f"min_budgeted_p={audit[4]:.6e} "
+                f"max_budgeted_log_gap={audit[5]:.6f}",
+                flush=True,
+            )
+            _AUDIT_WINDOW = None
+            _AUDIT_WINDOW_COUNT = 0
+
+    original_top_ids = (
+        logits.argmax(dim=-1) if sampling_metadata.all_greedy else None
+    )
     relaxed_logits = boost_candidate_logits(
         logits,
         draft_token_ids,
-        result.target_candidate_probs,
-        result.boosted_candidate_probs,
+        target_candidate_probs,
+        boosted_candidate_probs,
+        copy=False,
     )
     if sampling_metadata.all_greedy:
-        original_top_ids = logits.argmax(dim=-1)
+        assert original_top_ids is not None
         relaxed_top_ids = relaxed_logits.argmax(dim=-1)
         desired_ids = torch.where(
             draft_token_ids == relaxed_top_ids,
@@ -871,6 +999,31 @@ def _block_feature_rejection_sample_v1(
 def install_block_feature_mtp() -> None:
     """Install block-aware feature-consistent verification."""
     config = BlockFeatureConfig.from_env()
+    audit_interval = int(os.getenv("REMTP_BLOCK_AUDIT_INTERVAL", "0"))
+    if audit_interval < 0:
+        raise ValueError("REMTP_BLOCK_AUDIT_INTERVAL must be non-negative")
+    diagnostics_enabled = _env_flag("REMTP_BLOCK_DIAGNOSTICS", False)
+    compile_fast_path = _env_flag("REMTP_BLOCK_COMPILE", True)
+
+    def fast_candidate_probs(
+        target_probs: torch.Tensor,
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return block_feature_candidate_probs(
+            target_probs,
+            draft_probs,
+            draft_token_ids,
+            config,
+        )
+
+    if compile_fast_path:
+        fast_candidate_probs = torch.compile(
+            fast_candidate_probs,
+            fullgraph=True,
+            dynamic=False,
+        )
+
     module = importlib.import_module(_V1_REJECTION_MODULE)
     current = module.rejection_sample
     if not getattr(current, "_remtp_block_feature_mtp", False):
@@ -878,6 +1031,9 @@ def install_block_feature_mtp() -> None:
         wrapper._remtp_block_feature_mtp = True
         wrapper._remtp_original = current
         wrapper._remtp_config = config
+        wrapper._remtp_audit_interval = audit_interval
+        wrapper._remtp_diagnostics_enabled = diagnostics_enabled
+        wrapper._remtp_fast_candidate_probs = fast_candidate_probs
         module.rejection_sample = wrapper
 
     print(
@@ -891,8 +1047,16 @@ def install_block_feature_mtp() -> None:
         f"future_decay={config.future_decay:g} "
         f"top_k={config.distribution_top_k} "
         f"min_reliability={config.min_reliability:g} "
+        f"min_target_p={config.min_target_probability:g} "
         f"max_target_log_gap={config.max_target_log_gap:g} "
         f"min_prefix_reach={config.min_prefix_reach_probability:g} "
+        "trust_refs="
+        f"{config.trust_token_reference:g}/"
+        f"{config.trust_reliability_reference:g}/"
+        f"{config.trust_acceptance_reference:g} "
+        f"audit_interval={audit_interval} "
+        f"diagnostics={int(diagnostics_enabled)} "
+        f"compiled={int(compile_fast_path)} "
         "draft=probabilistic-MTP bonus=original-target",
         flush=True,
     )

@@ -6,10 +6,11 @@ import torch
 from remtp.block_feature_mtp import (
     BlockFeatureConfig,
     bernoulli_kl,
+    block_feature_candidate_probs,
     block_feature_distribution,
     boost_candidate_logits,
     greedy_verification_ids,
-    topk_distribution_agreement,
+    target_led_js_agreement,
 )
 
 
@@ -76,11 +77,11 @@ class BlockFeatureMTPTest(unittest.TestCase):
                 <= result.draft_candidate_probs + 1e-6
             )
         )
-        torch.testing.assert_close(
-            result.boosted_candidate_probs,
-            result.draft_candidate_probs,
-            atol=1e-5,
-            rtol=1e-5,
+        self.assertTrue(
+            torch.all(
+                result.boosted_candidate_probs
+                >= result.target_candidate_probs
+            )
         )
 
     def test_closed_form_boost_matches_allocated_delta(self) -> None:
@@ -129,6 +130,51 @@ class BlockFeatureMTPTest(unittest.TestCase):
             self.target[0, 1].item(),
             places=6,
         )
+
+    def test_low_strict_acceptance_shrinks_trusted_capacity(self) -> None:
+        target = torch.tensor([[0.899, 0.001, 0.05, 0.05]])
+        draft = torch.tensor([[0.20, 0.50, 0.15, 0.15]])
+        result = block_feature_distribution(
+            target,
+            draft,
+            torch.tensor([1]),
+            self.config(
+                expected_draft_tokens=1,
+                block_delta_budget=4.0,
+                use_current_distribution=False,
+                use_future_distribution=False,
+            ),
+        )
+        self.assertAlmostEqual(
+            result.strict_acceptance[0].item(),
+            0.002,
+            places=6,
+        )
+        self.assertLess(
+            result.trusted_delta_capacity[0].item(),
+            0.01 * result.delta_capacity[0].item(),
+        )
+        self.assertLessEqual(
+            result.allocated_delta[0].item(),
+            result.trusted_delta_capacity[0].item(),
+        )
+
+    def test_extreme_low_target_probability_gets_no_budget(self) -> None:
+        target = torch.tensor([[0.8995, 0.0005, 0.05, 0.05]])
+        draft = torch.tensor([[0.20, 0.50, 0.15, 0.15]])
+        result = block_feature_distribution(
+            target,
+            draft,
+            torch.tensor([1]),
+            self.config(
+                expected_draft_tokens=1,
+                block_delta_budget=4.0,
+                use_current_distribution=False,
+                use_future_distribution=False,
+            ),
+        )
+        self.assertFalse(result.safe[0].item())
+        self.assertEqual(result.allocated_delta[0].item(), 0.0)
 
     def test_candidate_rank_and_target_top1_gap_are_explicit(self) -> None:
         result = block_feature_distribution(
@@ -199,7 +245,7 @@ class BlockFeatureMTPTest(unittest.TestCase):
             torch.zeros(3),
         )
 
-    def test_topk_agreement_uses_q_direction_not_only_q_y(self) -> None:
+    def test_target_led_js_uses_q_direction_not_only_q_y(self) -> None:
         target = torch.tensor(
             [
                 [0.60, 0.25, 0.10, 0.04, 0.01],
@@ -212,31 +258,17 @@ class BlockFeatureMTPTest(unittest.TestCase):
                 [0.05, 0.05, 0.10, 0.35, 0.45],
             ]
         )
-        agreement = topk_distribution_agreement(
+        agreement = target_led_js_agreement(
             target,
             draft,
+            torch.tensor([2, 2]),
             top_k=2,
-            overlap_weight=0.4,
-            probability_cosine_weight=0.4,
-            js_similarity_weight=0.3,
         )
         # q(y=2) is identical, but the rest of Q points in opposite directions.
         self.assertEqual(draft[0, 2].item(), draft[1, 2].item())
         self.assertGreater(
-            agreement.topk_overlap[0].item(),
-            agreement.topk_overlap[1].item(),
-        )
-        self.assertGreater(
-            agreement.probability_cosine[0].item(),
-            agreement.probability_cosine[1].item(),
-        )
-        self.assertGreater(
             agreement.js_similarity[0].item(),
             agreement.js_similarity[1].item(),
-        )
-        self.assertGreater(
-            agreement.combined[0].item(),
-            agreement.combined[1].item(),
         )
 
     def test_token_only_variant_skips_distribution_signals(self) -> None:
@@ -249,24 +281,17 @@ class BlockFeatureMTPTest(unittest.TestCase):
                 use_future_distribution=False,
             ),
         )
-        torch.testing.assert_close(result.topk_overlap, torch.zeros(4))
         torch.testing.assert_close(
-            result.topk_probability_cosine,
-            torch.zeros(4),
-        )
-        torch.testing.assert_close(
-            result.topk_js_similarity,
+            result.current_js_similarity,
             torch.zeros(4),
         )
 
     def test_identical_distributions_have_unit_js_similarity(self) -> None:
-        agreement = topk_distribution_agreement(
+        agreement = target_led_js_agreement(
             self.target,
             self.target,
+            self.ids,
             top_k=2,
-            overlap_weight=0.4,
-            probability_cosine_weight=0.3,
-            js_similarity_weight=0.3,
         )
         torch.testing.assert_close(
             agreement.js_similarity,
@@ -452,6 +477,36 @@ class BlockFeatureMTPTest(unittest.TestCase):
         self.assertLessEqual(result.allocated_delta.sum().item(), 0.020001)
         self.assertTrue(torch.isfinite(result.realized_kl).all().item())
 
+    def test_candidate_only_fast_path_matches_detailed_path(self) -> None:
+        config = self.config(block_delta_budget=0.02)
+        result = block_feature_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            config,
+            assume_normalized=True,
+            construct_probs=False,
+            compute_shift_metrics=False,
+        )
+        target_candidate, boosted_candidate = (
+            block_feature_candidate_probs(
+                self.target,
+                self.draft,
+                self.ids,
+                config,
+            )
+        )
+        self.assertIsNone(result.realized_kl)
+        self.assertIsNone(result.realized_tv)
+        torch.testing.assert_close(
+            target_candidate,
+            result.target_candidate_probs,
+        )
+        torch.testing.assert_close(
+            boosted_candidate,
+            result.boosted_candidate_probs,
+        )
+
     def test_bernoulli_kl_matches_full_distribution_kl(self) -> None:
         result = block_feature_distribution(
             self.target,
@@ -471,6 +526,16 @@ class BlockFeatureMTPTest(unittest.TestCase):
             result.target_candidate_probs,
         )
         torch.testing.assert_close(full_kl, binary)
+
+    def test_reported_tv_matches_full_distribution_tv(self) -> None:
+        result = block_feature_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            self.config(block_delta_budget=0.02),
+        )
+        full_tv = 0.5 * (result.probs - self.target).abs().sum(dim=-1)
+        torch.testing.assert_close(full_tv, result.realized_tv)
 
     def test_greedy_rejects_to_original_target_top1(self) -> None:
         target = torch.tensor(
@@ -496,13 +561,11 @@ class BlockFeatureMTPTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             BlockFeatureConfig(distribution_top_k=0).validate()
         with self.assertRaises(ValueError):
-            topk_distribution_agreement(
+            target_led_js_agreement(
                 self.target,
                 self.draft,
-                top_k=2,
-                overlap_weight=0.0,
-                probability_cosine_weight=0.0,
-                js_similarity_weight=0.0,
+                self.ids,
+                top_k=0,
             )
 
 

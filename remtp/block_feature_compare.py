@@ -12,8 +12,8 @@ from typing import Any
 METHODS = (
     ("cactus", "Cactus + MTP"),
     ("token_only", "Token support only"),
-    ("distribution", "Token + current P/Q distribution"),
-    ("full", "Token + current/future P/Q distributions"),
+    ("distribution", "Token + current target-led JS"),
+    ("full", "Token + current/future target-led JS"),
 )
 
 

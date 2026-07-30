@@ -22,7 +22,10 @@ Optional environment variables:
   CACTUS_DELTA=1.0            Cactus per-position delta
   BLOCK_DELTA_BUDGET=4.0      Total closed-form delta for one MTP=4 block
   BLOCK_KL_BUDGET=4.0         Legacy alias for BLOCK_DELTA_BUDGET
-  BLOCK_DISTRIBUTION_TOP_K=8  P/Q top-K used by distribution agreement
+  BLOCK_DISTRIBUTION_TOP_K=8  Target top-K used by JS agreement
+  BLOCK_MIN_TARGET_PROBABILITY=0.001  Extreme-tail safety floor
+  BLOCK_COMPILE=1             Fuse the serving fast path with torch.compile
+  BLOCK_AUDIT_INTERVAL=0      Aggregate exact KL/TV every N rounds; 0 disables
   PROGRESS_EVERY=10           Print one sample row every N requests
   SERVER_START_TIMEOUT=180    Startup timeout in seconds
   RUN_TAG=<timestamp>         Optional local output suffix
@@ -51,6 +54,7 @@ MTP_TOKENS="${MTP_TOKENS:-4}"
 CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
 BLOCK_DELTA_BUDGET="${BLOCK_DELTA_BUDGET:-${BLOCK_KL_BUDGET:-4.0}}"
 BLOCK_DISTRIBUTION_TOP_K="${BLOCK_DISTRIBUTION_TOP_K:-8}"
+BLOCK_AUDIT_INTERVAL="${BLOCK_AUDIT_INTERVAL:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
@@ -124,6 +128,7 @@ run_method() {
   echo "===== ${label} ====="
   echo "Starting server; log: $server_log"
   BLOCK_FEATURE_VARIANT="$variant" \
+  BLOCK_AUDIT_INTERVAL="$BLOCK_AUDIT_INTERVAL" \
   setsid "$serve_script" >"$server_log" 2>&1 &
   server_pid=$!
   wait_for_server "$server_log"
@@ -138,6 +143,7 @@ run_method() {
   CACTUS_DELTA="$CACTUS_DELTA" \
   BLOCK_DELTA_BUDGET="$BLOCK_DELTA_BUDGET" \
   BLOCK_DISTRIBUTION_TOP_K="$BLOCK_DISTRIBUTION_TOP_K" \
+  BLOCK_AUDIT_INTERVAL="$BLOCK_AUDIT_INTERVAL" \
   BLOCK_FEATURE_VARIANT="$variant" \
   "$benchmark_script" \
     --base-url "$BASE_URL" \
@@ -183,14 +189,14 @@ run_method \
   "token_only"
 
 run_method \
-  "Token + current P/Q distribution" \
+  "Token + current target-led JS" \
   "distribution" \
   "$PROJECT_DIR/scripts/serve_block_feature_mtp.sh" \
   "$PROJECT_DIR/scripts/benchmark_gsm8k_block_feature_mtp.sh" \
   "distribution"
 
 run_method \
-  "Token + current/future P/Q distributions" \
+  "Token + current/future target-led JS" \
   "full" \
   "$PROJECT_DIR/scripts/serve_block_feature_mtp.sh" \
   "$PROJECT_DIR/scripts/benchmark_gsm8k_block_feature_mtp.sh" \
