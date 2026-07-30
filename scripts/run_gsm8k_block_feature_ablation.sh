@@ -7,7 +7,7 @@ cd "$PROJECT_DIR"
 
 usage() {
   cat <<'EOF'
-Run Cactus and three block-feature MTP=4 ablations sequentially on one GPU.
+Run Cactus and three P/Q distribution MTP=4 ablations on one GPU.
 
 Usage:
   ./scripts/run_gsm8k_block_feature_ablation.sh
@@ -21,6 +21,7 @@ Optional environment variables:
   MTP_TOKENS=4                Must remain four for this method
   CACTUS_DELTA=1.0            Cactus per-position delta
   BLOCK_KL_BUDGET=1.2         Total KL budget for one four-token block
+  BLOCK_DISTRIBUTION_TOP_K=8  P/Q top-K used by distribution agreement
   PROGRESS_EVERY=10           Print one sample row every N requests
   SERVER_START_TIMEOUT=180    Startup timeout in seconds
   RUN_TAG=<timestamp>         Optional local output suffix
@@ -48,6 +49,7 @@ MAX_TOKENS="${MAX_TOKENS:-384}"
 MTP_TOKENS="${MTP_TOKENS:-4}"
 CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
 BLOCK_KL_BUDGET="${BLOCK_KL_BUDGET:-1.2}"
+BLOCK_DISTRIBUTION_TOP_K="${BLOCK_DISTRIBUTION_TOP_K:-8}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
@@ -134,6 +136,7 @@ run_method() {
   MTP_TOKENS="$MTP_TOKENS" \
   CACTUS_DELTA="$CACTUS_DELTA" \
   BLOCK_KL_BUDGET="$BLOCK_KL_BUDGET" \
+  BLOCK_DISTRIBUTION_TOP_K="$BLOCK_DISTRIBUTION_TOP_K" \
   BLOCK_FEATURE_VARIANT="$variant" \
   "$benchmark_script" \
     --base-url "$BASE_URL" \
@@ -156,12 +159,13 @@ fi
 mkdir -p "$LOG_ROOT"
 mkdir "$RUN_ROOT"
 
-export MTP_TOKENS CACTUS_DELTA BLOCK_KL_BUDGET
+export MTP_TOKENS CACTUS_DELTA BLOCK_KL_BUDGET BLOCK_DISTRIBUTION_TOP_K
 
 echo "GSM8K block-feature ablation"
 echo "samples=$SAMPLES sample_seed=$SAMPLE_SEED temperature=$TEMPERATURE"
 echo "generation_seed=$SEED max_tokens=$MAX_TOKENS mtp_tokens=$MTP_TOKENS"
-echo "block_kl_budget=$BLOCK_KL_BUDGET local_results=$RUN_ROOT"
+echo "block_kl_budget=$BLOCK_KL_BUDGET top_k=$BLOCK_DISTRIBUTION_TOP_K"
+echo "local_results=$RUN_ROOT"
 
 run_method \
   "Cactus + probabilistic MTP" \
@@ -170,21 +174,21 @@ run_method \
   "$PROJECT_DIR/scripts/benchmark_gsm8k_cactus_mtp.sh"
 
 run_method \
-  "Block budget + prefix marginal value" \
-  "block_budget" \
+  "Token support only" \
+  "token_only" \
   "$PROJECT_DIR/scripts/serve_block_feature_mtp.sh" \
   "$PROJECT_DIR/scripts/benchmark_gsm8k_block_feature_mtp.sh" \
-  "block_budget"
+  "token_only"
 
 run_method \
-  "Block budget + future support" \
-  "lookahead" \
+  "Token + current P/Q distribution" \
+  "distribution" \
   "$PROJECT_DIR/scripts/serve_block_feature_mtp.sh" \
   "$PROJECT_DIR/scripts/benchmark_gsm8k_block_feature_mtp.sh" \
-  "lookahead"
+  "distribution"
 
 run_method \
-  "Block-aware feature-consistent MTP" \
+  "Token + current/future P/Q distributions" \
   "full" \
   "$PROJECT_DIR/scripts/serve_block_feature_mtp.sh" \
   "$PROJECT_DIR/scripts/benchmark_gsm8k_block_feature_mtp.sh" \

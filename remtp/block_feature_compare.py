@@ -11,9 +11,9 @@ from typing import Any
 
 METHODS = (
     ("cactus", "Cactus + MTP"),
-    ("block_budget", "Block budget + prefix value"),
-    ("lookahead", "Block budget + lookahead"),
-    ("full", "Block-aware feature-consistent MTP"),
+    ("token_only", "Token support only"),
+    ("distribution", "Token + current P/Q distribution"),
+    ("full", "Token + current/future P/Q distributions"),
 )
 
 
