@@ -11,6 +11,7 @@ from typing import Any
 
 METHODS = (
     ("cactus", "Cactus + MTP"),
+    ("spec_cascade", "SpecCascade TokenV3 + MTP"),
     ("cactus_cap", "Cactus + h(y)<=q(y)"),
     ("tv_head", "Exact-TV + head calibration"),
     (
@@ -69,7 +70,7 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
     lines = [
-        "# GSM8K target-anchored exact-TV ablation",
+        "# GSM8K MTP=6 target-anchored/cascade comparison",
         "",
         "| method | accuracy | decode tok/s | e2e tok/s | "
         "mean acceptance length | draft acceptance |",

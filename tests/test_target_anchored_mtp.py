@@ -42,6 +42,7 @@ class TargetAnchoredMTPTest(unittest.TestCase):
         values: dict[str, object] = {
             "variant": variant,
             "cactus_delta": 0.01,
+            "expected_draft_tokens": 4,
             "head_reliability": (1.0, 0.85, 0.70, 0.55),
             "max_target_log_gap": 100.0,
         }
@@ -288,6 +289,32 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             TargetAnchoredConfig(variant="js").validate()
         with self.assertRaises(ValueError):
             TargetAnchoredConfig(head_reliability=(1.0,)).validate()
+
+    def test_default_config_covers_six_mtp_heads(self) -> None:
+        config = TargetAnchoredConfig()
+        config.validate()
+        self.assertEqual(config.expected_draft_tokens, 6)
+        self.assertEqual(len(config.head_reliability), 6)
+
+        target = torch.softmax(torch.randn(6, 8), dim=-1)
+        draft = torch.softmax(torch.randn(6, 8), dim=-1)
+        result = target_anchored_distribution(
+            target,
+            draft,
+            torch.arange(6),
+            config,
+            hidden_similarity=torch.ones(6),
+        )
+        self.assertEqual(result.allocated_tv.shape[0], 6)
+        self.assertTrue(
+            torch.all(
+                result.boosted_candidate_probs
+                <= result.draft_candidate_probs.maximum(
+                    result.target_candidate_probs
+                )
+                + 1e-6
+            ).item()
+        )
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ _DIAGNOSTIC_EMITTED = False
 _HIDDEN_FALLBACK_EMITTED = False
 _AUDIT_ROUND = 0
 _AUDIT_TV = torch.zeros(3, dtype=torch.float64)
+_DEFAULT_HEAD_RELIABILITY = (1.0, 0.85, 0.70, 0.55, 0.40, 0.30)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -60,8 +61,8 @@ class TargetAnchoredConfig:
 
     variant: str = "tv_hidden_veto"
     cactus_delta: float = 1.0
-    expected_draft_tokens: int = 4
-    head_reliability: tuple[float, ...] = (1.0, 0.85, 0.70, 0.55)
+    expected_draft_tokens: int = 6
+    head_reliability: tuple[float, ...] = _DEFAULT_HEAD_RELIABILITY
     target_log_gap_scale: float = 2.0
     max_target_log_gap: float = 8.0
     future_veto_floor: float = 0.20
@@ -96,9 +97,10 @@ class TargetAnchoredConfig:
 
     @classmethod
     def from_env(cls) -> TargetAnchoredConfig:
-        expected = int(os.getenv("REMTP_TA_EXPECTED_DRAFT_TOKENS", "4"))
+        expected = int(os.getenv("REMTP_TA_EXPECTED_DRAFT_TOKENS", "6"))
         default_heads = ",".join(
-            ("1.0", "0.85", "0.70", "0.55")[:expected]
+            str(value)
+            for value in _DEFAULT_HEAD_RELIABILITY[:expected]
         )
         config = cls(
             variant=os.getenv(

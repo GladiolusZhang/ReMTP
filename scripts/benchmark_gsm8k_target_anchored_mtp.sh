@@ -9,5 +9,5 @@ variant="${TARGET_ANCHORED_VARIANT:-tv_hidden_veto}"
 delta="${CACTUS_DELTA:-1.0}"
 
 RUN_NAME="target_anchored_${variant}_cactus_delta${delta}" \
-MTP_TOKENS="${MTP_TOKENS:-4}" \
+MTP_TOKENS="${MTP_TOKENS:-6}" \
 exec "$PROJECT_DIR/scripts/benchmark_gsm8k.sh" "$@"

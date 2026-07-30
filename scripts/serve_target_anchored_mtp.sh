@@ -6,12 +6,12 @@ source "$PROJECT_DIR/.venv/bin/activate"
 
 export REMTP_TRACE=0
 export ENFORCE_EAGER=0
-export MTP_TOKENS="${MTP_TOKENS:-4}"
+export MTP_TOKENS="${MTP_TOKENS:-6}"
 export MTP_REJECTION_SAMPLE_METHOD=probabilistic
 export REMTP_WORKER_CLS=remtp.worker.TargetAnchoredMTPWorker
 
-if [[ "$MTP_TOKENS" != "4" ]]; then
-  echo "Target-anchored block verification requires MTP_TOKENS=4." >&2
+if [[ "$MTP_TOKENS" != "6" ]]; then
+  echo "Target-anchored block verification requires MTP_TOKENS=6." >&2
   exit 2
 fi
 
@@ -28,7 +28,7 @@ esac
 export REMTP_TA_VARIANT="$variant"
 export REMTP_TA_EXPECTED_DRAFT_TOKENS="$MTP_TOKENS"
 export REMTP_CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
-export REMTP_TA_HEAD_RELIABILITY="${HEAD_RELIABILITY:-1.0,0.85,0.70,0.55}"
+export REMTP_TA_HEAD_RELIABILITY="${HEAD_RELIABILITY:-1.0,0.85,0.70,0.55,0.40,0.30}"
 export REMTP_TA_TARGET_LOG_GAP_SCALE="${TARGET_LOG_GAP_SCALE:-2.0}"
 export REMTP_TA_MAX_TARGET_LOG_GAP="${MAX_TARGET_LOG_GAP:-8.0}"
 export REMTP_TA_FUTURE_VETO_FLOOR="${FUTURE_VETO_FLOOR:-0.20}"
