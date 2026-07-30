@@ -94,9 +94,10 @@ def bernoulli_kl(
     """Compute KL(Bernoulli(boosted) || Bernoulli(original))."""
     dtype = boosted.dtype
     work_dtype = torch.float32 if boosted.is_cuda else torch.float64
-    boosted_work = boosted.to(work_dtype).clamp(1e-12, 1.0 - 1e-12)
+    upper = 1.0 - torch.finfo(work_dtype).eps
+    boosted_work = boosted.to(work_dtype).clamp(1e-12, upper)
     original_work = original.to(work_dtype).clamp(
-        1e-12, 1.0 - 1e-12
+        1e-12, upper
     )
     kl = boosted_work * torch.log(boosted_work / original_work)
     kl += (1.0 - boosted_work) * torch.log(

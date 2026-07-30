@@ -169,6 +169,14 @@ class GatedDepthKLMTPTest(unittest.TestCase):
         ).sum()
         torch.testing.assert_close(full_kl, binary)
 
+    def test_bernoulli_kl_is_finite_at_probability_one(self) -> None:
+        value = bernoulli_kl(
+            torch.tensor([1.0]),
+            torch.tensor([1.0]),
+        )
+        self.assertTrue(torch.isfinite(value).all())
+        torch.testing.assert_close(value, torch.zeros(1))
+
     def test_greedy_rejects_to_original_target_top1(self) -> None:
         target = torch.tensor(
             [
