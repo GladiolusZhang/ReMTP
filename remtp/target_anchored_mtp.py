@@ -32,6 +32,7 @@ _HIDDEN_FALLBACK_EMITTED = False
 _AUDIT_ROUND = 0
 _AUDIT_TV = torch.zeros(3, dtype=torch.float64)
 _DEFAULT_HEAD_RELIABILITY = (1.0, 0.85, 0.70, 0.55, 0.40, 0.30)
+_POST_VERIFICATION_HOOK: Any | None = None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -477,10 +478,13 @@ def _target_anchored_rejection_sample(
             )
             _HIDDEN_FALLBACK_EMITTED = True
 
+    post_verification_hook = _POST_VERIFICATION_HOOK
     detailed = (
         getattr(_target_anchored_rejection_sample, "_remtp_diagnostics")
         and not _DIAGNOSTIC_EMITTED
-    ) or getattr(_target_anchored_rejection_sample, "_remtp_audit_interval") > 0
+    ) or (
+        getattr(_target_anchored_rejection_sample, "_remtp_audit_interval") > 0
+    )
     result: TargetAnchoredResult | None = None
     if detailed:
         result = target_anchored_distribution(
@@ -579,7 +583,7 @@ def _target_anchored_rejection_sample(
     else:
         verification_logits = relaxed_logits
 
-    return original(
+    output_token_ids = original(
         draft_token_ids,
         num_draft_tokens,
         max_spec_len,
@@ -589,6 +593,39 @@ def _target_anchored_rejection_sample(
         bonus_token_ids,
         sampling_metadata,
     )
+    if post_verification_hook is not None:
+        ids = draft_token_ids.to(device=target_probs.device, dtype=torch.int64)
+        rows = torch.arange(ids.shape[0], device=target_probs.device)
+        q_y = draft_probs[rows, ids]
+        post_verification_hook(
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            draft_token_ids=draft_token_ids,
+            output_token_ids=output_token_ids,
+            target_candidate_probs=p_y,
+            boosted_candidate_probs=h_y,
+            allocated_tv=(h_y - p_y).clamp_min(0.0),
+            strict_acceptance=torch.minimum(
+                torch.ones_like(p_y),
+                p_y / q_y.clamp_min(1e-30),
+            ),
+            hidden_similarity=hidden_similarity,
+            sampling_metadata=sampling_metadata,
+        )
+    return output_token_ids
+
+
+def set_post_verification_hook(hook: Any | None) -> None:
+    """Register an optional observer after target-anchored verification.
+
+    The hook receives the exact constrained target distribution, full MTP
+    proposal distribution, compiled verifier scalars, and committed output.
+    It cannot change the verifier result or force the verifier off its fast
+    path.
+    """
+    global _POST_VERIFICATION_HOOK
+
+    _POST_VERIFICATION_HOOK = hook
 
 
 def install_target_anchored_mtp() -> None:

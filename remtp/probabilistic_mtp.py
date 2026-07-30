@@ -29,6 +29,7 @@ _LAST_GENERATOR_ROWS: tuple[int, ...] = ()
 _PROPOSAL_COUNT = 0
 _DIAGNOSTIC_EMITTED = False
 _CAPTURE_ALIGNED_HIDDEN_STATES = False
+_BONUS_LOGITS_HOOK: Any | None = None
 
 
 def sample_mtp_logits(
@@ -256,6 +257,11 @@ def _forward_with_mtp_probs(
     global _DIAGNOSTIC_EMITTED
 
     original = getattr(_forward_with_mtp_probs, "_remtp_original")
+    if _BONUS_LOGITS_HOOK is not None:
+        _BONUS_LOGITS_HOOK(
+            logits[metadata.bonus_logits_indices].to(torch.float32),
+            sampling_metadata,
+        )
     if draft_probs is None and _LAST_DRAFT_PROBS is not None:
         num_drafts = sum(metadata.num_draft_tokens)
         if num_drafts > _LAST_DRAFT_PROBS.shape[0]:
@@ -315,6 +321,13 @@ def _forward_with_mtp_probs(
         logits,
         sampling_metadata,
     )
+
+
+def set_bonus_logits_hook(hook: Any | None) -> None:
+    """Expose the unmodified target bonus row to an optional observer."""
+    global _BONUS_LOGITS_HOOK
+
+    _BONUS_LOGITS_HOOK = hook
 
 
 def install_probabilistic_mtp() -> None:

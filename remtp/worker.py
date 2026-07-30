@@ -73,3 +73,21 @@ class TargetAnchoredMTPWorker(Worker):
         install_aligned_hidden_capture()
         install_target_anchored_mtp()
         return super().init_device(*args, **kwargs)
+
+
+class RegretFeedbackMTPWorker(Worker):
+    """CUDA worker for target-anchored MTP plus cross-block regret."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.probabilistic_mtp import (
+            install_aligned_hidden_capture,
+            install_probabilistic_mtp,
+        )
+        from remtp.regret_feedback import install_regret_feedback
+        from remtp.target_anchored_mtp import install_target_anchored_mtp
+
+        install_probabilistic_mtp()
+        install_aligned_hidden_capture()
+        install_target_anchored_mtp()
+        install_regret_feedback()
+        return super().init_device(*args, **kwargs)

@@ -458,3 +458,34 @@ python -m remtp.head_reliability \
 
 实验输出仅写入本地 `results/` 和 `logs/`，这两个目录不会上传到
 GitHub。
+
+## 11. Budget-Induced Regret Feedback（MTP=6）
+
+该实验保持上一节的 `tv_hidden_veto` 验证器不变。只有在同一个随机数
+`u` 下发生“严格验证拒绝、松弛验证接受”时，才从 `P -> H` 的实际 TV
+转移构造短期遗憾方向。记忆最多跨两个 block，并且只注入下一轮 MTP
+Module 1 使用的目标 hidden 副本；目标模型 hidden、KV、logits 和验证
+分布均不修改。
+
+单独启动：
+
+```bash
+MTP_TOKENS=6 \
+REGRET_ALPHA=0.03 \
+REGRET_TOKEN_DECAY=0.90 \
+./scripts/serve_regret_feedback_mtp.sh
+```
+
+把新方法跑在同一批 200 条 GSM8K 上，并追加到已经完成的五方法本地
+表格：
+
+```bash
+BASELINE_RUN_ROOT=results/gsm8k_mtp6_five_way_20260730_202927 \
+SAMPLES=200 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
+./scripts/run_gsm8k_mtp6_regret_append.sh
+```
+
+若省略 `BASELINE_RUN_ROOT`，脚本会选择最新的完整五方法结果。运行结束
+后，本地结果除六行对比表外还包含 `regret_mechanism.json`，其中记录
+严格可接受比例、causal relaxed acceptance、单位接受 token 的 TV、
+注入次数和六个 MTP head 的机制统计。
