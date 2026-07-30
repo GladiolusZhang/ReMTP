@@ -59,13 +59,13 @@ class CactusMTPWorker(Worker):
         return super().init_device(*args, **kwargs)
 
 
-class GatedDepthKLMTPWorker(Worker):
-    """CUDA worker for safety-gated, depth-decayed KL MTP verification."""
+class BlockFeatureMTPWorker(Worker):
+    """CUDA worker for block-aware, feature-consistent MTP verification."""
 
     def init_device(self, *args: Any, **kwargs: Any) -> Any:
-        from remtp.gated_depth_kl_mtp import install_gated_depth_kl_mtp
+        from remtp.block_feature_mtp import install_block_feature_mtp
         from remtp.probabilistic_mtp import install_probabilistic_mtp
 
         install_probabilistic_mtp()
-        install_gated_depth_kl_mtp()
+        install_block_feature_mtp()
         return super().init_device(*args, **kwargs)

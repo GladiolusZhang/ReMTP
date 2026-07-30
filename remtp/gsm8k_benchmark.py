@@ -225,7 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--generation-seed", type=int, default=42)
     parser.add_argument("--max-tokens", type=int, default=384)
-    parser.add_argument("--mtp-tokens", type=int, default=2)
+    parser.add_argument("--mtp-tokens", type=int, default=4)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--run-name", default="native_mtp")

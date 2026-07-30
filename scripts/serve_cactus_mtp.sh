@@ -6,7 +6,7 @@ source "$PROJECT_DIR/.venv/bin/activate"
 
 export REMTP_TRACE=0
 export ENFORCE_EAGER=0
-export MTP_TOKENS="${MTP_TOKENS:-2}"
+export MTP_TOKENS="${MTP_TOKENS:-4}"
 export MTP_REJECTION_SAMPLE_METHOD=probabilistic
 export REMTP_WORKER_CLS=remtp.worker.CactusMTPWorker
 export REMTP_CACTUS_DELTA="${CACTUS_DELTA:-1.0}"

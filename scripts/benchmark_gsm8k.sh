@@ -12,6 +12,6 @@ python -m remtp.gsm8k_benchmark \
   --temperature "${TEMPERATURE:-0.7}" \
   --generation-seed "${SEED:-42}" \
   --max-tokens "${MAX_TOKENS:-384}" \
-  --mtp-tokens "${MTP_TOKENS:-2}" \
+  --mtp-tokens "${MTP_TOKENS:-4}" \
   --run-name "${RUN_NAME:-native_mtp}" \
   "$@"
