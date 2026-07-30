@@ -13,7 +13,7 @@ Usage:
   ./scripts/run_gsm8k_block_feature_ablation.sh
 
 Optional environment variables:
-  SAMPLES=100                 Number of shared GSM8K samples
+  SAMPLES=200                 Number of shared GSM8K samples
   SAMPLE_SEED=20260730        Fixed subset seed
   TEMPERATURE=0.7             Sampling temperature
   SEED=42                     Generation seed
@@ -41,7 +41,7 @@ if (( $# > 0 )); then
   exit 2
 fi
 
-SAMPLES="${SAMPLES:-100}"
+SAMPLES="${SAMPLES:-200}"
 SAMPLE_SEED="${SAMPLE_SEED:-20260730}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 SEED="${SEED:-42}"
