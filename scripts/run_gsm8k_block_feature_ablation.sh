@@ -20,7 +20,8 @@ Optional environment variables:
   MAX_TOKENS=384              Per-answer token limit
   MTP_TOKENS=4                Must remain four for this method
   CACTUS_DELTA=1.0            Cactus per-position delta
-  BLOCK_KL_BUDGET=1.2         Total KL budget for one four-token block
+  BLOCK_DELTA_BUDGET=4.0      Total closed-form delta for one MTP=4 block
+  BLOCK_KL_BUDGET=4.0         Legacy alias for BLOCK_DELTA_BUDGET
   BLOCK_DISTRIBUTION_TOP_K=8  P/Q top-K used by distribution agreement
   PROGRESS_EVERY=10           Print one sample row every N requests
   SERVER_START_TIMEOUT=180    Startup timeout in seconds
@@ -48,7 +49,7 @@ SEED="${SEED:-42}"
 MAX_TOKENS="${MAX_TOKENS:-384}"
 MTP_TOKENS="${MTP_TOKENS:-4}"
 CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
-BLOCK_KL_BUDGET="${BLOCK_KL_BUDGET:-1.2}"
+BLOCK_DELTA_BUDGET="${BLOCK_DELTA_BUDGET:-${BLOCK_KL_BUDGET:-4.0}}"
 BLOCK_DISTRIBUTION_TOP_K="${BLOCK_DISTRIBUTION_TOP_K:-8}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
@@ -135,7 +136,7 @@ run_method() {
   MAX_TOKENS="$MAX_TOKENS" \
   MTP_TOKENS="$MTP_TOKENS" \
   CACTUS_DELTA="$CACTUS_DELTA" \
-  BLOCK_KL_BUDGET="$BLOCK_KL_BUDGET" \
+  BLOCK_DELTA_BUDGET="$BLOCK_DELTA_BUDGET" \
   BLOCK_DISTRIBUTION_TOP_K="$BLOCK_DISTRIBUTION_TOP_K" \
   BLOCK_FEATURE_VARIANT="$variant" \
   "$benchmark_script" \
@@ -159,12 +160,13 @@ fi
 mkdir -p "$LOG_ROOT"
 mkdir "$RUN_ROOT"
 
-export MTP_TOKENS CACTUS_DELTA BLOCK_KL_BUDGET BLOCK_DISTRIBUTION_TOP_K
+export MTP_TOKENS CACTUS_DELTA BLOCK_DELTA_BUDGET
+export BLOCK_DISTRIBUTION_TOP_K
 
 echo "GSM8K block-feature ablation"
 echo "samples=$SAMPLES sample_seed=$SAMPLE_SEED temperature=$TEMPERATURE"
 echo "generation_seed=$SEED max_tokens=$MAX_TOKENS mtp_tokens=$MTP_TOKENS"
-echo "block_kl_budget=$BLOCK_KL_BUDGET top_k=$BLOCK_DISTRIBUTION_TOP_K"
+echo "block_delta_budget=$BLOCK_DELTA_BUDGET top_k=$BLOCK_DISTRIBUTION_TOP_K"
 echo "local_results=$RUN_ROOT"
 
 run_method \

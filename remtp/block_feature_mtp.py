@@ -1,16 +1,16 @@
 """Block-aware, feature-consistent relaxation for probabilistic MTP.
 
-The verifier sees the complete MTP block in one target forward pass.  This
-module uses that information to allocate one KL budget across the whole block
-instead of independently relaxing each token:
+The verifier sees the complete MTP block in one target forward pass. This
+module uses that information to allocate one closed-form Cactus delta budget
+across the whole block instead of independently relaxing each token:
 
-* target rank and target top-1 gap for the sampled draft token;
-* full-distribution top-k agreement between MTP q_d and target p_d;
+* target top-k rank and target top-1 gap for the sampled draft token;
+* top-k overlap, aligned probability cosine, and JS similarity for q_d/p_d;
 * agreement at later positions in the sampled MTP block;
 * the number of later draft/bonus tokens unlocked by an accepted prefix.
 
-The implementation targets this repository's single-request, four-token MTP
-experiments.  It keeps vLLM's standard stochastic acceptance and residual
+The fast path avoids iterative KL inversion and full-vocabulary entropy/rank
+reductions. It keeps vLLM's standard stochastic acceptance and residual
 sampling after replacing each target distribution p_d by the block-conditioned
 temporary distribution h_d.  Bonus tokens always come from the original target.
 """
@@ -45,7 +45,7 @@ def _env_flag(name: str, default: bool) -> bool:
 class BlockFeatureConfig:
     """Configuration for block-aware feature-consistent verification."""
 
-    block_kl_budget: float = 1.2
+    block_delta_budget: float = 4.0
     expected_draft_tokens: int = 4
     use_prefix_value: bool = True
     use_current_distribution: bool = True
@@ -55,20 +55,19 @@ class BlockFeatureConfig:
     token_rank_scale: float = 4.0
     token_log_gap_scale: float = 2.0
     overlap_weight: float = 0.4
-    probability_cosine_weight: float = 0.4
-    entropy_consistency_weight: float = 0.2
+    probability_cosine_weight: float = 0.3
+    js_similarity_weight: float = 0.3
     token_signal_weight: float = 1.0
     current_distribution_weight: float = 1.0
     future_distribution_weight: float = 1.0
     reliability_power: float = 2.0
     min_reliability: float = 0.2
-    max_normalized_surprisal: float = 12.0
+    max_target_log_gap: float = 8.0
     min_prefix_reach_probability: float = 0.01
-    bisection_steps: int = 20
 
     def validate(self) -> None:
-        if self.block_kl_budget < 0:
-            raise ValueError("block_kl_budget must be non-negative")
+        if self.block_delta_budget < 0:
+            raise ValueError("block_delta_budget must be non-negative")
         if self.expected_draft_tokens < 1:
             raise ValueError("expected_draft_tokens must be positive")
         if not 0 <= self.future_decay <= 1:
@@ -80,7 +79,7 @@ class BlockFeatureConfig:
         distribution_weights = (
             self.overlap_weight,
             self.probability_cosine_weight,
-            self.entropy_consistency_weight,
+            self.js_similarity_weight,
         )
         signal_weights = (
             self.token_signal_weight,
@@ -100,21 +99,20 @@ class BlockFeatureConfig:
             raise ValueError("reliability_power must be positive")
         if not 0 <= self.min_reliability <= 1:
             raise ValueError("min_reliability must be in [0, 1]")
-        if self.max_normalized_surprisal <= 0:
-            raise ValueError("max_normalized_surprisal must be positive")
+        if self.max_target_log_gap <= 0:
+            raise ValueError("max_target_log_gap must be positive")
         if not 0 <= self.min_prefix_reach_probability <= 1:
             raise ValueError(
                 "min_prefix_reach_probability must be in [0, 1]"
             )
-        if self.bisection_steps < 1:
-            raise ValueError("bisection_steps must be positive")
-
     @classmethod
     def from_env(cls) -> BlockFeatureConfig:
+        delta_budget = os.getenv(
+            "REMTP_BLOCK_DELTA_BUDGET",
+            os.getenv("REMTP_BLOCK_KL_BUDGET", "4.0"),
+        )
         config = cls(
-            block_kl_budget=float(
-                os.getenv("REMTP_BLOCK_KL_BUDGET", "1.2")
-            ),
+            block_delta_budget=float(delta_budget),
             expected_draft_tokens=int(
                 os.getenv("REMTP_BLOCK_EXPECTED_DRAFT_TOKENS", "4")
             ),
@@ -143,10 +141,13 @@ class BlockFeatureConfig:
                 os.getenv("REMTP_BLOCK_OVERLAP_WEIGHT", "0.4")
             ),
             probability_cosine_weight=float(
-                os.getenv("REMTP_BLOCK_PROBABILITY_COSINE_WEIGHT", "0.4")
+                os.getenv("REMTP_BLOCK_PROBABILITY_COSINE_WEIGHT", "0.3")
             ),
-            entropy_consistency_weight=float(
-                os.getenv("REMTP_BLOCK_ENTROPY_WEIGHT", "0.2")
+            js_similarity_weight=float(
+                os.getenv(
+                    "REMTP_BLOCK_JS_WEIGHT",
+                    os.getenv("REMTP_BLOCK_ENTROPY_WEIGHT", "0.3"),
+                )
             ),
             token_signal_weight=float(
                 os.getenv("REMTP_BLOCK_TOKEN_SIGNAL_WEIGHT", "1.0")
@@ -169,17 +170,11 @@ class BlockFeatureConfig:
             min_reliability=float(
                 os.getenv("REMTP_BLOCK_MIN_RELIABILITY", "0.2")
             ),
-            max_normalized_surprisal=float(
-                os.getenv(
-                    "REMTP_BLOCK_MAX_NORMALIZED_SURPRISAL",
-                    "12.0",
-                )
+            max_target_log_gap=float(
+                os.getenv("REMTP_BLOCK_MAX_TARGET_LOG_GAP", "8.0")
             ),
             min_prefix_reach_probability=float(
                 os.getenv("REMTP_BLOCK_MIN_PREFIX_REACH", "0.01")
-            ),
-            bisection_steps=int(
-                os.getenv("REMTP_BLOCK_BISECTION_STEPS", "20")
             ),
         )
         config.validate()
@@ -195,13 +190,10 @@ class BlockFeatureResult:
     boosted_candidate_probs: torch.Tensor
     target_candidate_ranks: torch.Tensor
     target_candidate_log_gaps: torch.Tensor
-    target_entropy: torch.Tensor
-    draft_entropy: torch.Tensor
-    normalized_surprisal: torch.Tensor
     token_support: torch.Tensor
     topk_overlap: torch.Tensor
     topk_probability_cosine: torch.Tensor
-    entropy_consistency: torch.Tensor
+    topk_js_similarity: torch.Tensor
     current_distribution_consistency: torch.Tensor
     future_distribution_consistency: torch.Tensor
     reliability: torch.Tensor
@@ -210,8 +202,8 @@ class BlockFeatureResult:
     prefix_reach_probability: torch.Tensor
     prefix_value: torch.Tensor
     priority: torch.Tensor
-    kl_capacity: torch.Tensor
-    allocated_kl: torch.Tensor
+    delta_capacity: torch.Tensor
+    allocated_delta: torch.Tensor
     realized_kl: torch.Tensor
 
 
@@ -238,11 +230,9 @@ class DistributionAgreement:
     target_top_probs: torch.Tensor
     draft_top_ids: torch.Tensor
     draft_top_probs: torch.Tensor
-    target_entropy: torch.Tensor
-    draft_entropy: torch.Tensor
     topk_overlap: torch.Tensor
     probability_cosine: torch.Tensor
-    entropy_consistency: torch.Tensor
+    js_similarity: torch.Tensor
     combined: torch.Tensor
 
 
@@ -252,9 +242,9 @@ def topk_distribution_agreement(
     top_k: int,
     overlap_weight: float,
     probability_cosine_weight: float,
-    entropy_consistency_weight: float,
+    js_similarity_weight: float,
 ) -> DistributionAgreement:
-    """Compare complete MTP and target distributions on aligned top-k support."""
+    """Compare MTP and target on their top-k union plus one tail bucket."""
     if target_probs.shape != draft_probs.shape or target_probs.ndim != 2:
         raise ValueError("target_probs and draft_probs must share [rows, vocab]")
     if top_k < 1:
@@ -262,7 +252,7 @@ def topk_distribution_agreement(
     weights = (
         overlap_weight,
         probability_cosine_weight,
-        entropy_consistency_weight,
+        js_similarity_weight,
     )
     if any(weight < 0 for weight in weights):
         raise ValueError("distribution-agreement weights must be non-negative")
@@ -310,38 +300,61 @@ def topk_distribution_agreement(
         numerator / denominator.clamp_min(1e-30)
     ).clamp(0.0, 1.0)
 
-    target_entropy = -(
-        target_probs * torch.log(target_probs.clamp_min(1e-30))
-    ).sum(dim=-1)
-    draft_entropy = -(
-        draft_probs * torch.log(draft_probs.clamp_min(1e-30))
-    ).sum(dim=-1)
-    entropy_consistency = (
-        1.0
-        - (target_entropy - draft_entropy).abs()
-        / (target_entropy + draft_entropy).clamp_min(1e-6)
+    # The union contains every unique P/Q top-k ID. One additional bucket
+    # preserves all probability mass outside that union, so JS still compares
+    # normalized distributions without a full-vocabulary log/reduction.
+    target_tail = (
+        1.0 - target_vector.sum(dim=-1, keepdim=True)
+    ).clamp_min(0.0)
+    draft_tail = (
+        1.0 - draft_vector.sum(dim=-1, keepdim=True)
+    ).clamp_min(0.0)
+    target_js = torch.cat((target_vector, target_tail), dim=-1)
+    draft_js = torch.cat((draft_vector, draft_tail), dim=-1)
+    midpoint = 0.5 * (target_js + draft_js)
+    target_term = torch.where(
+        target_js > 0,
+        target_js
+        * (
+            torch.log(target_js.clamp_min(1e-30))
+            - torch.log(midpoint.clamp_min(1e-30))
+        ),
+        torch.zeros_like(target_js),
+    )
+    draft_term = torch.where(
+        draft_js > 0,
+        draft_js
+        * (
+            torch.log(draft_js.clamp_min(1e-30))
+            - torch.log(midpoint.clamp_min(1e-30))
+        ),
+        torch.zeros_like(draft_js),
+    )
+    js_divergence = 0.5 * (
+        target_term.sum(dim=-1) + draft_term.sum(dim=-1)
+    )
+    js_similarity = (
+        1.0 - js_divergence / 0.6931471805599453
     ).clamp(0.0, 1.0)
 
     weight_sum = (
         overlap_weight
         + probability_cosine_weight
-        + entropy_consistency_weight
+        + js_similarity_weight
     )
     combined = (
         overlap_weight * overlap
         + probability_cosine_weight * probability_cosine
-        + entropy_consistency_weight * entropy_consistency
+        + js_similarity_weight * js_similarity
     ) / weight_sum
     return DistributionAgreement(
         target_top_ids=target_top_ids,
         target_top_probs=target_top_probs,
         draft_top_ids=draft_top_ids,
         draft_top_probs=draft_top_probs,
-        target_entropy=target_entropy,
-        draft_entropy=draft_entropy,
         topk_overlap=overlap,
         probability_cosine=probability_cosine,
-        entropy_consistency=entropy_consistency,
+        js_similarity=js_similarity,
         combined=combined,
     )
 
@@ -396,57 +409,64 @@ def _prefix_marginal_values(
     return reach, reach * suffix_value
 
 
-def _allocate_capped_block_budget(
+def _allocate_capped_delta_fast(
     capacities: torch.Tensor,
     priorities: torch.Tensor,
     total_budget: float,
 ) -> torch.Tensor:
-    """Weighted water filling with per-position KL capacity caps."""
-    allocation = torch.zeros_like(capacities)
+    """Two-pass capped allocation without iterative water filling."""
     budget = torch.as_tensor(
         total_budget,
         device=capacities.device,
         dtype=capacities.dtype,
     )
-    for _ in range(capacities.shape[0] + 1):
-        remaining_capacity = (capacities - allocation).clamp_min(0.0)
-        active = (remaining_capacity > 1e-12) & (priorities > 0)
-        active_priority = torch.where(
-            active,
-            priorities,
-            torch.zeros_like(priorities),
-        )
-        remaining_budget = (budget - allocation.sum()).clamp_min(0.0)
-        share = (
-            remaining_budget
-            * active_priority
-            / active_priority.sum().clamp_min(1e-30)
-        )
-        grant = torch.minimum(share, remaining_capacity)
-        allocation = allocation + torch.where(
-            active,
-            grant,
-            torch.zeros_like(grant),
-        )
-    return allocation
+    active_priority = torch.where(
+        capacities > 1e-12,
+        priorities,
+        torch.zeros_like(priorities),
+    )
+    first = torch.minimum(
+        budget
+        * active_priority
+        / active_priority.sum().clamp_min(1e-30),
+        capacities,
+    )
+
+    # One redistribution recovers most budget stranded by positions that need
+    # very little delta to reach q(y). Avoiding a variable-length loop keeps
+    # the verifier launch count fixed.
+    residual_capacity = (capacities - first).clamp_min(0.0)
+    residual_priority = torch.where(
+        residual_capacity > 1e-12,
+        priorities,
+        torch.zeros_like(priorities),
+    )
+    remaining = (budget - first.sum()).clamp_min(0.0)
+    second = torch.minimum(
+        remaining
+        * residual_priority
+        / residual_priority.sum().clamp_min(1e-30),
+        residual_capacity,
+    )
+    return first + second
 
 
-def _solve_boosted_probability(
+def _closed_form_boost(
     original: torch.Tensor,
     upper: torch.Tensor,
-    epsilon: torch.Tensor,
-    steps: int,
+    allocated_delta: torch.Tensor,
 ) -> torch.Tensor:
-    upper = torch.maximum(upper, original)
-    low = original.clone()
-    high = upper
-    active = (epsilon > 0) & (upper > original)
-    for _ in range(steps):
-        midpoint = (low + high) * 0.5
-        within_budget = bernoulli_kl(midpoint, original) <= epsilon
-        low = torch.where(active & within_budget, midpoint, low)
-        high = torch.where(active & ~within_budget, midpoint, high)
-    return torch.where(active, low, original)
+    """Cactus/Pinsker closed-form candidate boost capped at q(y)."""
+    bonus = torch.sqrt(
+        (
+            2.0
+            * allocated_delta
+            * original
+            * (1.0 - original)
+        ).clamp_min(0.0)
+    )
+    boosted = torch.minimum(original + bonus, upper)
+    return torch.where(allocated_delta > 0, boosted, original)
 
 
 def block_feature_distribution(
@@ -494,27 +514,57 @@ def block_feature_distribution(
 
     target_candidate = target[rows, ids]
     draft_candidate = draft[rows, ids]
-    agreement = topk_distribution_agreement(
-        target,
-        draft,
-        config.distribution_top_k,
-        config.overlap_weight,
-        config.probability_cosine_weight,
-        config.entropy_consistency_weight,
+    needs_distribution = (
+        config.use_current_distribution
+        or config.use_future_distribution
     )
-    candidate_ranks = 1 + (
-        target > target_candidate.unsqueeze(-1)
-    ).sum(dim=-1)
-    target_top_probs = agreement.target_top_probs[:, 0]
+    if needs_distribution:
+        agreement = topk_distribution_agreement(
+            target,
+            draft,
+            config.distribution_top_k,
+            config.overlap_weight,
+            config.probability_cosine_weight,
+            config.js_similarity_weight,
+        )
+        target_top_ids = agreement.target_top_ids
+        target_top_probs = agreement.target_top_probs
+        topk_overlap = agreement.topk_overlap
+        topk_probability_cosine = agreement.probability_cosine
+        topk_js_similarity = agreement.js_similarity
+        current_distribution = agreement.combined
+    else:
+        topk_size = min(config.distribution_top_k, target.shape[-1])
+        target_top_probs, target_top_ids = torch.topk(
+            target,
+            k=topk_size,
+            dim=-1,
+            sorted=True,
+        )
+        topk_overlap = torch.zeros_like(target_candidate)
+        topk_probability_cosine = torch.zeros_like(target_candidate)
+        topk_js_similarity = torch.zeros_like(target_candidate)
+        current_distribution = torch.zeros_like(target_candidate)
+
+    candidate_matches = target_top_ids == ids.unsqueeze(1)
+    candidate_in_topk = candidate_matches.any(dim=-1)
+    candidate_topk_rank = (
+        candidate_matches.to(torch.int64).argmax(dim=-1) + 1
+    )
+    candidate_ranks = torch.where(
+        candidate_in_topk,
+        candidate_topk_rank,
+        torch.full_like(
+            candidate_topk_rank,
+            target_top_ids.shape[-1] + 1,
+        ),
+    )
+    target_top_probs = target_top_probs[:, 0]
     candidate_log_gaps = (
         torch.log(target_top_probs.clamp_min(1e-30))
         - torch.log(target_candidate.clamp_min(1e-30))
     ).clamp_min(0.0)
 
-    surprisal = -torch.log(target_candidate.clamp_min(1e-30))
-    normalized_surprisal = (
-        surprisal / agreement.target_entropy.clamp_min(1e-6)
-    )
     rank_support = torch.exp(
         -(candidate_ranks.to(torch.float32) - 1.0)
         / config.token_rank_scale
@@ -524,7 +574,6 @@ def block_feature_distribution(
     )
     token_support = torch.sqrt(rank_support * gap_support).clamp(0.0, 1.0)
 
-    current_distribution = agreement.combined
     future_distribution = _future_distribution_consistency(
         current_distribution,
         config.future_decay,
@@ -585,7 +634,7 @@ def block_feature_distribution(
         prefix_value = torch.ones_like(target_candidate)
 
     safe = (
-        (normalized_surprisal <= config.max_normalized_surprisal)
+        (candidate_log_gaps <= config.max_target_log_gap)
         & (reliability >= config.min_reliability)
     )
     if config.use_prefix_value:
@@ -603,22 +652,28 @@ def block_feature_distribution(
         draft_candidate.clamp_max(1.0 - 1e-6),
         target_candidate,
     )
-    kl_capacity = bernoulli_kl(candidate_cap, target_candidate)
-    kl_capacity = torch.where(
+    delta_capacity = (
+        (candidate_cap - target_candidate).square()
+        / (
+            2.0
+            * target_candidate
+            * (1.0 - target_candidate)
+        ).clamp_min(1e-30)
+    )
+    delta_capacity = torch.where(
         safe & (draft_candidate > target_candidate),
-        kl_capacity,
-        torch.zeros_like(kl_capacity),
+        delta_capacity,
+        torch.zeros_like(delta_capacity),
     )
-    allocated_kl = _allocate_capped_block_budget(
-        kl_capacity,
+    allocated_delta = _allocate_capped_delta_fast(
+        delta_capacity,
         priority,
-        config.block_kl_budget,
+        config.block_delta_budget,
     )
-    boosted = _solve_boosted_probability(
+    boosted = _closed_form_boost(
         target_candidate,
         candidate_cap,
-        allocated_kl,
-        config.bisection_steps,
+        allocated_delta,
     )
 
     relaxed = None
@@ -645,13 +700,10 @@ def block_feature_distribution(
         boosted_candidate_probs=realized_boosted,
         target_candidate_ranks=candidate_ranks,
         target_candidate_log_gaps=candidate_log_gaps,
-        target_entropy=agreement.target_entropy,
-        draft_entropy=agreement.draft_entropy,
-        normalized_surprisal=normalized_surprisal,
         token_support=token_support,
-        topk_overlap=agreement.topk_overlap,
-        topk_probability_cosine=agreement.probability_cosine,
-        entropy_consistency=agreement.entropy_consistency,
+        topk_overlap=topk_overlap,
+        topk_probability_cosine=topk_probability_cosine,
+        topk_js_similarity=topk_js_similarity,
         current_distribution_consistency=current_distribution,
         future_distribution_consistency=future_distribution,
         reliability=reliability,
@@ -660,8 +712,8 @@ def block_feature_distribution(
         prefix_reach_probability=reach_probability,
         prefix_value=prefix_value,
         priority=priority,
-        kl_capacity=kl_capacity,
-        allocated_kl=allocated_kl,
+        delta_capacity=delta_capacity,
+        allocated_delta=allocated_delta,
         realized_kl=realized_kl,
     )
 
@@ -764,13 +816,12 @@ def _block_feature_rejection_sample_v1(
             f"p(D)={result.target_candidate_probs.tolist()} "
             f"q(D)={result.draft_candidate_probs.tolist()} "
             f"h(D)={result.boosted_candidate_probs.tolist()} "
-            f"target_rank={result.target_candidate_ranks.tolist()} "
+            f"target_topk_rank={result.target_candidate_ranks.tolist()} "
             f"log_gap={result.target_candidate_log_gaps.tolist()} "
-            f"norm_surprisal={result.normalized_surprisal.tolist()} "
             f"token_support={result.token_support.tolist()} "
             f"topk_overlap={result.topk_overlap.tolist()} "
             f"prob_cos={result.topk_probability_cosine.tolist()} "
-            f"entropy_match={result.entropy_consistency.tolist()} "
+            f"js_similarity={result.topk_js_similarity.tolist()} "
             f"current_dist={result.current_distribution_consistency.tolist()} "
             f"future_dist={result.future_distribution_consistency.tolist()} "
             f"reliability={result.reliability.tolist()} "
@@ -778,7 +829,7 @@ def _block_feature_rejection_sample_v1(
             f"prefix_reach={result.prefix_reach_probability.tolist()} "
             f"prefix_value={result.prefix_value.tolist()} "
             f"priority={result.priority.tolist()} "
-            f"KL_alloc={result.allocated_kl.tolist()} "
+            f"delta_alloc={result.allocated_delta.tolist()} "
             f"KL_realized={result.realized_kl.tolist()} "
             f"KL_total={result.realized_kl.sum().item():.6f}",
             flush=True,
@@ -831,7 +882,8 @@ def install_block_feature_mtp() -> None:
 
     print(
         "[ReMTP][BlockFeature] "
-        f"block_kl_budget={config.block_kl_budget:g} "
+        "fast_closed_form=1 "
+        f"block_delta_budget={config.block_delta_budget:g} "
         f"draft_tokens={config.expected_draft_tokens} "
         f"prefix_value={int(config.use_prefix_value)} "
         f"current_distribution={int(config.use_current_distribution)} "
@@ -839,7 +891,7 @@ def install_block_feature_mtp() -> None:
         f"future_decay={config.future_decay:g} "
         f"top_k={config.distribution_top_k} "
         f"min_reliability={config.min_reliability:g} "
-        f"max_norm_surprisal={config.max_normalized_surprisal:g} "
+        f"max_target_log_gap={config.max_target_log_gap:g} "
         f"min_prefix_reach={config.min_prefix_reach_probability:g} "
         "draft=probabilistic-MTP bonus=original-target",
         flush=True,
