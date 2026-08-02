@@ -49,6 +49,8 @@ def _profile_label(directory: str) -> str:
         "debt_top1": "Current-block debt + nonnegative top-1 bias",
         "top1_surplus": "Cactus-dominant top-1 surplus",
         "target_surplus": "Cactus-dominant target surplus",
+        "risk_swap": "Target-anchored Cactus risk swap",
+        "target_recovery": "Target-surplus + target recovery",
     }
     return labels.get(directory, directory)
 

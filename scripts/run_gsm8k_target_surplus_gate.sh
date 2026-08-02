@@ -7,12 +7,12 @@ cd "$PROJECT_DIR"
 
 usage() {
   cat <<'EOF'
-Run native probabilistic MTP, Cactus, the old balanced debt controller, and
-Cactus-dominant target-supported surplus recycling on one GSM8K seed. Confirm
-target surplus on a second seed only if it passes all Pareto conditions.
+Run native probabilistic MTP, Cactus, the old balanced debt controller, the
+old target-surplus ablation, and two target-anchored candidates on one GSM8K
+seed. Confirm the best passing candidate on a second seed.
 
 Usage:
-  ./scripts/run_gsm8k_target_surplus_gate.sh
+  ./scripts/run_gsm8k_target_anchored_gate.sh
 
 Environment:
   SAMPLES=100
@@ -24,6 +24,9 @@ Environment:
   MTP_TOKENS=6
   CACTUS_DELTA=1.0
   SURPLUS_MAX_LOG_GAP=2.0
+  RISK_SWAP_SOFT_LOG_GAP=4.0
+  RISK_SWAP_HARD_LOG_GAP=10.0
+  RISK_SWAP_DESTINATION_LOG_GAP=2.0
   PROGRESS_EVERY=10
   SERVER_START_TIMEOUT=180
   RUN_TAG=<timestamp>
@@ -52,6 +55,9 @@ MAX_TOKENS="${MAX_TOKENS:-384}"
 MTP_TOKENS="${MTP_TOKENS:-6}"
 CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
 SURPLUS_MAX_LOG_GAP="${SURPLUS_MAX_LOG_GAP:-2.0}"
+RISK_SWAP_SOFT_LOG_GAP="${RISK_SWAP_SOFT_LOG_GAP:-4.0}"
+RISK_SWAP_HARD_LOG_GAP="${RISK_SWAP_HARD_LOG_GAP:-10.0}"
+RISK_SWAP_DESTINATION_LOG_GAP="${RISK_SWAP_DESTINATION_LOG_GAP:-2.0}"
 HEAD_RELIABILITY="${HEAD_RELIABILITY:-1.0,0.85,0.70,0.55,0.40,0.30}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
@@ -75,8 +81,8 @@ if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
   exit 2
 fi
 
-RUN_ROOT="$PROJECT_DIR/results/gsm8k_target_surplus_gate_${RUN_TAG}"
-LOG_ROOT="$PROJECT_DIR/logs/gsm8k_target_surplus_gate_${RUN_TAG}"
+RUN_ROOT="$PROJECT_DIR/results/gsm8k_target_anchored_gate_${RUN_TAG}"
+LOG_ROOT="$PROJECT_DIR/logs/gsm8k_target_anchored_gate_${RUN_TAG}"
 server_pid=""
 
 cleanup_server() {
@@ -149,6 +155,18 @@ profile_server() {
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_surplus_mtp.sh"
       PROFILE_ENV=(SURPLUS_MAX_LOG_GAP="$SURPLUS_MAX_LOG_GAP")
       ;;
+    risk_swap)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_risk_swap_mtp.sh"
+      PROFILE_ENV=(
+        RISK_SWAP_SOFT_LOG_GAP="$RISK_SWAP_SOFT_LOG_GAP"
+        RISK_SWAP_HARD_LOG_GAP="$RISK_SWAP_HARD_LOG_GAP"
+        RISK_SWAP_DESTINATION_LOG_GAP="$RISK_SWAP_DESTINATION_LOG_GAP"
+      )
+      ;;
+    target_recovery)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_recovery_mtp.sh"
+      PROFILE_ENV=(SURPLUS_MAX_LOG_GAP="$SURPLUS_MAX_LOG_GAP")
+      ;;
     *)
       echo "Unknown profile: $profile" >&2
       exit 2
@@ -213,30 +231,34 @@ run_stage() {
 mkdir -p "$LOG_ROOT"
 mkdir "$RUN_ROOT"
 
-echo "GSM8K Cactus-dominant target-surplus gate"
+echo "GSM8K target-anchored relaxed-MTP gate"
 echo "samples=$SAMPLES seeds=$SAMPLE_SEED,$SECOND_SAMPLE_SEED"
 echo "temperature=$TEMPERATURE generation_seed=$SEED max_tokens=$MAX_TOKENS"
 echo "production_audit=0 local_results=$RUN_ROOT"
 
-run_stage "$SAMPLE_SEED" native_mtp debt_balanced target_surplus
+run_stage "$SAMPLE_SEED" native_mtp debt_balanced target_surplus risk_swap target_recovery
 first_stage="$RUN_ROOT/seed_${SAMPLE_SEED}"
-surplus_pass="$(python -c '
+winner="$(python -c '
 import json, sys
 rows = json.load(open(sys.argv[1]))
-row = next(item for item in rows if item["directory"] == "target_surplus")
-print(int(row["pareto_pass"]))
+rows = [row for row in rows if row["directory"] in {"risk_swap", "target_recovery"} and row["pareto_pass"]]
+if not rows:
+    print("")
+else:
+    row = max(rows, key=lambda x: (x["accuracy"], x["mean_acceptance_length"], x["e2e_tok_s"]))
+    print(row["directory"])
 ' "$first_stage/comparison.json")"
 
-if [[ "$surplus_pass" != "1" ]]; then
+if [[ -z "$winner" ]]; then
   echo
-  echo "Target surplus did not pass the first-seed Pareto gate."
+  echo "No target-anchored candidate passed the first-seed Pareto gate."
   echo "The second seed was not run: $first_stage/comparison.md"
   exit 0
 fi
 
 echo
-echo "Target surplus passed seed $SAMPLE_SEED; confirming on $SECOND_SAMPLE_SEED."
-run_stage "$SECOND_SAMPLE_SEED" native_mtp target_surplus
+echo "$winner passed seed $SAMPLE_SEED; confirming on $SECOND_SAMPLE_SEED."
+run_stage "$SECOND_SAMPLE_SEED" native_mtp "$winner"
 second_stage="$RUN_ROOT/seed_${SECOND_SAMPLE_SEED}"
 second_pass="$(python -c '
 import json, sys
@@ -245,9 +267,9 @@ print(int(json.load(open(sys.argv[1]))["pareto_pass"]))
 
 echo
 if [[ "$second_pass" == "1" ]]; then
-  echo "REPRODUCED: target surplus passed all three metrics on both seeds."
+  echo "REPRODUCED: $winner passed all three metrics on both seeds."
 else
-  echo "NOT REPRODUCED: target surplus failed the second-seed gate."
+  echo "NOT REPRODUCED: $winner failed the second-seed gate."
 fi
 echo "Seed 1: $first_stage/comparison.md"
 echo "Seed 2: $second_stage/comparison.md"

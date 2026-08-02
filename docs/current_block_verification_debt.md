@@ -64,6 +64,21 @@ It keeps the strict top-1 destination as an ablation, but uses a default
 relative target log-probability gap of `2.0` in the main variant because the
 top-1 candidate is almost always already Cactus-saturated at `delta=1`.
 
+The next `tv_risk_swap` variant removes the structural Cactus floor at risky
+positions. It keeps Cactus TV through a soft target log-gap, attenuates it to
+zero at a hard gap, and reinvests both the pruned TV and saturation surplus by
+filling target-supported positions in prefix order. Unlike balanced debt, it
+has no suffix-wide stop.
+
+```bash
+SAMPLES=100 ./scripts/run_gsm8k_risk_swap_gate.sh
+```
+
+The same target-anchored gate includes a target-recovery ablation. It keeps
+relaxed acceptance unchanged but samples the first correction token from the
+original target distribution rather than `(H-Q)+`; the target bonus token is
+unchanged.
+
 Only that winner is repeated on a second sample seed. The comparison code
 also checks that sample manifests and decoding protocol fields are identical.
 

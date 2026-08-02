@@ -549,3 +549,22 @@ SAMPLES=100 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
 ```bash
 SAMPLES=10 ./scripts/run_gsm8k_target_surplus_audit.sh
 ```
+
+## 14. Target-anchored Cactus risk swap（MTP=6）
+
+Risk swap 取消全块 stop：目标支持位置保留 Cactus 有效预算，目标反对
+越强则连续削减；削减预算和候选饱和浪费一起，按草稿前缀顺序重新投入
+安全位置。
+
+主测试仍固定包含纯概率 MTP、Cactus、旧质量消融以及新方案：
+
+```bash
+SAMPLES=100 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
+./scripts/run_gsm8k_target_anchored_gate.sh
+```
+
+正式测试始终关闭机制审计；结果和日志仅写入本地忽略目录。
+
+同一入口还测试 target-recovery 消融：松弛接受和目标 bonus 保持不变，
+但第一次拒绝后的纠正 token 从原始目标分布采样，而不是松弛残差
+`(H-Q)+`。该消融用于隔离接受决策与 RECOVER 分布造成的质量变化。

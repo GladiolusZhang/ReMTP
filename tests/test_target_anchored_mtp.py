@@ -524,6 +524,64 @@ class TargetAnchoredMTPTest(unittest.TestCase):
         torch.testing.assert_close(p_y, result.target_candidate_probs)
         torch.testing.assert_close(h_y, result.boosted_candidate_probs)
 
+    def test_risk_swap_prunes_opposed_cactus_and_reinvests_safely(self) -> None:
+        target = torch.tensor(
+            [
+                [0.89, 0.01, 0.10],
+                [0.40, 0.35, 0.25],
+            ]
+        )
+        draft = torch.tensor(
+            [
+                [0.40, 0.50, 0.10],
+                [0.80, 0.10, 0.10],
+            ]
+        )
+        ids = torch.tensor([1, 0])
+        config = self.config(
+            "tv_risk_swap",
+            expected_draft_tokens=2,
+            head_reliability=(1.0, 1.0),
+            cactus_delta=0.01,
+            risk_swap_soft_log_gap=1.0,
+            risk_swap_hard_log_gap=4.0,
+            risk_swap_destination_log_gap=1.0,
+        )
+        result = target_anchored_distribution(
+            target,
+            draft,
+            ids,
+            config,
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        cactus_floor = torch.minimum(
+            result.cactus_tv,
+            result.useful_tv_capacity,
+        )
+        self.assertEqual(result.allocated_tv[0].item(), 0.0)
+        self.assertGreater(result.allocated_tv[1], cactus_floor[1])
+        self.assertLessEqual(
+            result.allocated_tv.sum().item(),
+            result.cactus_tv.sum().item() + 1e-6,
+        )
+        self.assertTrue(
+            torch.all(
+                result.allocated_tv
+                <= result.useful_tv_capacity + 1e-6
+            ).item()
+        )
+
+        p_y, h_y = target_anchored_candidate_probs(
+            target,
+            draft,
+            ids,
+            torch.ones(2),
+            config,
+        )
+        torch.testing.assert_close(p_y, result.target_candidate_probs)
+        torch.testing.assert_close(h_y, result.boosted_candidate_probs)
+
     def test_aligned_hidden_cosine_and_fallback(self) -> None:
         draft = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
@@ -623,6 +681,17 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             TargetAnchoredConfig(debt_fallback="unsafe").validate()
         with self.assertRaises(ValueError):
             TargetAnchoredConfig(surplus_max_log_gap=-1.0).validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(
+                risk_swap_soft_log_gap=2.0,
+                risk_swap_hard_log_gap=2.0,
+            ).validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(
+                risk_swap_destination_log_gap=-1.0,
+            ).validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(recovery_mode="unsafe").validate()
 
     def test_default_config_covers_six_mtp_heads(self) -> None:
         config = TargetAnchoredConfig()

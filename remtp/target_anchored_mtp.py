@@ -21,6 +21,9 @@ Three ablations are implemented:
   only where the MTP candidate is the target top-1.
 * ``tv_target_surplus``: practical variant that spends the same surplus in
   prefix order on target-supported candidates within one relative log gap.
+* ``tv_risk_swap``: preserve Cactus on target-supported positions, prune its
+  risky tail continuously, and spend both the pruned mass and saturation
+  surplus where it has higher target-anchored prefix utility.
 """
 
 from __future__ import annotations
@@ -89,6 +92,10 @@ class TargetAnchoredConfig:
     debt_max_cactus_ratio: float = 2.0
     debt_fallback: str = "strict"
     surplus_max_log_gap: float = 2.0
+    risk_swap_soft_log_gap: float = 4.0
+    risk_swap_hard_log_gap: float = 10.0
+    risk_swap_destination_log_gap: float = 2.0
+    recovery_mode: str = "residual"
 
     def validate(self) -> None:
         if self.variant not in {
@@ -98,6 +105,7 @@ class TargetAnchoredConfig:
             "tv_debt_control",
             "tv_top1_surplus",
             "tv_target_surplus",
+            "tv_risk_swap",
         }:
             raise ValueError(f"unsupported target-anchored variant: {self.variant}")
         if self.cactus_delta < 0:
@@ -138,6 +146,18 @@ class TargetAnchoredConfig:
             )
         if self.surplus_max_log_gap < 0.0:
             raise ValueError("surplus_max_log_gap must be non-negative")
+        if self.risk_swap_soft_log_gap < 0.0:
+            raise ValueError("risk_swap_soft_log_gap must be non-negative")
+        if self.risk_swap_hard_log_gap <= self.risk_swap_soft_log_gap:
+            raise ValueError(
+                "risk_swap_hard_log_gap must exceed the soft gap"
+            )
+        if self.risk_swap_destination_log_gap < 0.0:
+            raise ValueError(
+                "risk_swap_destination_log_gap must be non-negative"
+            )
+        if self.recovery_mode not in {"residual", "target"}:
+            raise ValueError("recovery_mode must be residual or target")
 
     @classmethod
     def from_env(cls) -> TargetAnchoredConfig:
@@ -196,6 +216,22 @@ class TargetAnchoredConfig:
             ),
             surplus_max_log_gap=float(
                 os.getenv("REMTP_TA_SURPLUS_MAX_LOG_GAP", "2.0")
+            ),
+            risk_swap_soft_log_gap=float(
+                os.getenv("REMTP_TA_RISK_SWAP_SOFT_LOG_GAP", "4.0")
+            ),
+            risk_swap_hard_log_gap=float(
+                os.getenv("REMTP_TA_RISK_SWAP_HARD_LOG_GAP", "10.0")
+            ),
+            risk_swap_destination_log_gap=float(
+                os.getenv(
+                    "REMTP_TA_RISK_SWAP_DESTINATION_LOG_GAP",
+                    "2.0",
+                )
+            ),
+            recovery_mode=os.getenv(
+                "REMTP_TA_RECOVERY_MODE",
+                "residual",
             ),
         )
         config.validate()
@@ -406,6 +442,61 @@ def top1_surplus_candidate_probs(
         max_log_gap=max_log_gap,
     )
     return p_y, p_y + allocated
+
+
+def _risk_swap_tv(
+    *,
+    p_y: torch.Tensor,
+    q_y: torch.Tensor,
+    log_gap: torch.Tensor,
+    cactus_tv: torch.Tensor,
+    soft_log_gap: float,
+    hard_log_gap: float,
+    destination_log_gap: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Swap risky Cactus TV into safer, higher-value prefix positions.
+
+    Cactus effective TV is kept unchanged up to ``soft_log_gap``, attenuated
+    linearly until ``hard_log_gap``, and removed at or beyond the hard gap.
+    The removed TV and candidate-saturation surplus share one exact block
+    budget and are reallocated only to target-supported destinations. Safe
+    capacity is filled in prefix order because no later speculative token can
+    be committed after an earlier rejection.
+    """
+    useful_capacity = (q_y - p_y).clamp_min(0.0)
+    cactus_floor = torch.minimum(cactus_tv, useful_capacity)
+    gap_width = hard_log_gap - soft_log_gap
+    keep_multiplier = (
+        (hard_log_gap - log_gap) / gap_width
+    ).clamp(0.0, 1.0)
+    kept = cactus_floor * keep_multiplier
+    pool = (cactus_tv - kept).clamp_min(0.0).sum()
+
+    destination_mask = log_gap <= destination_log_gap
+    destination_capacity = torch.where(
+        destination_mask,
+        (useful_capacity - kept).clamp_min(0.0),
+        torch.zeros_like(useful_capacity),
+    )
+    received = torch.zeros_like(useful_capacity)
+    remaining = pool
+    for depth in range(useful_capacity.shape[0]):
+        step = torch.minimum(destination_capacity[depth], remaining)
+        received[depth] = step
+        remaining = (remaining - step).clamp_min(0.0)
+    return (
+        kept + received,
+        cactus_floor,
+        kept,
+        destination_capacity,
+        keep_multiplier,
+    )
 
 
 def _debt_controlled_tv(
@@ -661,6 +752,25 @@ def target_anchored_distribution(
         raw_allocated = allocated.clone()
         risk_capacity = destination_capacity
         risk_multiplier = target_supported.to(torch.float32)
+    elif config.variant == "tv_risk_swap":
+        (
+            allocated,
+            cactus_floor,
+            kept_cactus,
+            destination_capacity,
+            keep_multiplier,
+        ) = _risk_swap_tv(
+            p_y=p_y,
+            q_y=q_y,
+            log_gap=log_gap,
+            cactus_tv=cactus_tv,
+            soft_log_gap=config.risk_swap_soft_log_gap,
+            hard_log_gap=config.risk_swap_hard_log_gap,
+            destination_log_gap=config.risk_swap_destination_log_gap,
+        )
+        raw_allocated = cactus_floor
+        risk_capacity = kept_cactus + destination_capacity
+        risk_multiplier = keep_multiplier
     elif config.variant == "tv_debt_control":
         (
             allocated,
@@ -782,6 +892,94 @@ def boost_candidate_logits(
     boosted = boosted_candidate_probs.clamp(1e-12, 1.0 - 1e-6)
     logits[rows, ids] += torch.logit(boosted) - torch.logit(original)
     return logits
+
+
+def _sample_with_target_recovery(
+    *,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: list[int],
+    max_spec_len: int,
+    cu_num_draft_tokens: torch.Tensor,
+    draft_probs: torch.Tensor,
+    verification_logits: torch.Tensor,
+    original_target_probs: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    sampling_metadata: Any,
+) -> torch.Tensor:
+    """Keep relaxed acceptance but recover a rejection from target ``p``.
+
+    The ordinary sampler draws RECOVER from ``(h-q)+``.  This ablation keeps
+    the same acceptance uniforms and relaxed distribution ``h`` but samples
+    the first correction token from the original target distribution.  The
+    accepted prefix and target bonus rules are unchanged.
+    """
+    module = importlib.import_module(_V1_REJECTION_MODULE)
+    batch_size = len(num_draft_tokens)
+    num_tokens = draft_token_ids.shape[0]
+    vocab_size = verification_logits.shape[-1]
+    device = verification_logits.device
+    output_token_ids = torch.full(
+        (batch_size, max_spec_len + 1),
+        module.PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    if sampling_metadata.all_greedy:
+        is_greedy = None
+    else:
+        is_greedy = (
+            sampling_metadata.temperature == module.GREEDY_TEMPERATURE
+        )
+    if not sampling_metadata.all_random:
+        target_argmax = verification_logits.argmax(dim=-1)
+        module.rejection_greedy_sample_kernel[(batch_size,)](
+            output_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            target_argmax,
+            bonus_token_ids,
+            is_greedy,
+            max_spec_len,
+        )
+        if sampling_metadata.all_greedy:
+            return output_token_ids
+
+    verification_probs = verification_logits.softmax(
+        dim=-1,
+        dtype=torch.float32,
+    ).contiguous()
+    uniform_probs = module.generate_uniform_probs(
+        num_tokens,
+        num_draft_tokens,
+        sampling_metadata.generators,
+        device,
+    )
+    recovered_token_ids = module.sample_recovered_tokens(
+        max_spec_len,
+        num_draft_tokens,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        None,
+        original_target_probs.contiguous(),
+        sampling_metadata,
+        device,
+    )
+    module.rejection_random_sample_kernel[(batch_size,)](
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        draft_probs,
+        verification_probs,
+        bonus_token_ids,
+        recovered_token_ids,
+        uniform_probs,
+        is_greedy,
+        max_spec_len,
+        vocab_size,
+        NO_DRAFT_PROBS=False,
+    )
+    return output_token_ids
 
 
 def _target_anchored_rejection_sample(
@@ -1076,16 +1274,29 @@ def _target_anchored_rejection_sample(
     else:
         verification_logits = relaxed_logits
 
-    output_token_ids = original(
-        draft_token_ids,
-        num_draft_tokens,
-        max_spec_len,
-        cu_num_draft_tokens,
-        draft_probs,
-        verification_logits,
-        bonus_token_ids,
-        sampling_metadata,
-    )
+    if config.recovery_mode == "target" and not sampling_metadata.all_greedy:
+        output_token_ids = _sample_with_target_recovery(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens,
+            max_spec_len=max_spec_len,
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            draft_probs=draft_probs,
+            verification_logits=verification_logits,
+            original_target_probs=target_probs,
+            bonus_token_ids=bonus_token_ids,
+            sampling_metadata=sampling_metadata,
+        )
+    else:
+        output_token_ids = original(
+            draft_token_ids,
+            num_draft_tokens,
+            max_spec_len,
+            cu_num_draft_tokens,
+            draft_probs,
+            verification_logits,
+            bonus_token_ids,
+            sampling_metadata,
+        )
     if post_verification_hook is not None:
         ids = draft_token_ids.to(device=target_probs.device, dtype=torch.int64)
         rows = torch.arange(ids.shape[0], device=target_probs.device)
@@ -1187,6 +1398,11 @@ def install_target_anchored_mtp() -> None:
         f"debt_max_cactus_ratio={config.debt_max_cactus_ratio:g} "
         f"debt_fallback={config.debt_fallback} "
         f"surplus_max_gap={config.surplus_max_log_gap:g} "
+        f"risk_swap_gap={config.risk_swap_soft_log_gap:g}:"
+        f"{config.risk_swap_hard_log_gap:g} "
+        f"risk_swap_destination_gap="
+        f"{config.risk_swap_destination_log_gap:g} "
+        f"recovery={config.recovery_mode} "
         f"compiled={int(compile_fast_path)} "
         "budget=exact-Cactus-TV cap=h(y)<=q(y) "
         f"surplus={int(config.variant in {'tv_top1_surplus', 'tv_target_surplus'})}",

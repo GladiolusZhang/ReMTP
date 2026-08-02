@@ -63,14 +63,14 @@ class TargetAnchoredMTPWorker(Worker):
     """CUDA worker for target-anchored exact-TV MTP verification."""
 
     def init_device(self, *args: Any, **kwargs: Any) -> Any:
-        from remtp.probabilistic_mtp import (
-            install_aligned_hidden_capture,
-            install_probabilistic_mtp,
-        )
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
         from remtp.target_anchored_mtp import install_target_anchored_mtp
 
         install_probabilistic_mtp()
-        install_aligned_hidden_capture()
+        if os.getenv("REMTP_TA_VARIANT") == "tv_hidden_veto":
+            from remtp.probabilistic_mtp import install_aligned_hidden_capture
+
+            install_aligned_hidden_capture()
         install_target_anchored_mtp()
         return super().init_device(*args, **kwargs)
 
