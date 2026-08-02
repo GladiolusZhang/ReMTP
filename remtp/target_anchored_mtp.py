@@ -27,8 +27,9 @@ Three ablations are implemented:
 * ``tv_block_shield``: retain a fixed Cactus share inside the risk swap so
   joint Block Verification can spend its acceptance surplus on quality
   control without falling below the token-wise Cactus operating point.
-* ``tv_event_shield``: apply that same shield only when the current block
-  contains a candidate beyond the risk-swap soft target-gap boundary.
+* ``tv_risk_gated_block``: apply that same shield only when the current block
+  contains a candidate beyond the target-risk soft boundary. The historical
+  ``tv_event_shield`` name remains as an exact alias.
 """
 
 from __future__ import annotations
@@ -114,6 +115,7 @@ class TargetAnchoredConfig:
             "tv_risk_swap",
             "tv_block_shield",
             "tv_event_shield",
+            "tv_risk_gated_block",
         }:
             raise ValueError(f"unsupported target-anchored variant: {self.variant}")
         if self.cactus_delta < 0:
@@ -769,6 +771,7 @@ def target_anchored_distribution(
         "tv_risk_swap",
         "tv_block_shield",
         "tv_event_shield",
+        "tv_risk_gated_block",
     }:
         (
             allocated,
@@ -788,12 +791,19 @@ def target_anchored_distribution(
         raw_allocated = cactus_floor
         risk_capacity = kept_cactus + destination_capacity
         risk_multiplier = keep_multiplier
-        if config.variant in {"tv_block_shield", "tv_event_shield"}:
+        if config.variant in {
+            "tv_block_shield",
+            "tv_event_shield",
+            "tv_risk_gated_block",
+        }:
             shield_allocated = (
                 (1.0 - config.block_shield_cactus_mix) * allocated
                 + config.block_shield_cactus_mix * cactus_tv
             )
-            if config.variant == "tv_event_shield":
+            if config.variant in {
+                "tv_event_shield",
+                "tv_risk_gated_block",
+            }:
                 block_trigger = (
                     log_gap > config.risk_swap_soft_log_gap
                 ).any()
@@ -1404,7 +1414,11 @@ def install_target_anchored_mtp() -> None:
 
     candidate_cap = (
         "Cactus/risk interpolation"
-        if config.variant in {"tv_block_shield", "tv_event_shield"}
+        if config.variant in {
+            "tv_block_shield",
+            "tv_event_shield",
+            "tv_risk_gated_block",
+        }
         else "h(y)<=q(y)"
     )
 

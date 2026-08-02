@@ -664,6 +664,50 @@ class TargetAnchoredMTPTest(unittest.TestCase):
         )
         torch.testing.assert_close(event.allocated_tv, fixed.allocated_tv)
 
+    def test_risk_gated_block_is_the_canonical_event_shield_name(self) -> None:
+        common = {
+            "cactus_delta": 0.01,
+            "risk_swap_soft_log_gap": 1.0,
+            "risk_swap_hard_log_gap": 4.0,
+            "risk_swap_destination_log_gap": 1.0,
+            "block_shield_cactus_mix": 0.30,
+        }
+        for target in (
+            self.target,
+            torch.tensor(
+                [
+                    [0.89, 0.01, 0.05, 0.05],
+                    [0.50, 0.35, 0.10, 0.05],
+                    [0.45, 0.35, 0.15, 0.05],
+                    [0.40, 0.35, 0.20, 0.05],
+                ]
+            ),
+        ):
+            canonical = target_anchored_distribution(
+                target,
+                self.draft,
+                self.ids,
+                self.config("tv_risk_gated_block", **common),
+                assume_normalized=True,
+                construct_probs=False,
+            )
+            historical = target_anchored_distribution(
+                target,
+                self.draft,
+                self.ids,
+                self.config("tv_event_shield", **common),
+                assume_normalized=True,
+                construct_probs=False,
+            )
+            torch.testing.assert_close(
+                canonical.allocated_tv,
+                historical.allocated_tv,
+            )
+            torch.testing.assert_close(
+                canonical.boosted_candidate_probs,
+                historical.boosted_candidate_probs,
+            )
+
     def test_aligned_hidden_cosine_and_fallback(self) -> None:
         draft = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])

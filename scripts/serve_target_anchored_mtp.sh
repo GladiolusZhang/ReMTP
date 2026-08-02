@@ -17,10 +17,10 @@ fi
 
 variant="${TARGET_ANCHORED_VARIANT:-tv_hidden_veto}"
 case "$variant" in
-  cactus_cap|tv_head|tv_hidden_veto|tv_debt_control|tv_top1_surplus|tv_target_surplus|tv_risk_swap|tv_block_shield|tv_event_shield) ;;
+  cactus_cap|tv_head|tv_hidden_veto|tv_debt_control|tv_top1_surplus|tv_target_surplus|tv_risk_swap|tv_block_shield|tv_event_shield|tv_risk_gated_block) ;;
   *)
     echo "Unknown TARGET_ANCHORED_VARIANT=$variant" >&2
-    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, tv_debt_control, tv_top1_surplus, tv_target_surplus, tv_risk_swap, tv_block_shield, or tv_event_shield" >&2
+    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, tv_debt_control, tv_top1_surplus, tv_target_surplus, tv_risk_swap, tv_block_shield, tv_event_shield, or tv_risk_gated_block" >&2
     exit 2
     ;;
 esac
@@ -56,7 +56,7 @@ if [[ -z "${REMTP_COMPILATION_CONFIG:-}" ]]; then
   export REMTP_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}'
 fi
 
-if [[ "$variant" == "tv_risk_swap" || "$variant" == "tv_block_shield" || "$variant" == "tv_event_shield" ]]; then
+if [[ "$variant" == "tv_risk_swap" || "$variant" == "tv_block_shield" || "$variant" == "tv_event_shield" || "$variant" == "tv_risk_gated_block" ]]; then
   echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS risk_swap_gap=$REMTP_TA_RISK_SWAP_SOFT_LOG_GAP:$REMTP_TA_RISK_SWAP_HARD_LOG_GAP destination_gap=$REMTP_TA_RISK_SWAP_DESTINATION_LOG_GAP"
 elif [[ "$variant" == "tv_top1_surplus" || "$variant" == "tv_target_surplus" ]]; then
   echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS surplus_max_log_gap=$REMTP_TA_SURPLUS_MAX_LOG_GAP"

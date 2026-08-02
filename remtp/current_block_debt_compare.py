@@ -43,6 +43,7 @@ def _profile_label(directory: str) -> str:
     labels = {
         "native_mtp": "Native probabilistic MTP",
         "cactus": "Cactus + MTP",
+        "spec_cascade": "SpecCascade TokenV3 + MTP",
         "debt_conservative": "Current-block debt (conservative)",
         "debt_balanced": "Current-block debt (balanced)",
         "debt_cactus_fallback": "Current-block debt (Cactus fallback)",
@@ -57,6 +58,7 @@ def _profile_label(directory: str) -> str:
         "risk_swap_block": "Target-anchored risk swap + Block Verification",
         "block_shield": "Block-surplus-shielded risk control",
         "event_shield": "Event-triggered Block Shield",
+        "risk_gated_block": "Target-Risk-Gated Block Relaxation",
     }
     return labels.get(directory, directory)
 
