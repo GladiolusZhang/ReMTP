@@ -50,6 +50,20 @@ mean acceptance length > Cactus
 E2E tok/s >= Cactus
 ```
 
+All main comparison scripts also include native probabilistic MTP. Cactus
+remains the direct relaxed-decoding reference for the Pareto gate, while the
+native row measures the net benefit of relaxation itself.
+
+The follow-up target-surplus experiment is run with:
+
+```bash
+SAMPLES=100 ./scripts/run_gsm8k_target_surplus_gate.sh
+```
+
+It keeps the strict top-1 destination as an ablation, but uses a default
+relative target log-probability gap of `2.0` in the main variant because the
+top-1 candidate is almost always already Cactus-saturated at `delta=1`.
+
 Only that winner is repeated on a second sample seed. The comparison code
 also checks that sample manifests and decoding protocol fields are identical.
 

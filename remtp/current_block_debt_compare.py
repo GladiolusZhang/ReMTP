@@ -1,4 +1,4 @@
-"""Compare current-block verification-debt runs against Cactus."""
+"""Compare relaxed-MTP experiments against the Cactus reference."""
 
 from __future__ import annotations
 
@@ -40,12 +40,15 @@ def _load_run(directory: Path) -> tuple[dict[str, Any], dict[str, Any], str]:
 
 def _profile_label(directory: str) -> str:
     labels = {
+        "native_mtp": "Native probabilistic MTP",
         "cactus": "Cactus + MTP",
         "debt_conservative": "Current-block debt (conservative)",
         "debt_balanced": "Current-block debt (balanced)",
         "debt_cactus_fallback": "Current-block debt (Cactus fallback)",
         "debt_scale": "Current-block debt + posterior scale",
         "debt_top1": "Current-block debt + nonnegative top-1 bias",
+        "top1_surplus": "Cactus-dominant top-1 surplus",
+        "target_surplus": "Cactus-dominant target surplus",
     }
     return labels.get(directory, directory)
 
@@ -81,7 +84,7 @@ def compare(run_root: Path, profiles: list[str]) -> list[dict[str, Any]]:
             - baseline["e2e_output_tok_s"]
         )
         pareto_pass = (
-            directory != "cactus"
+            directory not in {"cactus", "native_mtp"}
             and accuracy_delta > 0.0
             and mal_delta > 0.0
             and e2e_delta >= 0.0
@@ -128,7 +131,7 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
     lines = [
-        "# Current-block verification-debt Pareto gate",
+        "# Relaxed-MTP Pareto gate",
         "",
         "Pass condition: Accuracy > Cactus, MAL > Cactus, and E2E >= Cactus.",
         "",

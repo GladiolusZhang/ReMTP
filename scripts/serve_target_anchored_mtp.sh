@@ -17,10 +17,10 @@ fi
 
 variant="${TARGET_ANCHORED_VARIANT:-tv_hidden_veto}"
 case "$variant" in
-  cactus_cap|tv_head|tv_hidden_veto|tv_debt_control) ;;
+  cactus_cap|tv_head|tv_hidden_veto|tv_debt_control|tv_top1_surplus|tv_target_surplus) ;;
   *)
     echo "Unknown TARGET_ANCHORED_VARIANT=$variant" >&2
-    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, or tv_debt_control" >&2
+    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, tv_debt_control, tv_top1_surplus, or tv_target_surplus" >&2
     exit 2
     ;;
 esac
@@ -41,6 +41,7 @@ export REMTP_TA_DEBT_HARD_LOG_GAP="${DEBT_HARD_LOG_GAP:-6.0}"
 export REMTP_TA_DEBT_MAX_POSITION_TV="${DEBT_MAX_POSITION_TV:-0.15}"
 export REMTP_TA_DEBT_MAX_CACTUS_RATIO="${DEBT_MAX_CACTUS_RATIO:-2.0}"
 export REMTP_TA_DEBT_FALLBACK="${DEBT_FALLBACK:-strict}"
+export REMTP_TA_SURPLUS_MAX_LOG_GAP="${SURPLUS_MAX_LOG_GAP:-2.0}"
 export REMTP_TA_AUDIT_INTERVAL="${TARGET_ANCHORED_AUDIT_INTERVAL:-0}"
 export REMTP_TA_DIAGNOSTICS="${TARGET_ANCHORED_DIAGNOSTICS:-0}"
 export REMTP_TA_COMPILE="${TARGET_ANCHORED_COMPILE:-1}"
@@ -50,5 +51,9 @@ if [[ -z "${REMTP_COMPILATION_CONFIG:-}" ]]; then
   export REMTP_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}'
 fi
 
-echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS debt_position=$REMTP_TA_DEBT_POSITION_LIMIT debt_block=$REMTP_TA_DEBT_BLOCK_LIMIT debt_gap=$REMTP_TA_DEBT_SOFT_LOG_GAP:$REMTP_TA_DEBT_HARD_LOG_GAP debt_max_tv=$REMTP_TA_DEBT_MAX_POSITION_TV debt_ratio=$REMTP_TA_DEBT_MAX_CACTUS_RATIO debt_fallback=$REMTP_TA_DEBT_FALLBACK"
+if [[ "$variant" == "tv_top1_surplus" || "$variant" == "tv_target_surplus" ]]; then
+  echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS surplus_max_log_gap=$REMTP_TA_SURPLUS_MAX_LOG_GAP"
+else
+  echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS debt_position=$REMTP_TA_DEBT_POSITION_LIMIT debt_block=$REMTP_TA_DEBT_BLOCK_LIMIT debt_gap=$REMTP_TA_DEBT_SOFT_LOG_GAP:$REMTP_TA_DEBT_HARD_LOG_GAP debt_max_tv=$REMTP_TA_DEBT_MAX_POSITION_TV debt_ratio=$REMTP_TA_DEBT_MAX_CACTUS_RATIO debt_fallback=$REMTP_TA_DEBT_FALLBACK"
+fi
 exec "$PROJECT_DIR/scripts/serve.sh"

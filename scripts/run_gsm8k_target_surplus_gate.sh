@@ -7,30 +7,29 @@ cd "$PROJECT_DIR"
 
 usage() {
   cat <<'EOF'
-Screen current-block verification-debt profiles against native probabilistic
-MTP and Cactus, then repeat the winner with both baselines on a second seed.
+Run native probabilistic MTP, Cactus, the old balanced debt controller, and
+Cactus-dominant target-supported surplus recycling on one GSM8K seed. Confirm
+target surplus on a second seed only if it passes all Pareto conditions.
 
 Usage:
-  ./scripts/run_gsm8k_current_block_debt_gate.sh
+  ./scripts/run_gsm8k_target_surplus_gate.sh
 
-Main environment variables:
-  SAMPLES=100                 Samples per method and seed
-  SAMPLE_SEED=20260804        First fixed GSM8K subset seed
-  SECOND_SAMPLE_SEED=20260811 Independent confirmation subset seed
-  TEMPERATURE=0.7             Sampling temperature
-  SEED=42                     Per-question generation seed base
-  MAX_TOKENS=384              Per-answer output limit
-  MTP_TOKENS=6                Fixed MTP depth
-  CACTUS_DELTA=1.0            Cactus reference budget
-  DEBT_PROFILES="debt_conservative debt_balanced debt_cactus_fallback"
-  INCLUDE_WEAK_FEEDBACK=0     Add posterior-scale and top-1-bias ablations
+Environment:
+  SAMPLES=100
+  SAMPLE_SEED=20260804
+  SECOND_SAMPLE_SEED=20260811
+  TEMPERATURE=0.7
+  SEED=42
+  MAX_TOKENS=384
+  MTP_TOKENS=6
+  CACTUS_DELTA=1.0
+  SURPLUS_MAX_LOG_GAP=2.0
+  PROGRESS_EVERY=10
   SERVER_START_TIMEOUT=180
   RUN_TAG=<timestamp>
 
-Production audit is always disabled for a fair throughput comparison. The
-second seed runs only when a first-seed profile has Accuracy > Cactus, MAL >
-Cactus, and E2E tok/s >= Cactus. Results and logs remain local under results/
-and logs/.
+Production audit is always disabled for a fair throughput comparison.
+Results and logs remain local under ignored results/ and logs/ directories.
 EOF
 }
 
@@ -52,9 +51,8 @@ SEED="${SEED:-42}"
 MAX_TOKENS="${MAX_TOKENS:-384}"
 MTP_TOKENS="${MTP_TOKENS:-6}"
 CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
+SURPLUS_MAX_LOG_GAP="${SURPLUS_MAX_LOG_GAP:-2.0}"
 HEAD_RELIABILITY="${HEAD_RELIABILITY:-1.0,0.85,0.70,0.55,0.40,0.30}"
-DEBT_PROFILES="${DEBT_PROFILES:-debt_conservative debt_balanced debt_cactus_fallback}"
-INCLUDE_WEAK_FEEDBACK="${INCLUDE_WEAK_FEEDBACK:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
@@ -68,10 +66,6 @@ if [[ "$SAMPLE_SEED" == "$SECOND_SAMPLE_SEED" ]]; then
   echo "SAMPLE_SEED and SECOND_SAMPLE_SEED must differ." >&2
   exit 2
 fi
-if [[ "$INCLUDE_WEAK_FEEDBACK" != "0" && "$INCLUDE_WEAK_FEEDBACK" != "1" ]]; then
-  echo "INCLUDE_WEAK_FEEDBACK must be 0 or 1." >&2
-  exit 2
-fi
 if [[ ! -f "$PROJECT_DIR/data/gsm8k/test.jsonl" ]]; then
   echo "Missing data/gsm8k/test.jsonl. Download GSM8K first." >&2
   exit 2
@@ -81,26 +75,8 @@ if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
   exit 2
 fi
 
-read -r -a profiles <<<"$DEBT_PROFILES"
-if [[ ${#profiles[@]} -eq 0 ]]; then
-  echo "DEBT_PROFILES must contain at least one profile." >&2
-  exit 2
-fi
-if [[ "$INCLUDE_WEAK_FEEDBACK" == "1" ]]; then
-  profiles+=(debt_scale debt_top1)
-fi
-for profile in "${profiles[@]}"; do
-  case "$profile" in
-    debt_conservative|debt_balanced|debt_cactus_fallback|debt_scale|debt_top1) ;;
-    *)
-      echo "Unknown debt profile: $profile" >&2
-      exit 2
-      ;;
-  esac
-done
-
-RUN_ROOT="$PROJECT_DIR/results/gsm8k_current_block_debt_gate_${RUN_TAG}"
-LOG_ROOT="$PROJECT_DIR/logs/gsm8k_current_block_debt_gate_${RUN_TAG}"
+RUN_ROOT="$PROJECT_DIR/results/gsm8k_target_surplus_gate_${RUN_TAG}"
+LOG_ROOT="$PROJECT_DIR/logs/gsm8k_target_surplus_gate_${RUN_TAG}"
 server_pid=""
 
 cleanup_server() {
@@ -160,27 +136,8 @@ profile_server() {
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_cactus_mtp.sh"
       PROFILE_ENV=(REMTP_CACTUS_DIAGNOSTICS=0)
       ;;
-    debt_conservative)
+    debt_balanced)
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_current_block_debt_mtp.sh"
-      PROFILE_ENV=(
-        DEBT_POSITION_LIMIT=0.20 DEBT_BLOCK_LIMIT=0.70
-        DEBT_SOFT_LOG_GAP=1.5 DEBT_HARD_LOG_GAP=4.0
-        DEBT_MAX_POSITION_TV=0.08 DEBT_MAX_CACTUS_RATIO=1.5
-        DEBT_FALLBACK=strict
-      )
-      ;;
-    debt_balanced|debt_scale|debt_top1)
-      case "$profile" in
-        debt_scale)
-          PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_current_block_debt_scale_mtp.sh"
-          ;;
-        debt_top1)
-          PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_current_block_debt_top1_mtp.sh"
-          ;;
-        *)
-          PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_current_block_debt_mtp.sh"
-          ;;
-      esac
       PROFILE_ENV=(
         DEBT_POSITION_LIMIT=0.35 DEBT_BLOCK_LIMIT=1.20
         DEBT_SOFT_LOG_GAP=2.0 DEBT_HARD_LOG_GAP=6.0
@@ -188,14 +145,13 @@ profile_server() {
         DEBT_FALLBACK=strict
       )
       ;;
-    debt_cactus_fallback)
-      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_current_block_debt_mtp.sh"
-      PROFILE_ENV=(
-        DEBT_POSITION_LIMIT=0.35 DEBT_BLOCK_LIMIT=1.20
-        DEBT_SOFT_LOG_GAP=2.0 DEBT_HARD_LOG_GAP=6.0
-        DEBT_MAX_POSITION_TV=0.15 DEBT_MAX_CACTUS_RATIO=2.0
-        DEBT_FALLBACK=cactus_cap
-      )
+    target_surplus)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_surplus_mtp.sh"
+      PROFILE_ENV=(SURPLUS_MAX_LOG_GAP="$SURPLUS_MAX_LOG_GAP")
+      ;;
+    *)
+      echo "Unknown profile: $profile" >&2
+      exit 2
       ;;
   esac
 }
@@ -211,7 +167,6 @@ run_method() {
   profile_server "$profile"
   echo
   echo "===== seed=${sample_seed} profile=${profile} ====="
-  echo "Starting server; log: $server_log"
   setsid env \
     MTP_TOKENS="$MTP_TOKENS" \
     CACTUS_DELTA="$CACTUS_DELTA" \
@@ -223,7 +178,6 @@ run_method() {
   server_pid=$!
   wait_for_server "$server_log"
 
-  echo "Server ready. Running ${SAMPLES} GSM8K samples."
   RUN_NAME="$profile" \
   SAMPLES="$SAMPLES" \
   SAMPLE_SEED="$sample_seed" \
@@ -242,51 +196,58 @@ run_method() {
 run_stage() {
   local sample_seed="$1"
   shift
-  local stage_profiles=("$@")
+  local profiles=("$@")
   local stage_root="$RUN_ROOT/seed_${sample_seed}"
   local log_stage="$LOG_ROOT/seed_${sample_seed}"
   mkdir -p "$log_stage"
   mkdir "$stage_root"
 
   run_method "$stage_root" "$log_stage" "$sample_seed" cactus
-  run_method "$stage_root" "$log_stage" "$sample_seed" native_mtp
-  for profile in "${stage_profiles[@]}"; do
+  for profile in "${profiles[@]}"; do
     run_method "$stage_root" "$log_stage" "$sample_seed" "$profile"
   done
   python -m remtp.current_block_debt_compare \
-    "$stage_root" native_mtp "${stage_profiles[@]}"
+    "$stage_root" "${profiles[@]}"
 }
 
 mkdir -p "$LOG_ROOT"
 mkdir "$RUN_ROOT"
 
-echo "Current-block verification-debt Pareto gate (native MTP included)"
+echo "GSM8K Cactus-dominant target-surplus gate"
 echo "samples=$SAMPLES seeds=$SAMPLE_SEED,$SECOND_SAMPLE_SEED"
 echo "temperature=$TEMPERATURE generation_seed=$SEED max_tokens=$MAX_TOKENS"
-echo "profiles=${profiles[*]}"
-echo "local_results=$RUN_ROOT"
+echo "production_audit=0 local_results=$RUN_ROOT"
 
-run_stage "$SAMPLE_SEED" "${profiles[@]}"
+run_stage "$SAMPLE_SEED" native_mtp debt_balanced target_surplus
 first_stage="$RUN_ROOT/seed_${SAMPLE_SEED}"
-winner="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["winner"] or "")' "$first_stage/gate_selection.json")"
-if [[ -z "$winner" ]]; then
+surplus_pass="$(python -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+row = next(item for item in rows if item["directory"] == "target_surplus")
+print(int(row["pareto_pass"]))
+' "$first_stage/comparison.json")"
+
+if [[ "$surplus_pass" != "1" ]]; then
   echo
-  echo "No profile passed the first-seed Pareto gate; second seed was not run."
-  echo "See $first_stage/comparison.md"
+  echo "Target surplus did not pass the first-seed Pareto gate."
+  echo "The second seed was not run: $first_stage/comparison.md"
   exit 0
 fi
 
 echo
-echo "First-seed winner: $winner. Repeating only this profile on seed $SECOND_SAMPLE_SEED."
-run_stage "$SECOND_SAMPLE_SEED" "$winner"
+echo "Target surplus passed seed $SAMPLE_SEED; confirming on $SECOND_SAMPLE_SEED."
+run_stage "$SECOND_SAMPLE_SEED" native_mtp target_surplus
 second_stage="$RUN_ROOT/seed_${SECOND_SAMPLE_SEED}"
-second_pass="$(python -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["pareto_pass"]))' "$second_stage/gate_selection.json")"
+second_pass="$(python -c '
+import json, sys
+print(int(json.load(open(sys.argv[1]))["pareto_pass"]))
+' "$second_stage/gate_selection.json")"
 
 echo
 if [[ "$second_pass" == "1" ]]; then
-  echo "REPRODUCED: $winner passed the Pareto gate on both seeds."
+  echo "REPRODUCED: target surplus passed all three metrics on both seeds."
 else
-  echo "NOT REPRODUCED: $winner failed the second-seed Pareto gate."
+  echo "NOT REPRODUCED: target surplus failed the second-seed gate."
 fi
 echo "Seed 1: $first_stage/comparison.md"
 echo "Seed 2: $second_stage/comparison.md"

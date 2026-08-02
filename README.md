@@ -524,3 +524,28 @@ INCLUDE_WEAK_FEEDBACK=1 SAMPLES=100 \
 
 算法和参数说明见
 [docs/current_block_verification_debt.md](docs/current_block_verification_debt.md)。
+
+后续统一实验主表始终包含纯概率 MTP、参考论文方法和本仓库方法；如果还
+保留旧版本，它只作为额外消融，不替代纯 MTP 基线。
+
+## 13. Cactus-dominant target surplus（MTP=6）
+
+该版本保持每个位置的 Cactus 候选接受率作为下界，回收已经超过
+`q_mtp(y)`、无法继续增加该位置接受率的候选概率质量。回收的 Exact-TV
+surplus 按前缀顺序分配给目标模型相对 log-prob gap 不超过2.0且尚未
+饱和的位置。严格 top-1 版本保留为消融；真实 audit 表明在 `delta=1`
+时它几乎没有可接收位置，因此主版本采用 target-support margin。
+
+正式四方法测试包含纯概率 MTP、Cactus、旧 balanced debt 和新方案，
+并强制关闭 audit：
+
+```bash
+SAMPLES=100 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
+./scripts/run_gsm8k_target_surplus_gate.sh
+```
+
+单独运行10条机制审计：
+
+```bash
+SAMPLES=10 ./scripts/run_gsm8k_target_surplus_audit.sh
+```

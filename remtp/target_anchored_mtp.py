@@ -17,6 +17,10 @@ Three ablations are implemented:
   the increase in speculative acceptance probability as verification debt.
   Per-position risk caps and a cumulative block limit act before a risky
   relaxed token can be committed.
+* ``tv_top1_surplus``: strict ablation that spends saturated Cactus surplus
+  only where the MTP candidate is the target top-1.
+* ``tv_target_surplus``: practical variant that spends the same surplus in
+  prefix order on target-supported candidates within one relative log gap.
 """
 
 from __future__ import annotations
@@ -36,6 +40,8 @@ _HIDDEN_FALLBACK_EMITTED = False
 _AUDIT_ROUND = 0
 _AUDIT_TV = torch.zeros(3, dtype=torch.float64)
 _AUDIT_DEBT = torch.zeros(6, dtype=torch.float64)
+_AUDIT_SURPLUS = torch.zeros(4, dtype=torch.float64)
+_AUDIT_ELIGIBILITY = torch.zeros(10, dtype=torch.float64)
 _DEFAULT_HEAD_RELIABILITY = (1.0, 0.85, 0.70, 0.55, 0.40, 0.30)
 _PRE_VERIFICATION_HOOK: Any | None = None
 _POST_VERIFICATION_HOOK: Any | None = None
@@ -82,6 +88,7 @@ class TargetAnchoredConfig:
     debt_max_position_tv: float = 0.15
     debt_max_cactus_ratio: float = 2.0
     debt_fallback: str = "strict"
+    surplus_max_log_gap: float = 2.0
 
     def validate(self) -> None:
         if self.variant not in {
@@ -89,6 +96,8 @@ class TargetAnchoredConfig:
             "tv_head",
             "tv_hidden_veto",
             "tv_debt_control",
+            "tv_top1_surplus",
+            "tv_target_surplus",
         }:
             raise ValueError(f"unsupported target-anchored variant: {self.variant}")
         if self.cactus_delta < 0:
@@ -127,6 +136,8 @@ class TargetAnchoredConfig:
             raise ValueError(
                 "debt_fallback must be strict or cactus_cap"
             )
+        if self.surplus_max_log_gap < 0.0:
+            raise ValueError("surplus_max_log_gap must be non-negative")
 
     @classmethod
     def from_env(cls) -> TargetAnchoredConfig:
@@ -182,6 +193,9 @@ class TargetAnchoredConfig:
             debt_fallback=os.getenv(
                 "REMTP_TA_DEBT_FALLBACK",
                 "strict",
+            ),
+            surplus_max_log_gap=float(
+                os.getenv("REMTP_TA_SURPLUS_MAX_LOG_GAP", "2.0")
             ),
         )
         config.validate()
@@ -324,6 +338,74 @@ def _acceptance_from_candidate_probability(
         candidate_probability
         / draft_candidate_probability.clamp_min(1e-30),
     )
+
+
+def _target_surplus_tv(
+    *,
+    p_y: torch.Tensor,
+    q_y: torch.Tensor,
+    top_p: torch.Tensor,
+    cactus_tv: torch.Tensor,
+    max_log_gap: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Preserve Cactus acceptance and recycle only saturated surplus.
+
+    ``cactus_floor`` has exactly the same sampled-candidate acceptance as
+    Cactus because candidate probability above ``q_y`` is already saturated.
+    The otherwise acceptance-inert mass is reassigned, in prefix order, only
+    to positions whose proposed token stays within ``max_log_gap`` of the
+    verifier's top-1 probability. A zero gap gives the strict top-1 ablation.
+    """
+    useful_capacity = (q_y - p_y).clamp_min(0.0)
+    cactus_floor = torch.minimum(cactus_tv, useful_capacity)
+    surplus = (cactus_tv - cactus_floor).clamp_min(0.0).sum()
+    log_gap = (
+        torch.log(top_p.clamp_min(1e-30))
+        - torch.log(p_y.clamp_min(1e-30))
+    ).clamp_min(0.0)
+    target_supported = log_gap <= max_log_gap
+    destination_capacity = torch.where(
+        target_supported,
+        (useful_capacity - cactus_floor).clamp_min(0.0),
+        torch.zeros_like(useful_capacity),
+    )
+
+    received = torch.zeros_like(useful_capacity)
+    remaining = surplus
+    for depth in range(useful_capacity.shape[0]):
+        step = torch.minimum(destination_capacity[depth], remaining)
+        received[depth] = step
+        remaining = (remaining - step).clamp_min(0.0)
+    return (
+        cactus_floor + received,
+        cactus_floor,
+        destination_capacity,
+        target_supported,
+    )
+
+
+def top1_surplus_candidate_probs(
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    delta: float,
+    max_log_gap: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fast scalar path for Cactus-dominant top-1 surplus recycling."""
+    ids = draft_token_ids.to(device=target_probs.device, dtype=torch.int64)
+    rows = torch.arange(ids.shape[0], device=target_probs.device)
+    p_y = target_probs[rows, ids]
+    q_y = draft_probs[rows, ids]
+    top_p = target_probs.amax(dim=-1)
+    cactus_tv = cactus_tv_increment(p_y, delta)
+    allocated, _, _, _ = _target_surplus_tv(
+        p_y=p_y,
+        q_y=q_y,
+        top_p=top_p,
+        cactus_tv=cactus_tv,
+        max_log_gap=max_log_gap,
+    )
+    return p_y, p_y + allocated
 
 
 def _debt_controlled_tv(
@@ -559,6 +641,26 @@ def target_anchored_distribution(
     if config.variant == "cactus_cap":
         allocated = torch.minimum(cactus_tv, useful_capacity)
         raw_allocated = allocated.clone()
+    elif config.variant in {"tv_top1_surplus", "tv_target_surplus"}:
+        (
+            allocated,
+            cactus_floor,
+            destination_capacity,
+            target_supported,
+        ) = _target_surplus_tv(
+            p_y=p_y,
+            q_y=q_y,
+            top_p=top_p,
+            cactus_tv=cactus_tv,
+            max_log_gap=(
+                0.0
+                if config.variant == "tv_top1_surplus"
+                else config.surplus_max_log_gap
+            ),
+        )
+        raw_allocated = allocated.clone()
+        risk_capacity = destination_capacity
+        risk_multiplier = target_supported.to(torch.float32)
     elif config.variant == "tv_debt_control":
         (
             allocated,
@@ -642,6 +744,18 @@ def target_anchored_candidate_probs(
     hidden_similarity: torch.Tensor,
     config: TargetAnchoredConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if config.variant in {"tv_top1_surplus", "tv_target_surplus"}:
+        return top1_surplus_candidate_probs(
+            target_probs,
+            draft_probs,
+            draft_token_ids,
+            config.cactus_delta,
+            (
+                0.0
+                if config.variant == "tv_top1_surplus"
+                else config.surplus_max_log_gap
+            ),
+        )
     result = target_anchored_distribution(
         target_probs,
         draft_probs,
@@ -680,7 +794,9 @@ def _target_anchored_rejection_sample(
     bonus_token_ids: torch.Tensor,
     sampling_metadata: Any,
 ) -> torch.Tensor:
-    global _AUDIT_ROUND, _AUDIT_TV, _AUDIT_DEBT, _DIAGNOSTIC_EMITTED
+    global _AUDIT_ROUND, _AUDIT_TV, _AUDIT_DEBT, _AUDIT_SURPLUS
+    global _AUDIT_ELIGIBILITY
+    global _DIAGNOSTIC_EMITTED
     global _HIDDEN_FALLBACK_EMITTED
 
     original = getattr(_target_anchored_rejection_sample, "_remtp_original")
@@ -815,6 +931,7 @@ def _target_anchored_rejection_sample(
             f"cumulative_debt={result.cumulative_debt.tolist()} "
             f"fallback={result.fallback_mask.tolist()} "
             f"stopped={result.stopped_mask.tolist()} "
+            f"target_supported={result.risk_multiplier.tolist()} "
             f"block_cactus_TV={result.cactus_tv.sum().item():.6f} "
             f"block_allocated_TV={result.allocated_tv.sum().item():.6f}",
             flush=True,
@@ -848,9 +965,74 @@ def _target_anchored_rejection_sample(
             ),
             dtype=torch.float64,
         )
+        cactus_floor = torch.minimum(
+            result.cactus_tv,
+            result.useful_tv_capacity,
+        )
+        surplus_generated = (
+            result.cactus_tv - cactus_floor
+        ).clamp_min(0.0).sum().item()
+        surplus_received = (
+            result.allocated_tv - cactus_floor
+        ).clamp_min(0.0).sum().item()
+        _AUDIT_SURPLUS += torch.tensor(
+            (
+                surplus_generated,
+                surplus_received,
+                (
+                    (result.allocated_tv - cactus_floor) > 1e-12
+                ).sum().item(),
+                max(surplus_generated - surplus_received, 0.0),
+            ),
+            dtype=torch.float64,
+        )
+        available_after_floor = (
+            result.useful_tv_capacity - cactus_floor
+        ).clamp_min(0.0)
+        eligibility_values: list[float] = []
+        for threshold in (0.5, 1.0, 1.5, 2.0, 3.0):
+            eligible = result.target_log_gaps <= threshold
+            eligibility_values.extend(
+                (
+                    eligible.logical_and(
+                        available_after_floor > 1e-12
+                    ).sum().item(),
+                    torch.where(
+                        eligible,
+                        available_after_floor,
+                        torch.zeros_like(available_after_floor),
+                    ).sum().item(),
+                )
+            )
+        _AUDIT_ELIGIBILITY += torch.tensor(
+            eligibility_values,
+            dtype=torch.float64,
+        )
         if _AUDIT_ROUND % audit_interval == 0:
             values = (_AUDIT_TV / audit_interval).tolist()
             debt_values = (_AUDIT_DEBT / audit_interval).tolist()
+            surplus_values = (_AUDIT_SURPLUS / audit_interval).tolist()
+            eligibility = (
+                _AUDIT_ELIGIBILITY / audit_interval
+            ).tolist()
+            surplus_suffix = ""
+            if config.variant in {"tv_top1_surplus", "tv_target_surplus"}:
+                surplus_suffix = (
+                    f" mean_surplus_generated={surplus_values[0]:.6f}"
+                    f" mean_surplus_received={surplus_values[1]:.6f}"
+                    f" mean_surplus_destinations={surplus_values[2]:.6f}"
+                    f" mean_surplus_remaining={surplus_values[3]:.6f}"
+                    f" eligible_gap0.5={eligibility[0]:.6f}:"
+                    f"{eligibility[1]:.6f}"
+                    f" eligible_gap1.0={eligibility[2]:.6f}:"
+                    f"{eligibility[3]:.6f}"
+                    f" eligible_gap1.5={eligibility[4]:.6f}:"
+                    f"{eligibility[5]:.6f}"
+                    f" eligible_gap2.0={eligibility[6]:.6f}:"
+                    f"{eligibility[7]:.6f}"
+                    f" eligible_gap3.0={eligibility[8]:.6f}:"
+                    f"{eligibility[9]:.6f}"
+                )
             print(
                 "[ReMTP][TargetAnchored][audit] "
                 f"rounds={_AUDIT_ROUND-audit_interval+1}-{_AUDIT_ROUND} "
@@ -863,11 +1045,14 @@ def _target_anchored_rejection_sample(
                 f"mean_acceptance_debt={debt_values[2]:.6f} "
                 f"mean_fallback_positions={debt_values[3]:.6f} "
                 f"mean_stopped_positions={debt_values[4]:.6f} "
-                f"mean_risk_pruned_TV={debt_values[5]:.6f}",
+                f"mean_risk_pruned_TV={debt_values[5]:.6f}"
+                f"{surplus_suffix}",
                 flush=True,
             )
             _AUDIT_TV.zero_()
             _AUDIT_DEBT.zero_()
+            _AUDIT_SURPLUS.zero_()
+            _AUDIT_ELIGIBILITY.zero_()
 
     original_top_ids = (
         logits.argmax(dim=-1) if sampling_metadata.all_greedy else None
@@ -1001,7 +1186,9 @@ def install_target_anchored_mtp() -> None:
         f"debt_max_position_TV={config.debt_max_position_tv:g} "
         f"debt_max_cactus_ratio={config.debt_max_cactus_ratio:g} "
         f"debt_fallback={config.debt_fallback} "
+        f"surplus_max_gap={config.surplus_max_log_gap:g} "
         f"compiled={int(compile_fast_path)} "
-        "budget=exact-Cactus-TV cap=h(y)<=q(y)",
+        "budget=exact-Cactus-TV cap=h(y)<=q(y) "
+        f"surplus={int(config.variant in {'tv_top1_surplus', 'tv_target_surplus'})}",
         flush=True,
     )

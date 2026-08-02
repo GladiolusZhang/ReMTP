@@ -61,6 +61,17 @@ class CurrentBlockDebtCompareTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 compare(root, ["candidate"])
 
+    def test_native_mtp_is_reported_but_never_selected_as_method(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "cactus", acc=0.80, e2e=180.0, mal=4.9)
+            self._write(root, "native_mtp", acc=0.90, e2e=190.0, mal=5.2)
+            self._write(root, "candidate", acc=0.81, e2e=181.0, mal=5.0)
+            rows = compare(root, ["native_mtp", "candidate"])
+            status = {row["directory"]: row["pareto_pass"] for row in rows}
+            self.assertFalse(status["native_mtp"])
+            self.assertTrue(status["candidate"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -326,6 +326,204 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             baseline.allocated_tv,
         )
 
+    def test_top1_surplus_preserves_cactus_acceptance_and_budget(self) -> None:
+        target = torch.tensor(
+            [
+                [0.70, 0.20, 0.10],
+                [0.40, 0.35, 0.25],
+                [0.40, 0.35, 0.25],
+            ]
+        )
+        draft = torch.tensor(
+            [
+                [0.69, 0.21, 0.10],
+                [0.80, 0.10, 0.10],
+                [0.80, 0.10, 0.10],
+            ]
+        )
+        ids = torch.tensor([1, 0, 0])
+        result = target_anchored_distribution(
+            target,
+            draft,
+            ids,
+            self.config(
+                "tv_top1_surplus",
+                expected_draft_tokens=3,
+                head_reliability=(1.0, 1.0, 1.0),
+                cactus_delta=0.01,
+            ),
+        )
+        cactus_acceptance = torch.minimum(
+            torch.ones(3),
+            (result.target_candidate_probs + result.cactus_tv)
+            / result.draft_candidate_probs,
+        )
+        self.assertTrue(
+            torch.all(result.relaxed_acceptance >= cactus_acceptance - 1e-6)
+        )
+        self.assertLessEqual(
+            result.allocated_tv.sum().item(),
+            result.cactus_tv.sum().item() + 1e-6,
+        )
+        self.assertTrue(
+            torch.all(
+                result.boosted_candidate_probs
+                <= result.draft_candidate_probs + 1e-6
+            )
+        )
+
+    def test_top1_surplus_uses_prefix_order_and_top1_only(self) -> None:
+        target = torch.tensor(
+            [
+                [0.70, 0.20, 0.10],
+                [0.40, 0.35, 0.25],
+                [0.40, 0.35, 0.25],
+            ]
+        )
+        draft = torch.tensor(
+            [
+                [0.69, 0.21, 0.10],
+                [0.80, 0.10, 0.10],
+                [0.80, 0.10, 0.10],
+            ]
+        )
+        ids = torch.tensor([1, 0, 0])
+        result = target_anchored_distribution(
+            target,
+            draft,
+            ids,
+            self.config(
+                "tv_top1_surplus",
+                expected_draft_tokens=3,
+                head_reliability=(1.0, 1.0, 1.0),
+                cactus_delta=0.01,
+            ),
+        )
+        floor = torch.minimum(result.cactus_tv, result.useful_tv_capacity)
+        received = (result.allocated_tv - floor).clamp_min(0.0)
+        self.assertEqual(received[0].item(), 0.0)
+        self.assertGreater(received[1].item(), 0.0)
+        self.assertEqual(received[2].item(), 0.0)
+        self.assertEqual(result.risk_multiplier.tolist(), [0.0, 1.0, 1.0])
+        generated = (result.cactus_tv - floor).clamp_min(0.0).sum()
+        torch.testing.assert_close(received.sum(), generated)
+
+    def test_top1_surplus_fast_path_matches_detailed_path(self) -> None:
+        config = self.config("tv_top1_surplus")
+        detailed = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            config,
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        p_y, h_y = target_anchored_candidate_probs(
+            self.target,
+            self.draft,
+            self.ids,
+            torch.ones(4),
+            config,
+        )
+        torch.testing.assert_close(p_y, detailed.target_candidate_probs)
+        torch.testing.assert_close(h_y, detailed.boosted_candidate_probs)
+
+    def test_top1_surplus_randomized_acceptance_dominance(self) -> None:
+        generator = torch.Generator().manual_seed(17)
+        for _ in range(20):
+            target = torch.softmax(
+                torch.randn(6, 32, generator=generator),
+                dim=-1,
+            )
+            draft = torch.softmax(
+                torch.randn(6, 32, generator=generator),
+                dim=-1,
+            )
+            ids = torch.randint(0, 32, (6,), generator=generator)
+            result = target_anchored_distribution(
+                target,
+                draft,
+                ids,
+                TargetAnchoredConfig(variant="tv_top1_surplus"),
+                assume_normalized=True,
+                construct_probs=False,
+            )
+            cactus_acceptance = torch.minimum(
+                torch.ones(6),
+                (
+                    result.target_candidate_probs
+                    + result.cactus_tv
+                )
+                / result.draft_candidate_probs.clamp_min(1e-30),
+            )
+            self.assertTrue(
+                torch.all(
+                    result.relaxed_acceptance
+                    >= cactus_acceptance - 1e-6
+                ).item()
+            )
+            self.assertLessEqual(
+                result.allocated_tv.sum().item(),
+                result.cactus_tv.sum().item() + 1e-6,
+            )
+            uniforms = torch.rand(6, generator=generator)
+            cactus_prefix = 0
+            new_prefix = 0
+            for depth in range(6):
+                if uniforms[depth] <= cactus_acceptance[depth]:
+                    cactus_prefix += 1
+                else:
+                    break
+            for depth in range(6):
+                if uniforms[depth] <= result.relaxed_acceptance[depth]:
+                    new_prefix += 1
+                else:
+                    break
+            self.assertGreaterEqual(new_prefix, cactus_prefix)
+
+    def test_target_surplus_activates_for_supported_non_top1(self) -> None:
+        target = torch.tensor(
+            [
+                [0.70, 0.20, 0.10],
+                [0.50, 0.15, 0.35],
+            ]
+        )
+        draft = torch.tensor(
+            [
+                [0.69, 0.21, 0.10],
+                [0.10, 0.80, 0.10],
+            ]
+        )
+        ids = torch.tensor([1, 1])
+        config = self.config(
+            "tv_target_surplus",
+            expected_draft_tokens=2,
+            head_reliability=(1.0, 1.0),
+            cactus_delta=0.01,
+            surplus_max_log_gap=2.0,
+        )
+        result = target_anchored_distribution(
+            target,
+            draft,
+            ids,
+            config,
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        floor = torch.minimum(result.cactus_tv, result.useful_tv_capacity)
+        received = (result.allocated_tv - floor).clamp_min(0.0)
+        self.assertGreater(received[1].item(), 0.0)
+        self.assertEqual(result.risk_multiplier.tolist(), [1.0, 1.0])
+        p_y, h_y = target_anchored_candidate_probs(
+            target,
+            draft,
+            ids,
+            torch.ones(2),
+            config,
+        )
+        torch.testing.assert_close(p_y, result.target_candidate_probs)
+        torch.testing.assert_close(h_y, result.boosted_candidate_probs)
+
     def test_aligned_hidden_cosine_and_fallback(self) -> None:
         draft = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
@@ -423,6 +621,9 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             ).validate()
         with self.assertRaises(ValueError):
             TargetAnchoredConfig(debt_fallback="unsafe").validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(surplus_max_log_gap=-1.0).validate()
+
     def test_default_config_covers_six_mtp_heads(self) -> None:
         config = TargetAnchoredConfig()
         config.validate()
