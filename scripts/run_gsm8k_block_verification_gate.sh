@@ -31,10 +31,11 @@ Environment:
   SERVER_START_TIMEOUT=180
   RUN_TAG=<timestamp>
 
-The second seed runs if either Cactus+Block Verification or the block-surplus
-shield passes the first-seed Pareto gate against Cactus. This preserves the
-pre-registered narrow fallback if the new risk-control method fails. Results
-and server logs remain under ignored local directories.
+The second seed runs if Cactus+Block Verification, the fixed block-surplus
+shield, or the event-triggered shield passes the first-seed Pareto gate
+against Cactus. This preserves the pre-registered narrow fallback if the new
+risk-control methods fail. Results and server logs remain under ignored local
+directories.
 EOF
 }
 
@@ -159,6 +160,9 @@ profile_server() {
     block_shield)
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_block_shield_mtp.sh"
       ;;
+    event_shield)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_event_block_shield_mtp.sh"
+      ;;
     *)
       echo "Unknown profile: $profile" >&2
       exit 2
@@ -213,6 +217,7 @@ run_stage() {
   local log_stage="$LOG_ROOT/seed_${sample_seed}"
   local profiles=(
     native_mtp native_block cactus_block risk_swap risk_swap_block block_shield
+    event_shield
   )
   mkdir -p "$log_stage"
   mkdir "$stage_root"
@@ -238,13 +243,13 @@ first_stage="$RUN_ROOT/seed_${SAMPLE_SEED}"
 first_pass="$(python -c '
 import json, sys
 rows = json.load(open(sys.argv[1]))
-rows = [x for x in rows if x["directory"] in {"cactus_block", "block_shield"}]
+rows = [x for x in rows if x["directory"] in {"cactus_block", "block_shield", "event_shield"}]
 print(int(any(x["pareto_pass"] for x in rows)))
 ' "$first_stage/comparison.json")"
 
 if [[ "$first_pass" != "1" ]]; then
   echo
-  echo "Neither Cactus+Block nor Block Shield passed the first-seed gate."
+  echo "No block-verification candidate passed the first-seed gate."
   echo "The second seed was not run: $first_stage/comparison.md"
   exit 0
 fi
@@ -257,7 +262,7 @@ reproduction="$(python -c '
 import json, sys
 first = {x["directory"]: x for x in json.load(open(sys.argv[1]))}
 second = {x["directory"]: x for x in json.load(open(sys.argv[2]))}
-for name in ("cactus_block", "block_shield"):
+for name in ("cactus_block", "block_shield", "event_shield"):
     if first[name]["pareto_pass"]:
         status = "REPRODUCED" if second[name]["pareto_pass"] else "NOT REPRODUCED"
         print(f"{status}: {name}")

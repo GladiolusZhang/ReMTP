@@ -619,6 +619,51 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             0.70 * risk.allocated_tv + 0.30 * risk.cactus_tv,
         )
 
+    def test_event_shield_uses_cactus_without_high_risk_candidate(self) -> None:
+        result = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            self.config(
+                "tv_event_shield",
+                cactus_delta=0.01,
+                risk_swap_soft_log_gap=10.0,
+                risk_swap_hard_log_gap=11.0,
+                block_shield_cactus_mix=0.30,
+            ),
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        torch.testing.assert_close(result.allocated_tv, result.cactus_tv)
+
+    def test_event_shield_matches_fixed_shield_on_triggered_block(self) -> None:
+        target = self.target.clone()
+        target[0] = torch.tensor([0.89, 0.01, 0.05, 0.05])
+        common = {
+            "cactus_delta": 0.01,
+            "risk_swap_soft_log_gap": 1.0,
+            "risk_swap_hard_log_gap": 4.0,
+            "risk_swap_destination_log_gap": 1.0,
+            "block_shield_cactus_mix": 0.30,
+        }
+        event = target_anchored_distribution(
+            target,
+            self.draft,
+            self.ids,
+            self.config("tv_event_shield", **common),
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        fixed = target_anchored_distribution(
+            target,
+            self.draft,
+            self.ids,
+            self.config("tv_block_shield", **common),
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        torch.testing.assert_close(event.allocated_tv, fixed.allocated_tv)
+
     def test_aligned_hidden_cosine_and_fallback(self) -> None:
         draft = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])

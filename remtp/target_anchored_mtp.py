@@ -27,6 +27,8 @@ Three ablations are implemented:
 * ``tv_block_shield``: retain a fixed Cactus share inside the risk swap so
   joint Block Verification can spend its acceptance surplus on quality
   control without falling below the token-wise Cactus operating point.
+* ``tv_event_shield``: apply that same shield only when the current block
+  contains a candidate beyond the risk-swap soft target-gap boundary.
 """
 
 from __future__ import annotations
@@ -111,6 +113,7 @@ class TargetAnchoredConfig:
             "tv_target_surplus",
             "tv_risk_swap",
             "tv_block_shield",
+            "tv_event_shield",
         }:
             raise ValueError(f"unsupported target-anchored variant: {self.variant}")
         if self.cactus_delta < 0:
@@ -762,7 +765,11 @@ def target_anchored_distribution(
         raw_allocated = allocated.clone()
         risk_capacity = destination_capacity
         risk_multiplier = target_supported.to(torch.float32)
-    elif config.variant in {"tv_risk_swap", "tv_block_shield"}:
+    elif config.variant in {
+        "tv_risk_swap",
+        "tv_block_shield",
+        "tv_event_shield",
+    }:
         (
             allocated,
             cactus_floor,
@@ -781,11 +788,22 @@ def target_anchored_distribution(
         raw_allocated = cactus_floor
         risk_capacity = kept_cactus + destination_capacity
         risk_multiplier = keep_multiplier
-        if config.variant == "tv_block_shield":
-            allocated = (
+        if config.variant in {"tv_block_shield", "tv_event_shield"}:
+            shield_allocated = (
                 (1.0 - config.block_shield_cactus_mix) * allocated
                 + config.block_shield_cactus_mix * cactus_tv
             )
+            if config.variant == "tv_event_shield":
+                block_trigger = (
+                    log_gap > config.risk_swap_soft_log_gap
+                ).any()
+                allocated = torch.where(
+                    block_trigger,
+                    shield_allocated,
+                    cactus_tv,
+                )
+            else:
+                allocated = shield_allocated
     elif config.variant == "tv_debt_control":
         (
             allocated,
@@ -1386,7 +1404,7 @@ def install_target_anchored_mtp() -> None:
 
     candidate_cap = (
         "Cactus/risk interpolation"
-        if config.variant == "tv_block_shield"
+        if config.variant in {"tv_block_shield", "tv_event_shield"}
         else "h(y)<=q(y)"
     )
 
