@@ -568,3 +568,28 @@ SAMPLES=100 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
 同一入口还测试 target-recovery 消融：松弛接受和目标 bonus 保持不变，
 但第一次拒绝后的纠正 token 从原始目标分布采样，而不是松弛残差
 `(H-Q)+`。该消融用于隔离接受决策与 RECOVER 分布造成的质量变化。
+
+## 15. HumanEval 质量—速度评测（MTP=6）
+
+HumanEval 采用官方功能测试计算 `pass@1`，允许生成实现与参考代码不同。
+生成和执行完全分离：模型代码只在无网络、只读、限资源的临时 Docker
+容器内执行，判题时间不计入生成吞吐。
+
+```bash
+./scripts/setup_humaneval.sh
+./scripts/download_humaneval.sh
+
+# 先验证三种方法和完整执行链路
+SAMPLES=5 \
+PROFILES="native_mtp cactus regret_calibrated_block" \
+./scripts/run_humaneval_comparison.sh
+
+# 再跑默认九方法、全部 164 题
+SAMPLES=164 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
+./scripts/run_humaneval_comparison.sh
+```
+
+默认主表包含纯概率 MTP、Cactus、SpecCascade、Block Verification 论文
+基线、此前具有代表性的 Exact-TV 变体以及当前 Regret-Calibrated Block
+方法。完整说明见 [docs/humaneval.md](docs/humaneval.md)。数据、生成代码、
+判题结果和日志均只保存在本地忽略目录。
