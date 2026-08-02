@@ -85,6 +85,22 @@ class CactusBlockVerificationMTPWorker(Worker):
         return super().init_device(*args, **kwargs)
 
 
+class PrefixTrimBlockMTPWorker(Worker):
+    """Cactus prefix-saturation trim with exact joint block verification."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.block_verification import install_block_verification
+        from remtp.prefix_saturation_trim import (
+            install_prefix_saturation_trim,
+        )
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_block_verification()
+        install_prefix_saturation_trim()
+        return super().init_device(*args, **kwargs)
+
+
 class TargetAnchoredMTPWorker(Worker):
     """CUDA worker for target-anchored exact-TV MTP verification."""
 
