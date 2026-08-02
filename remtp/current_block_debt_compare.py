@@ -6,6 +6,7 @@ import argparse
 import csv
 import hashlib
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,158 @@ def _profile_label(directory: str) -> str:
         "block_shield": "Block-surplus-shielded risk control",
     }
     return labels.get(directory, directory)
+
+
+def _request_key(record: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        record.get("task"),
+        record.get("question_id"),
+        record.get("sample_index"),
+        record.get("seed"),
+    )
+
+
+def _load_requests(directory: Path) -> dict[tuple[Any, ...], dict[str, Any]]:
+    path = directory / "requests.jsonl"
+    rows: dict[tuple[Any, ...], dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            key = _request_key(record)
+            if key in rows:
+                raise ValueError(f"duplicate request key in {path}: {key}")
+            rows[key] = record
+    if not rows:
+        raise ValueError(f"no request records in {path}")
+    return rows
+
+
+def _request_components(
+    record: dict[str, Any],
+) -> tuple[float, float, float, float, float]:
+    metrics = record.get("metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError("request record is missing metrics")
+    return (
+        float(bool(record.get("correct"))),
+        float(record["output_tokens"]),
+        float(record["client_seconds"]),
+        float(metrics["vllm:spec_decode_num_accepted_tokens_total"]),
+        float(metrics["vllm:spec_decode_num_drafts_total"]),
+    )
+
+
+def _aggregate_components(
+    rows: list[tuple[float, float, float, float, float]],
+    indices: list[int],
+) -> tuple[float, float, float]:
+    correct = output_tokens = seconds = accepted = rounds = 0.0
+    for index in indices:
+        row = rows[index]
+        correct += row[0]
+        output_tokens += row[1]
+        seconds += row[2]
+        accepted += row[3]
+        rounds += row[4]
+    count = len(indices)
+    if count == 0 or seconds <= 0.0 or rounds <= 0.0:
+        raise ValueError("paired bootstrap requires non-empty timed requests")
+    return (
+        correct / count,
+        output_tokens / seconds,
+        1.0 + accepted / rounds,
+    )
+
+
+def _quantile(values: list[float], probability: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * probability
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def paired_bootstrap_intervals(
+    run_root: Path,
+    profiles: list[str],
+    *,
+    bootstrap_samples: int = 10_000,
+    bootstrap_seed: int = 20260802,
+) -> dict[str, dict[str, tuple[float, float]]]:
+    """Return paired request-bootstrap intervals against Cactus.
+
+    Accuracy is paired by request. E2E throughput is recomputed as the ratio
+    of resampled output-token and wall-time sums. MAL is recomputed as
+    ``1 + accepted_drafts / draft_rounds`` rather than averaging request MALs.
+    """
+    if bootstrap_samples < 1:
+        raise ValueError("bootstrap_samples must be positive")
+    baseline_map = _load_requests(run_root / "cactus")
+    keys = sorted(baseline_map, key=repr)
+    baseline_rows = [_request_components(baseline_map[key]) for key in keys]
+    result: dict[str, dict[str, tuple[float, float]]] = {
+        "cactus": {
+            "accuracy_delta_pp": (0.0, 0.0),
+            "e2e_delta_pct": (0.0, 0.0),
+            "mal_delta": (0.0, 0.0),
+        }
+    }
+    for profile in profiles:
+        candidate_map = _load_requests(run_root / profile)
+        if set(candidate_map) != set(baseline_map):
+            raise ValueError(
+                f"request identities differ between cactus and {profile}"
+            )
+        candidate_rows = [
+            _request_components(candidate_map[key]) for key in keys
+        ]
+        rng = random.Random(bootstrap_seed)
+        accuracy_deltas: list[float] = []
+        e2e_deltas: list[float] = []
+        mal_deltas: list[float] = []
+        for _ in range(bootstrap_samples):
+            indices = [rng.randrange(len(keys)) for _ in keys]
+            base_accuracy, base_e2e, base_mal = _aggregate_components(
+                baseline_rows,
+                indices,
+            )
+            cand_accuracy, cand_e2e, cand_mal = _aggregate_components(
+                candidate_rows,
+                indices,
+            )
+            accuracy_deltas.append(100.0 * (cand_accuracy - base_accuracy))
+            e2e_deltas.append(100.0 * (cand_e2e / base_e2e - 1.0))
+            mal_deltas.append(cand_mal - base_mal)
+        result[profile] = {
+            "accuracy_delta_pp": (
+                _quantile(accuracy_deltas, 0.025),
+                _quantile(accuracy_deltas, 0.975),
+            ),
+            "e2e_delta_pct": (
+                _quantile(e2e_deltas, 0.025),
+                _quantile(e2e_deltas, 0.975),
+            ),
+            "mal_delta": (
+                _quantile(mal_deltas, 0.025),
+                _quantile(mal_deltas, 0.975),
+            ),
+        }
+    return result
+
+
+def _attach_intervals(
+    rows: list[dict[str, Any]],
+    intervals: dict[str, dict[str, tuple[float, float]]],
+) -> None:
+    for row in rows:
+        profile = row["directory"]
+        values = intervals[profile]
+        for metric, (lower, upper) in values.items():
+            row[f"{metric}_ci95_low"] = lower
+            row[f"{metric}_ci95_high"] = upper
 
 
 def compare(run_root: Path, profiles: list[str]) -> list[dict[str, Any]]:
@@ -156,6 +309,29 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
             f"{100.0*row['truncation_rate']:.1f}% | "
             f"{'YES' if row['pareto_pass'] else 'NO'} |"
         )
+    if "accuracy_delta_pp_ci95_low" in rows[0]:
+        lines.extend(
+            [
+                "",
+                "## Paired request-bootstrap 95% intervals",
+                "",
+                "These intervals are diagnostic and do not replace the "
+                "locked point-estimate gate or second-seed replication.",
+                "",
+                "| method | accuracy delta | E2E delta | MAL delta |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        for row in rows:
+            lines.append(
+                f"| {row['method']} | "
+                f"[{row['accuracy_delta_pp_ci95_low']:+.1f}, "
+                f"{row['accuracy_delta_pp_ci95_high']:+.1f}] pp | "
+                f"[{row['e2e_delta_pct_ci95_low']:+.2f}%, "
+                f"{row['e2e_delta_pct_ci95_high']:+.2f}%] | "
+                f"[{row['mal_delta_ci95_low']:+.3f}, "
+                f"{row['mal_delta_ci95_high']:+.3f}] |"
+            )
     (run_root / "comparison.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
@@ -189,9 +365,18 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_root", type=Path)
     parser.add_argument("profiles", nargs="+")
+    parser.add_argument("--bootstrap-samples", type=int, default=10_000)
+    parser.add_argument("--bootstrap-seed", type=int, default=20260802)
     args = parser.parse_args()
     run_root = args.run_root.resolve()
     rows = compare(run_root, args.profiles)
+    intervals = paired_bootstrap_intervals(
+        run_root,
+        args.profiles,
+        bootstrap_samples=args.bootstrap_samples,
+        bootstrap_seed=args.bootstrap_seed,
+    )
+    _attach_intervals(rows, intervals)
     _write_outputs(run_root, rows)
     selection = _select(rows)
     (run_root / "gate_selection.json").write_text(

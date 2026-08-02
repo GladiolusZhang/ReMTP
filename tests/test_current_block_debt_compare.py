@@ -3,7 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from remtp.current_block_debt_compare import compare
+from remtp.current_block_debt_compare import (
+    compare,
+    paired_bootstrap_intervals,
+)
 
 
 class CurrentBlockDebtCompareTest(unittest.TestCase):
@@ -36,6 +39,30 @@ class CurrentBlockDebtCompareTest(unittest.TestCase):
         }
         (directory / "summary.json").write_text(json.dumps(payload))
         (directory / "sample_manifest.json").write_text("shared\n")
+
+    @staticmethod
+    def _write_requests(root: Path, name: str) -> None:
+        path = root / name / "requests.jsonl"
+        records = []
+        for index in range(4):
+            records.append(
+                {
+                    "task": "gsm8k",
+                    "question_id": index,
+                    "sample_index": index,
+                    "seed": 42 + index,
+                    "correct": index % 2 == 0,
+                    "output_tokens": 10 + index,
+                    "client_seconds": 0.1 + index / 100.0,
+                    "metrics": {
+                        "vllm:spec_decode_num_accepted_tokens_total": 8 + index,
+                        "vllm:spec_decode_num_drafts_total": 2 + index,
+                    },
+                }
+            )
+        path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records)
+        )
 
     def test_gate_requires_all_three_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -71,6 +98,22 @@ class CurrentBlockDebtCompareTest(unittest.TestCase):
             status = {row["directory"]: row["pareto_pass"] for row in rows}
             self.assertFalse(status["native_mtp"])
             self.assertTrue(status["candidate"])
+
+    def test_paired_bootstrap_is_zero_for_identical_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "cactus", acc=0.5, e2e=100.0, mal=4.0)
+            self._write(root, "candidate", acc=0.5, e2e=100.0, mal=4.0)
+            self._write_requests(root, "cactus")
+            self._write_requests(root, "candidate")
+            intervals = paired_bootstrap_intervals(
+                root,
+                ["candidate"],
+                bootstrap_samples=100,
+                bootstrap_seed=7,
+            )
+            for interval in intervals["candidate"].values():
+                self.assertEqual(interval, (0.0, 0.0))
 
 
 if __name__ == "__main__":
