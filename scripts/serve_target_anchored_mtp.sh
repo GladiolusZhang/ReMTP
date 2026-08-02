@@ -8,7 +8,7 @@ export REMTP_TRACE=0
 export ENFORCE_EAGER=0
 export MTP_TOKENS="${MTP_TOKENS:-6}"
 export MTP_REJECTION_SAMPLE_METHOD=probabilistic
-export REMTP_WORKER_CLS=remtp.worker.TargetAnchoredMTPWorker
+export REMTP_WORKER_CLS="${REMTP_WORKER_CLS:-remtp.worker.TargetAnchoredMTPWorker}"
 
 if [[ "$MTP_TOKENS" != "6" ]]; then
   echo "Target-anchored block verification requires MTP_TOKENS=6." >&2
@@ -17,10 +17,10 @@ fi
 
 variant="${TARGET_ANCHORED_VARIANT:-tv_hidden_veto}"
 case "$variant" in
-  cactus_cap|tv_head|tv_hidden_veto|tv_debt_control|tv_top1_surplus|tv_target_surplus|tv_risk_swap) ;;
+  cactus_cap|tv_head|tv_hidden_veto|tv_debt_control|tv_top1_surplus|tv_target_surplus|tv_risk_swap|tv_block_shield) ;;
   *)
     echo "Unknown TARGET_ANCHORED_VARIANT=$variant" >&2
-    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, tv_debt_control, tv_top1_surplus, tv_target_surplus, or tv_risk_swap" >&2
+    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, tv_debt_control, tv_top1_surplus, tv_target_surplus, tv_risk_swap, or tv_block_shield" >&2
     exit 2
     ;;
 esac
@@ -45,6 +45,7 @@ export REMTP_TA_SURPLUS_MAX_LOG_GAP="${SURPLUS_MAX_LOG_GAP:-2.0}"
 export REMTP_TA_RISK_SWAP_SOFT_LOG_GAP="${RISK_SWAP_SOFT_LOG_GAP:-4.0}"
 export REMTP_TA_RISK_SWAP_HARD_LOG_GAP="${RISK_SWAP_HARD_LOG_GAP:-10.0}"
 export REMTP_TA_RISK_SWAP_DESTINATION_LOG_GAP="${RISK_SWAP_DESTINATION_LOG_GAP:-2.0}"
+export REMTP_TA_BLOCK_SHIELD_CACTUS_MIX="${BLOCK_SHIELD_CACTUS_MIX:-0.30}"
 export REMTP_TA_RECOVERY_MODE="${TARGET_ANCHORED_RECOVERY_MODE:-residual}"
 export REMTP_TA_AUDIT_INTERVAL="${TARGET_ANCHORED_AUDIT_INTERVAL:-0}"
 export REMTP_TA_DIAGNOSTICS="${TARGET_ANCHORED_DIAGNOSTICS:-0}"
@@ -55,7 +56,7 @@ if [[ -z "${REMTP_COMPILATION_CONFIG:-}" ]]; then
   export REMTP_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}'
 fi
 
-if [[ "$variant" == "tv_risk_swap" ]]; then
+if [[ "$variant" == "tv_risk_swap" || "$variant" == "tv_block_shield" ]]; then
   echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS risk_swap_gap=$REMTP_TA_RISK_SWAP_SOFT_LOG_GAP:$REMTP_TA_RISK_SWAP_HARD_LOG_GAP destination_gap=$REMTP_TA_RISK_SWAP_DESTINATION_LOG_GAP"
 elif [[ "$variant" == "tv_top1_surplus" || "$variant" == "tv_target_surplus" ]]; then
   echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS surplus_max_log_gap=$REMTP_TA_SURPLUS_MAX_LOG_GAP"

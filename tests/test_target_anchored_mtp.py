@@ -582,6 +582,43 @@ class TargetAnchoredMTPTest(unittest.TestCase):
         torch.testing.assert_close(p_y, result.target_candidate_probs)
         torch.testing.assert_close(h_y, result.boosted_candidate_probs)
 
+    def test_block_shield_retains_fixed_cactus_share(self) -> None:
+        risk_config = self.config(
+            "tv_risk_swap",
+            cactus_delta=0.01,
+            risk_swap_soft_log_gap=1.0,
+            risk_swap_hard_log_gap=4.0,
+            risk_swap_destination_log_gap=1.0,
+        )
+        shield_config = self.config(
+            "tv_block_shield",
+            cactus_delta=0.01,
+            risk_swap_soft_log_gap=1.0,
+            risk_swap_hard_log_gap=4.0,
+            risk_swap_destination_log_gap=1.0,
+            block_shield_cactus_mix=0.30,
+        )
+        risk = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            risk_config,
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        shield = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            shield_config,
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        torch.testing.assert_close(
+            shield.allocated_tv,
+            0.70 * risk.allocated_tv + 0.30 * risk.cactus_tv,
+        )
+
     def test_aligned_hidden_cosine_and_fallback(self) -> None:
         draft = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
@@ -690,6 +727,8 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             TargetAnchoredConfig(
                 risk_swap_destination_log_gap=-1.0,
             ).validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(block_shield_cactus_mix=1.1).validate()
         with self.assertRaises(ValueError):
             TargetAnchoredConfig(recovery_mode="unsafe").validate()
 

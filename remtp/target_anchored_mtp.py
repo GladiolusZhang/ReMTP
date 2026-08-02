@@ -24,6 +24,9 @@ Three ablations are implemented:
 * ``tv_risk_swap``: preserve Cactus on target-supported positions, prune its
   risky tail continuously, and spend both the pruned mass and saturation
   surplus where it has higher target-anchored prefix utility.
+* ``tv_block_shield``: retain a fixed Cactus share inside the risk swap so
+  joint Block Verification can spend its acceptance surplus on quality
+  control without falling below the token-wise Cactus operating point.
 """
 
 from __future__ import annotations
@@ -95,6 +98,7 @@ class TargetAnchoredConfig:
     risk_swap_soft_log_gap: float = 4.0
     risk_swap_hard_log_gap: float = 10.0
     risk_swap_destination_log_gap: float = 2.0
+    block_shield_cactus_mix: float = 0.30
     recovery_mode: str = "residual"
 
     def validate(self) -> None:
@@ -106,6 +110,7 @@ class TargetAnchoredConfig:
             "tv_top1_surplus",
             "tv_target_surplus",
             "tv_risk_swap",
+            "tv_block_shield",
         }:
             raise ValueError(f"unsupported target-anchored variant: {self.variant}")
         if self.cactus_delta < 0:
@@ -156,6 +161,8 @@ class TargetAnchoredConfig:
             raise ValueError(
                 "risk_swap_destination_log_gap must be non-negative"
             )
+        if not 0.0 <= self.block_shield_cactus_mix <= 1.0:
+            raise ValueError("block_shield_cactus_mix must be in [0,1]")
         if self.recovery_mode not in {"residual", "target"}:
             raise ValueError("recovery_mode must be residual or target")
 
@@ -228,6 +235,9 @@ class TargetAnchoredConfig:
                     "REMTP_TA_RISK_SWAP_DESTINATION_LOG_GAP",
                     "2.0",
                 )
+            ),
+            block_shield_cactus_mix=float(
+                os.getenv("REMTP_TA_BLOCK_SHIELD_CACTUS_MIX", "0.30")
             ),
             recovery_mode=os.getenv(
                 "REMTP_TA_RECOVERY_MODE",
@@ -752,7 +762,7 @@ def target_anchored_distribution(
         raw_allocated = allocated.clone()
         risk_capacity = destination_capacity
         risk_multiplier = target_supported.to(torch.float32)
-    elif config.variant == "tv_risk_swap":
+    elif config.variant in {"tv_risk_swap", "tv_block_shield"}:
         (
             allocated,
             cactus_floor,
@@ -771,6 +781,11 @@ def target_anchored_distribution(
         raw_allocated = cactus_floor
         risk_capacity = kept_cactus + destination_capacity
         risk_multiplier = keep_multiplier
+        if config.variant == "tv_block_shield":
+            allocated = (
+                (1.0 - config.block_shield_cactus_mix) * allocated
+                + config.block_shield_cactus_mix * cactus_tv
+            )
     elif config.variant == "tv_debt_control":
         (
             allocated,
@@ -1369,6 +1384,12 @@ def install_target_anchored_mtp() -> None:
     if compile_fast_path:
         fast = torch.compile(fast, fullgraph=True, dynamic=False)
 
+    candidate_cap = (
+        "Cactus/risk interpolation"
+        if config.variant == "tv_block_shield"
+        else "h(y)<=q(y)"
+    )
+
     module = importlib.import_module(_V1_REJECTION_MODULE)
     current = module.rejection_sample
     if not getattr(current, "_remtp_target_anchored_mtp", False):
@@ -1402,9 +1423,10 @@ def install_target_anchored_mtp() -> None:
         f"{config.risk_swap_hard_log_gap:g} "
         f"risk_swap_destination_gap="
         f"{config.risk_swap_destination_log_gap:g} "
+        f"block_shield_cactus_mix={config.block_shield_cactus_mix:g} "
         f"recovery={config.recovery_mode} "
         f"compiled={int(compile_fast_path)} "
-        "budget=exact-Cactus-TV cap=h(y)<=q(y) "
+        f"budget=exact-Cactus-TV cap={candidate_cap} "
         f"surplus={int(config.variant in {'tv_top1_surplus', 'tv_target_surplus'})}",
         flush=True,
     )

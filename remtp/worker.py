@@ -59,6 +59,32 @@ class CactusMTPWorker(Worker):
         return super().init_device(*args, **kwargs)
 
 
+class BlockVerificationMTPWorker(Worker):
+    """Probabilistic native MTP with lossless joint block verification."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.block_verification import install_block_verification
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_block_verification()
+        return super().init_device(*args, **kwargs)
+
+
+class CactusBlockVerificationMTPWorker(Worker):
+    """Cactus target adapter followed by joint block verification."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.block_verification import install_block_verification
+        from remtp.cactus_mtp import install_cactus_mtp
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_block_verification()
+        install_cactus_mtp()
+        return super().init_device(*args, **kwargs)
+
+
 class TargetAnchoredMTPWorker(Worker):
     """CUDA worker for target-anchored exact-TV MTP verification."""
 
@@ -67,6 +93,24 @@ class TargetAnchoredMTPWorker(Worker):
         from remtp.target_anchored_mtp import install_target_anchored_mtp
 
         install_probabilistic_mtp()
+        if os.getenv("REMTP_TA_VARIANT") == "tv_hidden_veto":
+            from remtp.probabilistic_mtp import install_aligned_hidden_capture
+
+            install_aligned_hidden_capture()
+        install_target_anchored_mtp()
+        return super().init_device(*args, **kwargs)
+
+
+class TargetAnchoredBlockMTPWorker(Worker):
+    """Target-anchored relaxation followed by joint block verification."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.block_verification import install_block_verification
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+        from remtp.target_anchored_mtp import install_target_anchored_mtp
+
+        install_probabilistic_mtp()
+        install_block_verification()
         if os.getenv("REMTP_TA_VARIANT") == "tv_hidden_veto":
             from remtp.probabilistic_mtp import install_aligned_hidden_capture
 

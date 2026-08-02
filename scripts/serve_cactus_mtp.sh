@@ -8,7 +8,7 @@ export REMTP_TRACE=0
 export ENFORCE_EAGER=0
 export MTP_TOKENS="${MTP_TOKENS:-4}"
 export MTP_REJECTION_SAMPLE_METHOD=probabilistic
-export REMTP_WORKER_CLS=remtp.worker.CactusMTPWorker
+export REMTP_WORKER_CLS="${REMTP_WORKER_CLS:-remtp.worker.CactusMTPWorker}"
 export REMTP_CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
 
 # Qwen3.5's GDN Triton kernel cannot be captured safely in this pinned stack.
