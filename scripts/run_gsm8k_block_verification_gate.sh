@@ -31,9 +31,10 @@ Environment:
   SERVER_START_TIMEOUT=180
   RUN_TAG=<timestamp>
 
-The second seed runs only if block-surplus-shielded risk control passes the
-first-seed Pareto gate against Cactus. Results and server logs remain under
-ignored local directories.
+The second seed runs if either Cactus+Block Verification or the block-surplus
+shield passes the first-seed Pareto gate against Cactus. This preserves the
+pre-registered narrow fallback if the new risk-control method fails. Results
+and server logs remain under ignored local directories.
 EOF
 }
 
@@ -237,33 +238,32 @@ first_stage="$RUN_ROOT/seed_${SAMPLE_SEED}"
 first_pass="$(python -c '
 import json, sys
 rows = json.load(open(sys.argv[1]))
-row = next(x for x in rows if x["directory"] == "block_shield")
-print(int(row["pareto_pass"]))
+rows = [x for x in rows if x["directory"] in {"cactus_block", "block_shield"}]
+print(int(any(x["pareto_pass"] for x in rows)))
 ' "$first_stage/comparison.json")"
 
 if [[ "$first_pass" != "1" ]]; then
   echo
-  echo "Block-surplus-shielded risk control did not pass the first-seed gate."
+  echo "Neither Cactus+Block nor Block Shield passed the first-seed gate."
   echo "The second seed was not run: $first_stage/comparison.md"
   exit 0
 fi
 
 echo
-echo "Block-surplus shield passed seed $SAMPLE_SEED; confirming."
+echo "At least one block candidate passed seed $SAMPLE_SEED; confirming."
 run_stage "$SECOND_SAMPLE_SEED"
 second_stage="$RUN_ROOT/seed_${SECOND_SAMPLE_SEED}"
-second_pass="$(python -c '
+reproduction="$(python -c '
 import json, sys
-rows = json.load(open(sys.argv[1]))
-row = next(x for x in rows if x["directory"] == "block_shield")
-print(int(row["pareto_pass"]))
-' "$second_stage/comparison.json")"
+first = {x["directory"]: x for x in json.load(open(sys.argv[1]))}
+second = {x["directory"]: x for x in json.load(open(sys.argv[2]))}
+for name in ("cactus_block", "block_shield"):
+    if first[name]["pareto_pass"]:
+        status = "REPRODUCED" if second[name]["pareto_pass"] else "NOT REPRODUCED"
+        print(f"{status}: {name}")
+' "$first_stage/comparison.json" "$second_stage/comparison.json")"
 
 echo
-if [[ "$second_pass" == "1" ]]; then
-  echo "REPRODUCED: block-surplus shield passed both seeds."
-else
-  echo "NOT REPRODUCED: the candidate failed the second-seed gate."
-fi
+echo "$reproduction"
 echo "Seed 1: $first_stage/comparison.md"
 echo "Seed 2: $second_stage/comparison.md"
