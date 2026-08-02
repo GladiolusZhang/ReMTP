@@ -2,7 +2,10 @@ import unittest
 
 import torch
 
-from remtp.cactus_mtp import cactus_target_distribution
+from remtp.cactus_mtp import (
+    cactus_target_distribution,
+    sparse_checkpoint_target_distribution,
+)
 
 
 class CactusMTPTest(unittest.TestCase):
@@ -60,6 +63,40 @@ class CactusMTPTest(unittest.TestCase):
                 torch.tensor([[0.5, 0.5]]),
                 torch.tensor([0]),
                 delta=-0.1,
+            )
+
+    def test_sparse_checkpoint_changes_only_target_opposed_rows(self) -> None:
+        target = torch.tensor(
+            [
+                [0.2, 0.3, 0.5],
+                [0.01, 0.09, 0.90],
+            ]
+        )
+        strict, checkpoint = sparse_checkpoint_target_distribution(
+            target,
+            torch.tensor([0, 0]),
+            delta=0.5,
+            max_log_gap=2.0,
+        )
+        expected_safe = cactus_target_distribution(
+            target[:1],
+            torch.tensor([0]),
+            delta=0.5,
+        )
+        torch.testing.assert_close(strict[:1], expected_safe)
+        torch.testing.assert_close(strict[1:], target[1:])
+        torch.testing.assert_close(
+            checkpoint,
+            torch.tensor([False, True]),
+        )
+
+    def test_sparse_checkpoint_rejects_negative_gap(self) -> None:
+        with self.assertRaises(ValueError):
+            sparse_checkpoint_target_distribution(
+                torch.tensor([[0.5, 0.5]]),
+                torch.tensor([0]),
+                delta=1.0,
+                max_log_gap=-1.0,
             )
 
 

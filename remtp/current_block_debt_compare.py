@@ -55,6 +55,7 @@ def _profile_label(directory: str) -> str:
         "cactus_block": "Cactus + Block Verification",
         "risk_swap_block": "Target-anchored risk swap + Block Verification",
         "block_shield": "Block-surplus-shielded risk control",
+        "sparse_checkpoint": "Sparse target-risk checkpoint + Block Verification",
     }
     return labels.get(directory, directory)
 

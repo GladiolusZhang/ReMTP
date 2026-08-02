@@ -78,6 +78,45 @@ def cactus_target_distribution(
     ).clamp_min(1e-30)
 
 
+def sparse_checkpoint_target_distribution(
+    target_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    delta: float,
+    max_log_gap: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use strict target rows only at strongly target-opposed positions.
+
+    Joint Block Verification can use Cactus mass above ``q(y)`` to repair an
+    earlier prefix-survival deficit.  A dense cap therefore destroys useful
+    block-level evidence.  This ablation keeps Cactus unchanged except when
+    the draft token is more than ``max_log_gap`` nats below the target top-1;
+    only those sparse rows fall back to the original target distribution.
+    """
+    if max_log_gap < 0:
+        raise ValueError("max_log_gap must be non-negative")
+    cactus = cactus_target_distribution(
+        target_probs,
+        draft_token_ids,
+        delta,
+    )
+    probs = target_probs.to(torch.float32)
+    ids = draft_token_ids.to(device=probs.device, dtype=torch.int64)
+    rows = torch.arange(probs.shape[0], device=probs.device)
+    candidate = probs[rows, ids]
+    top = probs.amax(dim=-1)
+    log_gap = (
+        torch.log(top.clamp_min(1e-30))
+        - torch.log(candidate.clamp_min(1e-30))
+    ).clamp_min(0.0)
+    checkpoint = log_gap > max_log_gap
+    verification = torch.where(
+        checkpoint.unsqueeze(-1),
+        probs,
+        cactus,
+    )
+    return verification, checkpoint
+
+
 def _cactus_rejection_sample_v1(
     draft_token_ids: torch.Tensor,
     num_draft_tokens: list[int],
@@ -120,11 +159,26 @@ def _cactus_rejection_sample_v1(
         target_logits.to(torch.float32),
         dim=-1,
     )
-    cactus_probs = cactus_target_distribution(
-        target_probs,
-        draft_token_ids,
-        delta,
+    checkpoint_gap_raw = os.getenv("REMTP_CACTUS_SPARSE_CHECKPOINT_GAP")
+    checkpoint_mask = torch.zeros(
+        draft_token_ids.shape[0],
+        device=target_probs.device,
+        dtype=torch.bool,
     )
+    if checkpoint_gap_raw is None:
+        cactus_probs = cactus_target_distribution(
+            target_probs,
+            draft_token_ids,
+            delta,
+        )
+    else:
+        checkpoint_gap = float(checkpoint_gap_raw)
+        cactus_probs, checkpoint_mask = sparse_checkpoint_target_distribution(
+            target_probs,
+            draft_token_ids,
+            delta,
+            checkpoint_gap,
+        )
 
     if (
         not _DIAGNOSTIC_EMITTED
@@ -154,6 +208,7 @@ def _cactus_rejection_sample_v1(
                 f"q_mtp(D)={mtp_at_draft.tolist()} "
                 f"p_target(D)={target_at_draft.tolist()} "
                 f"h_cactus(D)={cactus_at_draft.tolist()} "
+                f"strict_checkpoint={checkpoint_mask.tolist()} "
                 f"KL(h||p)={kl.tolist()}",
                 flush=True,
             )
@@ -179,6 +234,11 @@ def install_cactus_mtp() -> None:
     delta = float(os.getenv("REMTP_CACTUS_DELTA", "1.0"))
     if delta < 0:
         raise ValueError("REMTP_CACTUS_DELTA must be non-negative")
+    checkpoint_gap_raw = os.getenv("REMTP_CACTUS_SPARSE_CHECKPOINT_GAP")
+    if checkpoint_gap_raw is not None and float(checkpoint_gap_raw) < 0:
+        raise ValueError(
+            "REMTP_CACTUS_SPARSE_CHECKPOINT_GAP must be non-negative"
+        )
 
     module = importlib.import_module(_V1_REJECTION_MODULE)
     current = module.rejection_sample
@@ -190,6 +250,7 @@ def install_cactus_mtp() -> None:
     print(
         "[ReMTP][Cactus] "
         f"delta={delta:g} draft=probabilistic-MTP "
-        "verifier=Cactus-h bonus=target",
+        "verifier=Cactus-h bonus=target "
+        f"sparse_checkpoint_gap={checkpoint_gap_raw or 'off'}",
         flush=True,
     )
