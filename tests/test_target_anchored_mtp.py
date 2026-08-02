@@ -289,7 +289,6 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             TargetAnchoredConfig(variant="js").validate()
         with self.assertRaises(ValueError):
             TargetAnchoredConfig(head_reliability=(1.0,)).validate()
-
     def test_default_config_covers_six_mtp_heads(self) -> None:
         config = TargetAnchoredConfig()
         config.validate()

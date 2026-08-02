@@ -79,6 +79,13 @@ class RegretFeedbackMTPWorker(Worker):
     """CUDA worker for target-anchored MTP plus cross-block regret."""
 
     def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        if os.getenv("REMTP_REGRET_DIRECTION", "token") in {
+            "adaptive_depth",
+            "expected_scale_adaptive_depth",
+        }:
+            from remtp.adaptive_scheduler import install_adaptive_async_scheduler
+
+            install_adaptive_async_scheduler()
         from remtp.probabilistic_mtp import (
             install_aligned_hidden_capture,
             install_probabilistic_mtp,

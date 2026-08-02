@@ -30,6 +30,8 @@ _PROPOSAL_COUNT = 0
 _DIAGNOSTIC_EMITTED = False
 _CAPTURE_ALIGNED_HIDDEN_STATES = False
 _BONUS_LOGITS_HOOK: Any | None = None
+_DRAFT_HIDDEN_HOOK: Any | None = None
+_DRAFT_LOGITS_HOOK: Any | None = None
 
 
 def sample_mtp_logits(
@@ -114,7 +116,20 @@ def _sample_from_full_mtp_distribution(
         raise RuntimeError("MTP sampling metadata has no temperature tensor")
     temperatures = temperatures[:batch_size]
 
-    logits = self.model.compute_logits(hidden_states)
+    proposal_depth = len(self._remtp_current_draft_probs)
+    logits_hidden_states = hidden_states
+    if _DRAFT_HIDDEN_HOOK is not None:
+        logits_hidden_states = _DRAFT_HIDDEN_HOOK(
+            hidden_states,
+            proposal_depth,
+        )
+    logits = self.model.compute_logits(logits_hidden_states)
+    if _DRAFT_LOGITS_HOOK is not None:
+        logits = _DRAFT_LOGITS_HOOK(
+            logits,
+            proposal_depth,
+            temperatures,
+        )
     sampled, probs = sample_mtp_logits(
         logits,
         temperatures,
@@ -124,7 +139,7 @@ def _sample_from_full_mtp_distribution(
     self._remtp_current_draft_probs.append(probs.contiguous())
     if _CAPTURE_ALIGNED_HIDDEN_STATES:
         self._remtp_current_draft_hidden_states.append(
-            hidden_states.contiguous()
+            logits_hidden_states.contiguous()
         )
     return sampled
 
@@ -328,6 +343,20 @@ def set_bonus_logits_hook(hook: Any | None) -> None:
     global _BONUS_LOGITS_HOOK
 
     _BONUS_LOGITS_HOOK = hook
+
+
+def set_draft_hidden_hook(hook: Any | None) -> None:
+    """Optionally correct the hidden row used to form each MTP draft q."""
+    global _DRAFT_HIDDEN_HOOK
+
+    _DRAFT_HIDDEN_HOOK = hook
+
+
+def set_draft_logits_hook(hook: Any | None) -> None:
+    """Optionally calibrate each MTP head's logits before sampling q."""
+    global _DRAFT_LOGITS_HOOK
+
+    _DRAFT_LOGITS_HOOK = hook
 
 
 def install_probabilistic_mtp() -> None:

@@ -32,6 +32,7 @@ _HIDDEN_FALLBACK_EMITTED = False
 _AUDIT_ROUND = 0
 _AUDIT_TV = torch.zeros(3, dtype=torch.float64)
 _DEFAULT_HEAD_RELIABILITY = (1.0, 0.85, 0.70, 0.55, 0.40, 0.30)
+_PRE_VERIFICATION_HOOK: Any | None = None
 _POST_VERIFICATION_HOOK: Any | None = None
 
 
@@ -444,7 +445,7 @@ def _target_anchored_rejection_sample(
         )
 
     config = getattr(_target_anchored_rejection_sample, "_remtp_config")
-    if max_spec_len != config.expected_draft_tokens:
+    if not 1 <= max_spec_len <= config.expected_draft_tokens:
         raise RuntimeError(
             f"configured MTP={config.expected_draft_tokens}, "
             f"but vLLM max_spec_len={max_spec_len}"
@@ -506,6 +507,28 @@ def _target_anchored_rejection_sample(
             draft_token_ids,
             hidden_similarity,
         )
+
+    pre_verification_hook = _PRE_VERIFICATION_HOOK
+    if pre_verification_hook is not None:
+        h_y = pre_verification_hook(
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            draft_token_ids=draft_token_ids,
+            target_candidate_probs=p_y,
+            boosted_candidate_probs=h_y,
+            hidden_similarity=hidden_similarity,
+            sampling_metadata=sampling_metadata,
+        )
+        h_y = torch.maximum(h_y, p_y)
+        rows = torch.arange(
+            draft_token_ids.shape[0],
+            device=target_probs.device,
+        )
+        q_y = draft_probs[
+            rows,
+            draft_token_ids.to(torch.int64),
+        ]
+        h_y = torch.minimum(h_y, q_y)
 
     diagnostics = getattr(
         _target_anchored_rejection_sample,
@@ -626,6 +649,17 @@ def set_post_verification_hook(hook: Any | None) -> None:
     global _POST_VERIFICATION_HOOK
 
     _POST_VERIFICATION_HOOK = hook
+
+
+def set_pre_verification_hook(hook: Any | None) -> None:
+    """Register an optional constrained-budget controller before sampling.
+
+    The hook may only change the candidate probabilities used by the verifier.
+    The wrapper enforces ``p(y) <= h(y) <= q(y)`` after the hook returns.
+    """
+    global _PRE_VERIFICATION_HOOK
+
+    _PRE_VERIFICATION_HOOK = hook
 
 
 def install_target_anchored_mtp() -> None:
