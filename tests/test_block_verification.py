@@ -5,6 +5,7 @@ import torch
 
 from remtp.block_verification import (
     block_verification_state,
+    expected_longest_accepted_prefix,
     longest_accepted_prefix,
     prefix_joint_probability,
 )
@@ -95,6 +96,11 @@ class BlockVerificationTest(unittest.TestCase):
         )
         torch.testing.assert_close(capped, torch.tensor([0.5, 0.5]))
         torch.testing.assert_close(repaired, torch.tensor([0.5, 1.0]))
+
+    def test_expected_longest_prefix_uses_independent_subblock_tests(self) -> None:
+        # P(L >= 1)=1-(1-.2)(1-.5)=.6; P(L >= 2)=.5.
+        expected = expected_longest_accepted_prefix(torch.tensor([0.2, 0.5]))
+        self.assertAlmostEqual(expected.item(), 1.1, places=6)
 
 
 if __name__ == "__main__":

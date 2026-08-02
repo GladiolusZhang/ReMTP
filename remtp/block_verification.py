@@ -175,6 +175,21 @@ def longest_accepted_prefix(
     ).amax()
 
 
+def expected_longest_accepted_prefix(
+    acceptance_probabilities: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``E[max{i: subblock i accepts}]`` for independent tests."""
+    if acceptance_probabilities.ndim != 1:
+        raise ValueError("acceptance probabilities must have shape [rows]")
+    probabilities = acceptance_probabilities.clamp(0.0, 1.0)
+    # P(L >= k) is one minus the probability that every subblock k..D fails.
+    suffix_all_fail = torch.cumprod(
+        (1.0 - probabilities).flip(0),
+        dim=0,
+    ).flip(0)
+    return (1.0 - suffix_all_fail).sum()
+
+
 def _block_rejection_sample(
     draft_token_ids: torch.Tensor,
     num_draft_tokens: list[int],

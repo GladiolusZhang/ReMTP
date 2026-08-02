@@ -114,16 +114,39 @@ def sample_gsm8k(
     rows: list[dict[str, Any]],
     samples: int,
     seed: int,
+    excluded_question_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
-    if samples > len(rows):
+    excluded = excluded_question_ids or set()
+    eligible = [
+        row for row in rows if int(row["question_id"]) not in excluded
+    ]
+    if samples > len(eligible):
         raise ValueError(
-            f"GSM8K has {len(rows)} rows; cannot sample {samples}"
+            f"GSM8K has {len(eligible)} eligible rows after exclusions; "
+            f"cannot sample {samples}"
         )
     rng = random.Random(seed)
     return sorted(
-        rng.sample(rows, samples),
+        rng.sample(eligible, samples),
         key=lambda row: int(row["question_id"]),
     )
+
+
+def load_excluded_question_ids(paths: list[Path]) -> set[int]:
+    """Load question ids from prior benchmark sample manifests."""
+    excluded: set[int] = set()
+    for path in paths:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"sample manifest must contain a list: {path}")
+        for record in payload:
+            try:
+                excluded.add(int(record["question_id"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid question_id in sample manifest: {path}"
+                ) from exc
+    return excluded
 
 
 def add_accuracy(
@@ -238,6 +261,13 @@ def parse_args() -> argparse.Namespace:
         help="print one progress row every N samples",
     )
     parser.add_argument("--skip-warmup", action="store_true")
+    parser.add_argument(
+        "--exclude-manifest",
+        action="append",
+        default=[],
+        type=Path,
+        help="exclude question ids in a prior sample_manifest.json; repeatable",
+    )
     return parser.parse_args()
 
 
@@ -273,7 +303,21 @@ def main() -> int:
         return 2
 
     rows = load_gsm8k(data_path)
-    selected = sample_gsm8k(rows, args.samples, args.sample_seed)
+    exclusion_paths = [path.resolve() for path in args.exclude_manifest]
+    missing_exclusions = [path for path in exclusion_paths if not path.is_file()]
+    if missing_exclusions:
+        print(
+            f"exclusion manifest not found: {missing_exclusions[0]}",
+            file=sys.stderr,
+        )
+        return 2
+    excluded_question_ids = load_excluded_question_ids(exclusion_paths)
+    selected = sample_gsm8k(
+        rows,
+        args.samples,
+        args.sample_seed,
+        excluded_question_ids,
+    )
 
     output_dir = args.output_dir
     if output_dir is None:
@@ -399,6 +443,11 @@ def main() -> int:
         "progress_every": args.progress_every,
         "answer_metric": "normalized_numeric_exact_match",
         "answer_extraction": "####, then boxed, then last numeric token",
+        "excluded_question_ids": len(excluded_question_ids),
+        "exclusion_manifest_sha256": [
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in exclusion_paths
+        ],
     }
     with (output_dir / "requests.jsonl").open(
         "w",

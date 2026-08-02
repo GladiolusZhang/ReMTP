@@ -20,6 +20,8 @@ _PROTOCOL_KEYS = (
     "mtp_tokens",
     "data_sha256",
     "answer_metric",
+    "excluded_question_ids",
+    "exclusion_manifest_sha256",
 )
 
 
@@ -56,6 +58,8 @@ def _profile_label(directory: str) -> str:
         "cactus_block": "Cactus + Block Verification",
         "risk_swap_block": "Target-anchored risk swap + Block Verification",
         "block_shield": "Block-surplus-shielded risk control",
+        "spec_cascade": "SpecCascade TokenV3 + MTP",
+        "learned_gate": "Calibrated minimal Block Shield router",
     }
     return labels.get(directory, directory)
 

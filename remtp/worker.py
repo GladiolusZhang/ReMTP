@@ -119,6 +119,20 @@ class TargetAnchoredBlockMTPWorker(Worker):
         return super().init_device(*args, **kwargs)
 
 
+class LearnedBlockGateMTPWorker(Worker):
+    """Cactus/Block-Shield logistic routing with joint block verification."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.block_verification import install_block_verification
+        from remtp.learned_block_gate import install_learned_block_gate
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_block_verification()
+        install_learned_block_gate()
+        return super().init_device(*args, **kwargs)
+
+
 class RegretFeedbackMTPWorker(Worker):
     """CUDA worker for target-anchored MTP plus cross-block regret."""
 
