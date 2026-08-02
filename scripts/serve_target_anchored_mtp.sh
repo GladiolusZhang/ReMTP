@@ -17,10 +17,10 @@ fi
 
 variant="${TARGET_ANCHORED_VARIANT:-tv_hidden_veto}"
 case "$variant" in
-  cactus_cap|tv_head|tv_hidden_veto) ;;
+  cactus_cap|tv_head|tv_hidden_veto|tv_debt_control) ;;
   *)
     echo "Unknown TARGET_ANCHORED_VARIANT=$variant" >&2
-    echo "Expected: cactus_cap, tv_head, or tv_hidden_veto" >&2
+    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, or tv_debt_control" >&2
     exit 2
     ;;
 esac
@@ -34,6 +34,13 @@ export REMTP_TA_MAX_TARGET_LOG_GAP="${MAX_TARGET_LOG_GAP:-8.0}"
 export REMTP_TA_FUTURE_VETO_FLOOR="${FUTURE_VETO_FLOOR:-0.20}"
 export REMTP_TA_HIDDEN_RELIABILITY_FLOOR="${HIDDEN_RELIABILITY_FLOOR:-0.25}"
 export REMTP_TA_USE_PREFIX_VALUE="${USE_PREFIX_VALUE:-1}"
+export REMTP_TA_DEBT_POSITION_LIMIT="${DEBT_POSITION_LIMIT:-0.35}"
+export REMTP_TA_DEBT_BLOCK_LIMIT="${DEBT_BLOCK_LIMIT:-1.20}"
+export REMTP_TA_DEBT_SOFT_LOG_GAP="${DEBT_SOFT_LOG_GAP:-2.0}"
+export REMTP_TA_DEBT_HARD_LOG_GAP="${DEBT_HARD_LOG_GAP:-6.0}"
+export REMTP_TA_DEBT_MAX_POSITION_TV="${DEBT_MAX_POSITION_TV:-0.15}"
+export REMTP_TA_DEBT_MAX_CACTUS_RATIO="${DEBT_MAX_CACTUS_RATIO:-2.0}"
+export REMTP_TA_DEBT_FALLBACK="${DEBT_FALLBACK:-strict}"
 export REMTP_TA_AUDIT_INTERVAL="${TARGET_ANCHORED_AUDIT_INTERVAL:-0}"
 export REMTP_TA_DIAGNOSTICS="${TARGET_ANCHORED_DIAGNOSTICS:-0}"
 export REMTP_TA_COMPILE="${TARGET_ANCHORED_COMPILE:-1}"
@@ -43,5 +50,5 @@ if [[ -z "${REMTP_COMPILATION_CONFIG:-}" ]]; then
   export REMTP_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}'
 fi
 
-echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS"
+echo "[ReMTP][TargetAnchored] variant=$variant mtp_tokens=$MTP_TOKENS debt_position=$REMTP_TA_DEBT_POSITION_LIMIT debt_block=$REMTP_TA_DEBT_BLOCK_LIMIT debt_gap=$REMTP_TA_DEBT_SOFT_LOG_GAP:$REMTP_TA_DEBT_HARD_LOG_GAP debt_max_tv=$REMTP_TA_DEBT_MAX_POSITION_TV debt_ratio=$REMTP_TA_DEBT_MAX_CACTUS_RATIO debt_fallback=$REMTP_TA_DEBT_FALLBACK"
 exec "$PROJECT_DIR/scripts/serve.sh"

@@ -489,3 +489,38 @@ SAMPLES=200 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
 后，本地结果除六行对比表外还包含 `regret_mechanism.json`，其中记录
 严格可接受比例、causal relaxed acceptance、单位接受 token 的 TV、
 注入次数和六个 MTP head 的机制统计。
+
+该跨块 hidden-steering 版本保留在
+`research/future-only-regret-exploration`，作为 future-only 机制的探索记录。
+
+## 12. 当前块验证债务控制（MTP=6）
+
+新方法不再把主要风险反馈推迟到下一块。它把松弛造成的接受概率增量
+
+```text
+debt_i = A_relaxed(i) - A_strict(i)
+```
+
+作为当前位置的验证债务，在 token 提交前限制单位置预算、目标明显反对
+的候选和块内累计债务；被裁掉的 Exact-TV 预算仍可回收到更安全且前缀
+价值更高的位置。达到风险阈值后，主方法停止后续松弛并退回严格验证，
+另提供 CACTUS fallback 消融。
+
+在两个固定 GSM8K seed 上执行 Pareto 门槛：
+
+```bash
+SAMPLES=100 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
+./scripts/run_gsm8k_current_block_debt_gate.sh
+```
+
+第一 seed 只有同时达到 `Accuracy > CACTUS`、`MAL > CACTUS`、
+`E2E >= CACTUS` 的配置才进入第二 seed。加入低成本 posterior scale 和
+top-1 bias 辅助消融：
+
+```bash
+INCLUDE_WEAK_FEEDBACK=1 SAMPLES=100 \
+./scripts/run_gsm8k_current_block_debt_gate.sh
+```
+
+算法和参数说明见
+[docs/current_block_verification_debt.md](docs/current_block_verification_debt.md)。

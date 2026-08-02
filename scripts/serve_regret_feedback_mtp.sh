@@ -15,8 +15,10 @@ if [[ "$MTP_TOKENS" != "6" ]]; then
   exit 2
 fi
 
-# Keep the current target-anchored verifier exactly unchanged.
-export REMTP_TA_VARIANT=tv_hidden_veto
+# The historical default remains unchanged. Current-block experiments may
+# select tv_debt_control while future-only scale/top-1 feedback stays an
+# optional, low-cost ablation.
+export REMTP_TA_VARIANT="${TARGET_ANCHORED_VARIANT:-tv_hidden_veto}"
 export REMTP_TA_EXPECTED_DRAFT_TOKENS="$MTP_TOKENS"
 export REMTP_CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
 export REMTP_TA_HEAD_RELIABILITY="${HEAD_RELIABILITY:-1.0,0.85,0.70,0.55,0.40,0.30}"
@@ -25,6 +27,13 @@ export REMTP_TA_MAX_TARGET_LOG_GAP="${MAX_TARGET_LOG_GAP:-8.0}"
 export REMTP_TA_FUTURE_VETO_FLOOR="${FUTURE_VETO_FLOOR:-0.20}"
 export REMTP_TA_HIDDEN_RELIABILITY_FLOOR="${HIDDEN_RELIABILITY_FLOOR:-0.25}"
 export REMTP_TA_USE_PREFIX_VALUE="${USE_PREFIX_VALUE:-1}"
+export REMTP_TA_DEBT_POSITION_LIMIT="${DEBT_POSITION_LIMIT:-0.35}"
+export REMTP_TA_DEBT_BLOCK_LIMIT="${DEBT_BLOCK_LIMIT:-1.20}"
+export REMTP_TA_DEBT_SOFT_LOG_GAP="${DEBT_SOFT_LOG_GAP:-2.0}"
+export REMTP_TA_DEBT_HARD_LOG_GAP="${DEBT_HARD_LOG_GAP:-6.0}"
+export REMTP_TA_DEBT_MAX_POSITION_TV="${DEBT_MAX_POSITION_TV:-0.15}"
+export REMTP_TA_DEBT_MAX_CACTUS_RATIO="${DEBT_MAX_CACTUS_RATIO:-2.0}"
+export REMTP_TA_DEBT_FALLBACK="${DEBT_FALLBACK:-strict}"
 export REMTP_TA_AUDIT_INTERVAL="${TARGET_ANCHORED_AUDIT_INTERVAL:-0}"
 export REMTP_TA_DIAGNOSTICS="${TARGET_ANCHORED_DIAGNOSTICS:-0}"
 export REMTP_TA_COMPILE="${TARGET_ANCHORED_COMPILE:-1}"

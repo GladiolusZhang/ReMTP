@@ -201,6 +201,131 @@ class TargetAnchoredMTPTest(unittest.TestCase):
         )
         self.assertLess(result.priority[0], result.priority[1])
 
+    def test_debt_control_bounds_position_and_block_acceptance_uplift(
+        self,
+    ) -> None:
+        result = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            self.config(
+                "tv_debt_control",
+                cactus_delta=1.0,
+                debt_position_limit=0.15,
+                debt_block_limit=0.30,
+                debt_soft_log_gap=10.0,
+                debt_hard_log_gap=20.0,
+                debt_max_position_tv=1.0,
+                debt_max_cactus_ratio=10.0,
+            ),
+        )
+        self.assertTrue(
+            torch.all(result.acceptance_residual <= 0.15 + 1e-6).item()
+        )
+        self.assertLessEqual(result.cumulative_debt[-1].item(), 0.30 + 1e-6)
+        self.assertTrue(
+            torch.all(result.allocated_tv <= result.risk_capacity + 1e-6).item()
+        )
+        self.assertTrue(
+            torch.all(
+                result.allocated_tv <= result.raw_allocated_tv + 1e-6
+            ).item()
+        )
+
+    def test_debt_control_recycles_budget_after_risk_caps(self) -> None:
+        result = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            self.config(
+                "tv_debt_control",
+                cactus_delta=0.01,
+                debt_position_limit=0.20,
+                debt_block_limit=1.0,
+                debt_soft_log_gap=10.0,
+                debt_hard_log_gap=20.0,
+                debt_max_position_tv=1.0,
+                debt_max_cactus_ratio=10.0,
+            ),
+        )
+        self.assertGreater(result.allocated_tv.sum().item(), 0.0)
+        self.assertLessEqual(
+            result.allocated_tv.sum().item(),
+            result.cactus_tv.sum().item() + 1e-6,
+        )
+
+    def test_hard_target_opposition_stops_suffix_relaxation(self) -> None:
+        target = self.target.clone()
+        target[1] = torch.tensor([0.999, 0.0001, 0.0005, 0.0004])
+        result = target_anchored_distribution(
+            target,
+            self.draft,
+            self.ids,
+            self.config(
+                "tv_debt_control",
+                cactus_delta=1.0,
+                max_target_log_gap=100.0,
+                debt_soft_log_gap=2.0,
+                debt_hard_log_gap=4.0,
+                debt_max_position_tv=1.0,
+                debt_max_cactus_ratio=10.0,
+                debt_fallback="strict",
+            ),
+        )
+        self.assertEqual(result.allocated_tv[1].item(), 0.0)
+        self.assertTrue(torch.all(result.allocated_tv[2:] == 0.0).item())
+        self.assertTrue(result.fallback_mask[1].item())
+        self.assertTrue(torch.all(result.stopped_mask[2:]).item())
+
+    def test_cactus_fallback_is_available_as_an_ablation(self) -> None:
+        target = self.target.clone()
+        target[1] = torch.tensor([0.999, 0.0001, 0.0005, 0.0004])
+        result = target_anchored_distribution(
+            target,
+            self.draft,
+            self.ids,
+            self.config(
+                "tv_debt_control",
+                cactus_delta=0.01,
+                max_target_log_gap=100.0,
+                debt_soft_log_gap=2.0,
+                debt_hard_log_gap=4.0,
+                debt_max_position_tv=1.0,
+                debt_max_cactus_ratio=10.0,
+                debt_fallback="cactus_cap",
+            ),
+        )
+        expected = torch.minimum(result.cactus_tv, result.useful_tv_capacity)
+        torch.testing.assert_close(result.allocated_tv[1:], expected[1:])
+        self.assertTrue(torch.all(result.fallback_mask[1:]).item())
+
+    def test_loose_debt_limits_recover_tv_head_allocation(self) -> None:
+        baseline = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            self.config("tv_head", cactus_delta=0.01),
+        )
+        debt = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            self.config(
+                "tv_debt_control",
+                cactus_delta=0.01,
+                debt_position_limit=1.0,
+                debt_block_limit=4.0,
+                debt_soft_log_gap=100.0,
+                debt_hard_log_gap=101.0,
+                debt_max_position_tv=1.0,
+                debt_max_cactus_ratio=100.0,
+            ),
+        )
+        torch.testing.assert_close(
+            debt.allocated_tv,
+            baseline.allocated_tv,
+        )
+
     def test_aligned_hidden_cosine_and_fallback(self) -> None:
         draft = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
@@ -289,6 +414,15 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             TargetAnchoredConfig(variant="js").validate()
         with self.assertRaises(ValueError):
             TargetAnchoredConfig(head_reliability=(1.0,)).validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(debt_position_limit=1.1).validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(
+                debt_soft_log_gap=2.0,
+                debt_hard_log_gap=2.0,
+            ).validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(debt_fallback="unsafe").validate()
     def test_default_config_covers_six_mtp_heads(self) -> None:
         config = TargetAnchoredConfig()
         config.validate()

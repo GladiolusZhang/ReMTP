@@ -13,6 +13,10 @@ Three ablations are implemented:
 * ``tv_hidden_veto``: additionally use aligned current MTP/target hidden
   cosine and allow later target support only to veto, never reward, an
   earlier candidate.
+* ``tv_debt_control``: keep saturation-aware block-TV recycling, but treat
+  the increase in speculative acceptance probability as verification debt.
+  Per-position risk caps and a cumulative block limit act before a risky
+  relaxed token can be committed.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ _DIAGNOSTIC_EMITTED = False
 _HIDDEN_FALLBACK_EMITTED = False
 _AUDIT_ROUND = 0
 _AUDIT_TV = torch.zeros(3, dtype=torch.float64)
+_AUDIT_DEBT = torch.zeros(6, dtype=torch.float64)
 _DEFAULT_HEAD_RELIABILITY = (1.0, 0.85, 0.70, 0.55, 0.40, 0.30)
 _PRE_VERIFICATION_HOOK: Any | None = None
 _POST_VERIFICATION_HOOK: Any | None = None
@@ -70,12 +75,20 @@ class TargetAnchoredConfig:
     future_veto_floor: float = 0.20
     hidden_reliability_floor: float = 0.25
     use_prefix_value: bool = True
+    debt_position_limit: float = 0.35
+    debt_block_limit: float = 1.20
+    debt_soft_log_gap: float = 2.0
+    debt_hard_log_gap: float = 6.0
+    debt_max_position_tv: float = 0.15
+    debt_max_cactus_ratio: float = 2.0
+    debt_fallback: str = "strict"
 
     def validate(self) -> None:
         if self.variant not in {
             "cactus_cap",
             "tv_head",
             "tv_hidden_veto",
+            "tv_debt_control",
         }:
             raise ValueError(f"unsupported target-anchored variant: {self.variant}")
         if self.cactus_delta < 0:
@@ -96,6 +109,24 @@ class TargetAnchoredConfig:
             raise ValueError("future_veto_floor must be in [0,1]")
         if not 0.0 <= self.hidden_reliability_floor <= 1.0:
             raise ValueError("hidden_reliability_floor must be in [0,1]")
+        if not 0.0 <= self.debt_position_limit <= 1.0:
+            raise ValueError("debt_position_limit must be in [0,1]")
+        if self.debt_block_limit < 0.0:
+            raise ValueError("debt_block_limit must be non-negative")
+        if self.debt_soft_log_gap < 0.0:
+            raise ValueError("debt_soft_log_gap must be non-negative")
+        if self.debt_hard_log_gap <= self.debt_soft_log_gap:
+            raise ValueError(
+                "debt_hard_log_gap must exceed debt_soft_log_gap"
+            )
+        if self.debt_max_position_tv < 0.0:
+            raise ValueError("debt_max_position_tv must be non-negative")
+        if self.debt_max_cactus_ratio < 1.0:
+            raise ValueError("debt_max_cactus_ratio must be at least one")
+        if self.debt_fallback not in {"strict", "cactus_cap"}:
+            raise ValueError(
+                "debt_fallback must be strict or cactus_cap"
+            )
 
     @classmethod
     def from_env(cls) -> TargetAnchoredConfig:
@@ -130,6 +161,28 @@ class TargetAnchoredConfig:
                 "REMTP_TA_USE_PREFIX_VALUE",
                 True,
             ),
+            debt_position_limit=float(
+                os.getenv("REMTP_TA_DEBT_POSITION_LIMIT", "0.35")
+            ),
+            debt_block_limit=float(
+                os.getenv("REMTP_TA_DEBT_BLOCK_LIMIT", "1.20")
+            ),
+            debt_soft_log_gap=float(
+                os.getenv("REMTP_TA_DEBT_SOFT_LOG_GAP", "2.0")
+            ),
+            debt_hard_log_gap=float(
+                os.getenv("REMTP_TA_DEBT_HARD_LOG_GAP", "6.0")
+            ),
+            debt_max_position_tv=float(
+                os.getenv("REMTP_TA_DEBT_MAX_POSITION_TV", "0.15")
+            ),
+            debt_max_cactus_ratio=float(
+                os.getenv("REMTP_TA_DEBT_MAX_CACTUS_RATIO", "2.0")
+            ),
+            debt_fallback=os.getenv(
+                "REMTP_TA_DEBT_FALLBACK",
+                "strict",
+            ),
         )
         config.validate()
         return config
@@ -153,7 +206,15 @@ class TargetAnchoredResult:
     priority: torch.Tensor
     cactus_tv: torch.Tensor
     useful_tv_capacity: torch.Tensor
+    raw_allocated_tv: torch.Tensor
+    risk_capacity: torch.Tensor
+    risk_multiplier: torch.Tensor
     allocated_tv: torch.Tensor
+    relaxed_acceptance: torch.Tensor
+    acceptance_residual: torch.Tensor
+    cumulative_debt: torch.Tensor
+    fallback_mask: torch.Tensor
+    stopped_mask: torch.Tensor
 
 
 def cactus_tv_increment(
@@ -253,6 +314,153 @@ def _allocate_capped_tv(
     return allocated
 
 
+def _acceptance_from_candidate_probability(
+    candidate_probability: torch.Tensor,
+    draft_candidate_probability: torch.Tensor,
+) -> torch.Tensor:
+    """Return speculative acceptance for one or more proposed tokens."""
+    return torch.minimum(
+        torch.ones_like(candidate_probability),
+        candidate_probability
+        / draft_candidate_probability.clamp_min(1e-30),
+    )
+
+
+def _debt_controlled_tv(
+    *,
+    p_y: torch.Tensor,
+    q_y: torch.Tensor,
+    log_gap: torch.Tensor,
+    strict_acceptance: torch.Tensor,
+    cactus_tv: torch.Tensor,
+    useful_capacity: torch.Tensor,
+    priority: torch.Tensor,
+    config: TargetAnchoredConfig,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Allocate block TV under position and cumulative verification debt.
+
+    Debt is the exact increase in speculative acceptance probability caused
+    by relaxation, ``A_relaxed - A_strict``. Risk caps are constructed before
+    water filling so TV reclaimed from an unsafe position can still move to a
+    safer, high-value position. A prefix-order pass enforces the block debt
+    limit and stops later relaxation after the limit or a hard target veto.
+    """
+    raw_allocated = _allocate_capped_tv(
+        useful_capacity,
+        priority,
+        cactus_tv.sum(),
+    )
+    capped_cactus = torch.minimum(cactus_tv, useful_capacity)
+
+    gap_width = config.debt_hard_log_gap - config.debt_soft_log_gap
+    gap_multiplier = (
+        (config.debt_hard_log_gap - log_gap) / gap_width
+    ).clamp(0.0, 1.0)
+
+    # A_relaxed - A_strict <= position_limit. Before saturation this maps
+    # exactly to h-p <= q*position_limit.
+    max_acceptance = (
+        strict_acceptance + config.debt_position_limit
+    ).clamp(max=1.0)
+    debt_tv_cap = (
+        q_y * max_acceptance - p_y
+    ).clamp_min(0.0)
+    cactus_ratio_cap = capped_cactus * config.debt_max_cactus_ratio
+    absolute_tv_cap = torch.full_like(
+        useful_capacity,
+        config.debt_max_position_tv,
+    )
+    risk_capacity = torch.minimum(
+        useful_capacity,
+        torch.minimum(
+            debt_tv_cap,
+            torch.minimum(cactus_ratio_cap, absolute_tv_cap),
+        ),
+    ) * gap_multiplier
+
+    proposed = _allocate_capped_tv(
+        risk_capacity,
+        priority,
+        cactus_tv.sum(),
+    )
+
+    kept = torch.zeros_like(proposed)
+    relaxed_acceptance = strict_acceptance.clone()
+    acceptance_residual = torch.zeros_like(proposed)
+    cumulative_debt = torch.zeros_like(proposed)
+    fallback_mask = torch.zeros_like(proposed, dtype=torch.bool)
+    stopped_mask = torch.zeros_like(proposed, dtype=torch.bool)
+    running_debt = torch.zeros_like(proposed[0])
+    active = torch.ones_like(proposed[0], dtype=torch.bool)
+    use_cactus_fallback = config.debt_fallback == "cactus_cap"
+
+    for depth in range(proposed.shape[0]):
+        hard_veto = log_gap[depth] >= config.debt_hard_log_gap
+        remaining_debt = (
+            config.debt_block_limit - running_debt
+        ).clamp_min(0.0)
+        allowed_acceptance = torch.minimum(
+            _acceptance_from_candidate_probability(
+                p_y[depth] + proposed[depth],
+                q_y[depth],
+            ),
+            strict_acceptance[depth] + remaining_debt,
+        ).clamp(max=1.0)
+        block_tv_cap = (
+            q_y[depth] * allowed_acceptance - p_y[depth]
+        ).clamp_min(0.0)
+        controlled = torch.minimum(proposed[depth], block_tv_cap)
+
+        risk_stop = hard_veto | (~active) | (remaining_debt <= 1e-12)
+        fallback = (
+            capped_cactus[depth]
+            if use_cactus_fallback
+            else torch.zeros_like(controlled)
+        )
+        chosen = torch.where(risk_stop, fallback, controlled)
+        kept[depth] = chosen
+        current_acceptance = _acceptance_from_candidate_probability(
+            p_y[depth] + chosen,
+            q_y[depth],
+        )
+        current_debt = (
+            current_acceptance - strict_acceptance[depth]
+        ).clamp_min(0.0)
+        relaxed_acceptance[depth] = current_acceptance
+        acceptance_residual[depth] = current_debt
+        running_debt = running_debt + current_debt
+        cumulative_debt[depth] = running_debt
+        fallback_mask[depth] = risk_stop
+        stopped_mask[depth] = ~active
+
+        hit_block_limit = running_debt >= (
+            config.debt_block_limit - 1e-12
+        )
+        active = active & (~hard_veto) & (~hit_block_limit)
+
+    return (
+        kept,
+        raw_allocated,
+        risk_capacity,
+        gap_multiplier,
+        relaxed_acceptance,
+        acceptance_residual,
+        cumulative_debt,
+        fallback_mask,
+        stopped_mask,
+    )
+
+
 def target_anchored_distribution(
     target_probs: torch.Tensor,
     draft_probs: torch.Tensor,
@@ -340,14 +548,54 @@ def target_anchored_distribution(
 
     cactus_tv = cactus_tv_increment(p_y, config.cactus_delta)
     useful_capacity = (q_y - p_y).clamp_min(0.0)
+    raw_allocated = torch.zeros_like(useful_capacity)
+    risk_capacity = useful_capacity.clone()
+    risk_multiplier = torch.ones_like(useful_capacity)
+    relaxed_acceptance = strict_acceptance.clone()
+    acceptance_residual = torch.zeros_like(useful_capacity)
+    cumulative_debt = torch.zeros_like(useful_capacity)
+    fallback_mask = torch.zeros_like(useful_capacity, dtype=torch.bool)
+    stopped_mask = torch.zeros_like(useful_capacity, dtype=torch.bool)
     if config.variant == "cactus_cap":
         allocated = torch.minimum(cactus_tv, useful_capacity)
+        raw_allocated = allocated.clone()
+    elif config.variant == "tv_debt_control":
+        (
+            allocated,
+            raw_allocated,
+            risk_capacity,
+            risk_multiplier,
+            relaxed_acceptance,
+            acceptance_residual,
+            cumulative_debt,
+            fallback_mask,
+            stopped_mask,
+        ) = _debt_controlled_tv(
+            p_y=p_y,
+            q_y=q_y,
+            log_gap=log_gap,
+            strict_acceptance=strict_acceptance,
+            cactus_tv=cactus_tv,
+            useful_capacity=useful_capacity,
+            priority=priority,
+            config=config,
+        )
     else:
         allocated = _allocate_capped_tv(
             useful_capacity,
             priority,
             cactus_tv.sum(),
         )
+        raw_allocated = allocated.clone()
+    if config.variant != "tv_debt_control":
+        relaxed_acceptance = _acceptance_from_candidate_probability(
+            p_y + allocated,
+            q_y,
+        )
+        acceptance_residual = (
+            relaxed_acceptance - strict_acceptance
+        ).clamp_min(0.0)
+        cumulative_debt = acceptance_residual.cumsum(dim=0)
     boosted = p_y + allocated
 
     relaxed = None
@@ -375,7 +623,15 @@ def target_anchored_distribution(
         priority=priority,
         cactus_tv=cactus_tv,
         useful_tv_capacity=useful_capacity,
+        raw_allocated_tv=raw_allocated,
+        risk_capacity=risk_capacity,
+        risk_multiplier=risk_multiplier,
         allocated_tv=allocated,
+        relaxed_acceptance=relaxed_acceptance,
+        acceptance_residual=acceptance_residual,
+        cumulative_debt=cumulative_debt,
+        fallback_mask=fallback_mask,
+        stopped_mask=stopped_mask,
     )
 
 
@@ -424,7 +680,7 @@ def _target_anchored_rejection_sample(
     bonus_token_ids: torch.Tensor,
     sampling_metadata: Any,
 ) -> torch.Tensor:
-    global _AUDIT_ROUND, _AUDIT_TV, _DIAGNOSTIC_EMITTED
+    global _AUDIT_ROUND, _AUDIT_TV, _AUDIT_DEBT, _DIAGNOSTIC_EMITTED
     global _HIDDEN_FALLBACK_EMITTED
 
     original = getattr(_target_anchored_rejection_sample, "_remtp_original")
@@ -550,7 +806,15 @@ def _target_anchored_rejection_sample(
             f"priority={result.priority.tolist()} "
             f"cactus_TV={result.cactus_tv.tolist()} "
             f"capacity={result.useful_tv_capacity.tolist()} "
+            f"raw_allocated_TV={result.raw_allocated_tv.tolist()} "
+            f"risk_capacity={result.risk_capacity.tolist()} "
+            f"risk_multiplier={result.risk_multiplier.tolist()} "
             f"allocated_TV={result.allocated_tv.tolist()} "
+            f"relaxed_A={result.relaxed_acceptance.tolist()} "
+            f"acceptance_debt={result.acceptance_residual.tolist()} "
+            f"cumulative_debt={result.cumulative_debt.tolist()} "
+            f"fallback={result.fallback_mask.tolist()} "
+            f"stopped={result.stopped_mask.tolist()} "
             f"block_cactus_TV={result.cactus_tv.sum().item():.6f} "
             f"block_allocated_TV={result.allocated_tv.sum().item():.6f}",
             flush=True,
@@ -571,18 +835,39 @@ def _target_anchored_rejection_sample(
             ),
             dtype=torch.float64,
         )
+        _AUDIT_DEBT += torch.tensor(
+            (
+                result.raw_allocated_tv.sum().item(),
+                result.allocated_tv.sum().item(),
+                result.acceptance_residual.sum().item(),
+                result.fallback_mask.sum().item(),
+                result.stopped_mask.sum().item(),
+                (
+                    result.raw_allocated_tv - result.allocated_tv
+                ).clamp_min(0.0).sum().item(),
+            ),
+            dtype=torch.float64,
+        )
         if _AUDIT_ROUND % audit_interval == 0:
             values = (_AUDIT_TV / audit_interval).tolist()
+            debt_values = (_AUDIT_DEBT / audit_interval).tolist()
             print(
                 "[ReMTP][TargetAnchored][audit] "
                 f"rounds={_AUDIT_ROUND-audit_interval+1}-{_AUDIT_ROUND} "
                 f"mean_cactus_TV={values[0]:.6f} "
                 f"mean_allocated_TV={values[1]:.6f} "
                 f"mean_useful_capacity={values[2]:.6f} "
-                f"budget_utilization={values[1]/max(values[0],1e-30):.6f}",
+                f"budget_utilization={values[1]/max(values[0],1e-30):.6f} "
+                f"mean_raw_exact_TV={debt_values[0]:.6f} "
+                f"mean_controlled_TV={debt_values[1]:.6f} "
+                f"mean_acceptance_debt={debt_values[2]:.6f} "
+                f"mean_fallback_positions={debt_values[3]:.6f} "
+                f"mean_stopped_positions={debt_values[4]:.6f} "
+                f"mean_risk_pruned_TV={debt_values[5]:.6f}",
                 flush=True,
             )
             _AUDIT_TV.zero_()
+            _AUDIT_DEBT.zero_()
 
     original_top_ids = (
         logits.argmax(dim=-1) if sampling_metadata.all_greedy else None
@@ -709,6 +994,13 @@ def install_target_anchored_mtp() -> None:
         f"max_gap={config.max_target_log_gap:g} "
         f"future_veto_floor={config.future_veto_floor:g} "
         f"hidden_floor={config.hidden_reliability_floor:g} "
+        f"debt_position_limit={config.debt_position_limit:g} "
+        f"debt_block_limit={config.debt_block_limit:g} "
+        f"debt_gap={config.debt_soft_log_gap:g}:"
+        f"{config.debt_hard_log_gap:g} "
+        f"debt_max_position_TV={config.debt_max_position_tv:g} "
+        f"debt_max_cactus_ratio={config.debt_max_cactus_ratio:g} "
+        f"debt_fallback={config.debt_fallback} "
         f"compiled={int(compile_fast_path)} "
         "budget=exact-Cactus-TV cap=h(y)<=q(y)",
         flush=True,
