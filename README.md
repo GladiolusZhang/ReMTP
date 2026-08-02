@@ -593,3 +593,25 @@ SAMPLES=164 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
 基线、此前具有代表性的 Exact-TV 变体以及当前 Regret-Calibrated Block
 方法。完整说明见 [docs/humaneval.md](docs/humaneval.md)。数据、生成代码、
 判题结果和日志均只保存在本地忽略目录。
+
+若只研究“Cactus verifier 不变、遗憾残差仅引导下一块 MTP 草稿”，运行：
+
+```bash
+# 40 条固定子集筛查
+./scripts/run_humaneval_cactus_regret.sh
+
+# 锁定参数后的全量测试
+SAMPLES=164 CACTUS_REGRET_ALPHA=0.03 \
+./scripts/run_humaneval_cactus_regret.sh
+```
+
+This profile leaves the Cactus verifier unchanged and projects the previous
+block's target-side `P-H` regret through the shared output head to correct
+only the next block's first MTP proposal. Its
+default posterior causal responsibility is continuous; use
+`CACTUS_REGRET_RESPONSIBILITY=realized` for the binary-event ablation.
+Experimental feature-space variants are available with
+`CACTUS_REGRET_INJECTION_SITE=root` and
+`CACTUS_REGRET_RESIDUAL_SPACE=boundary_hidden` or `hidden`.
+
+该表固定包含纯概率 MTP、Cactus、SpecCascade 和 residual regret 方法。

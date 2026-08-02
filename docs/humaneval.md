@@ -59,15 +59,44 @@ MTP_TOKENS=6 \
 
 1. Native probabilistic MTP；
 2. Cactus + MTP；
-3. SpecCascade TokenV3 + MTP；
-4. Native MTP + Block Verification；
-5. Cactus + Block Verification；
-6. Current-block debt balanced；
-7. Cactus-dominant target surplus；
-8. Exact-TV + head calibration；
-9. Regret-Calibrated Block Relaxation（当前方法）。
+3. Cactus + residual regret feedback；
+4. SpecCascade TokenV3 + MTP；
+5. Native MTP + Block Verification；
+6. Cactus + Block Verification；
+7. Current-block debt balanced；
+8. Cactus-dominant target surplus；
+9. Exact-TV + head calibration；
+10. Regret-Calibrated Block Relaxation。
 
 可用 `PROFILES` 选择子集，但正式对比强制包含 `native_mtp` 和 `cactus`。
+
+### Cactus 不变、只反馈后续 MTP 的实验
+
+该入口保持 Cactus verifier 完全不变，只把 causal Cactus acceptance 中
+被 Cactus 临时分布压低的目标偏好残差用于下一块第一颗 MTP 草稿：
+
+```bash
+# 默认固定抽 40 条，用于小规模机制筛查
+./scripts/run_humaneval_cactus_regret.sh
+
+# 参数锁定后跑全部 164 条
+SAMPLES=164 CACTUS_REGRET_ALPHA=0.03 \
+./scripts/run_humaneval_cactus_regret.sh
+```
+
+The regret profile keeps Cactus verification unchanged. By default it uses
+the continuous posterior responsibility
+`(A_cactus - A_strict) / A_cactus` for each committed draft token, then
+projects the lexical `P-H` regret through the shared output head and steers
+only the next block's first MTP proposal. Set
+`CACTUS_REGRET_RESPONSIBILITY=realized` only for the higher-variance binary
+event ablation. The experimental native-feature variants use
+`CACTUS_REGRET_INJECTION_SITE=root` with
+`CACTUS_REGRET_RESIDUAL_SPACE=boundary_hidden` or `hidden`; they are retained
+for ablation but are not the evidence-backed default.
+
+固定包含纯概率 MTP、Cactus、SpecCascade 和 Cactus + residual regret。
+反馈不会修改 Cactus 的 `H`、接受公式、纠正分布或 bonus token。
 
 ## 5. 输出
 

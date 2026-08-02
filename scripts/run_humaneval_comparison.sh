@@ -12,6 +12,7 @@ Run the protocol-locked HumanEval comparison.
 Default methods:
   - native probabilistic MTP
   - Cactus + MTP
+  - Cactus + residual regret feedback
   - SpecCascade TokenV3 + MTP
   - native MTP + published Block Verification
   - Cactus + published Block Verification
@@ -34,7 +35,8 @@ Useful environment variables:
   SEED=42
   MAX_TOKENS=512
   MTP_TOKENS=6
-  PROFILES="native_mtp cactus spec_cascade native_block cactus_block debt_balanced target_surplus tv_head regret_calibrated_block"
+  CACTUS_REGRET_ALPHA=0.03
+  PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head regret_calibrated_block"
   EVAL_TIMEOUT=8
   HUMANEVAL_DOCKER_IMAGE=python:3-slim
   PROGRESS_EVERY=10
@@ -69,6 +71,15 @@ CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
 CASCADE_RULE="${CASCADE_RULE:-token_v3}"
 CASCADE_ALPHA="${CASCADE_ALPHA:-0.5}"
 REGRET_FEEDBACK_SCALE="${REGRET_FEEDBACK_SCALE:-0.05}"
+CACTUS_REGRET_ALPHA="${CACTUS_REGRET_ALPHA:-0.03}"
+CACTUS_REGRET_TOP_K="${CACTUS_REGRET_TOP_K:-16}"
+CACTUS_REGRET_STRENGTH_REFERENCE="${CACTUS_REGRET_STRENGTH_REFERENCE:-0.10}"
+CACTUS_REGRET_DEPTH_DECAY="${CACTUS_REGRET_DEPTH_DECAY:-0.90}"
+CACTUS_REGRET_RESPONSIBILITY="${CACTUS_REGRET_RESPONSIBILITY:-posterior}"
+CACTUS_REGRET_INJECTION_SITE="${CACTUS_REGRET_INJECTION_SITE:-head1}"
+CACTUS_REGRET_RESIDUAL_SPACE="${CACTUS_REGRET_RESIDUAL_SPACE:-output}"
+CACTUS_REGRET_AUDIT_INTERVAL="${CACTUS_REGRET_AUDIT_INTERVAL:-0}"
+CACTUS_REGRET_DIAGNOSTICS="${CACTUS_REGRET_DIAGNOSTICS:-0}"
 BLOCK_SHIELD_CACTUS_MIX="${BLOCK_SHIELD_CACTUS_MIX:-0.30}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
@@ -79,7 +90,7 @@ HUMANEVAL_DOCKER_IMAGE="${HUMANEVAL_DOCKER_IMAGE:-python:3-slim}"
 HUMANEVAL_DATA="${HUMANEVAL_DATA:-$PROJECT_DIR/data/humaneval/HumanEval.jsonl.gz}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-DEFAULT_PROFILES="native_mtp cactus spec_cascade native_block cactus_block debt_balanced target_surplus tv_head regret_calibrated_block"
+DEFAULT_PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head regret_calibrated_block"
 read -r -a profiles <<< "${PROFILES:-$DEFAULT_PROFILES}"
 
 if [[ "$MTP_TOKENS" != "6" ]]; then
@@ -179,6 +190,9 @@ profile_server() {
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_cactus_mtp.sh"
       PROFILE_ENV=(REMTP_CACTUS_DIAGNOSTICS=0)
       ;;
+    cactus_regret)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_cactus_regret_mtp.sh"
+      ;;
     spec_cascade)
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_spec_cascade.sh"
       ;;
@@ -225,6 +239,15 @@ run_method() {
     CASCADE_RULE="$CASCADE_RULE" \
     CASCADE_ALPHA="$CASCADE_ALPHA" \
     REGRET_FEEDBACK_SCALE="$REGRET_FEEDBACK_SCALE" \
+    CACTUS_REGRET_ALPHA="$CACTUS_REGRET_ALPHA" \
+    CACTUS_REGRET_TOP_K="$CACTUS_REGRET_TOP_K" \
+    CACTUS_REGRET_STRENGTH_REFERENCE="$CACTUS_REGRET_STRENGTH_REFERENCE" \
+    CACTUS_REGRET_DEPTH_DECAY="$CACTUS_REGRET_DEPTH_DECAY" \
+    CACTUS_REGRET_RESPONSIBILITY="$CACTUS_REGRET_RESPONSIBILITY" \
+    CACTUS_REGRET_INJECTION_SITE="$CACTUS_REGRET_INJECTION_SITE" \
+    CACTUS_REGRET_RESIDUAL_SPACE="$CACTUS_REGRET_RESIDUAL_SPACE" \
+    CACTUS_REGRET_AUDIT_INTERVAL="$CACTUS_REGRET_AUDIT_INTERVAL" \
+    CACTUS_REGRET_DIAGNOSTICS="$CACTUS_REGRET_DIAGNOSTICS" \
     BLOCK_SHIELD_CACTUS_MIX="$BLOCK_SHIELD_CACTUS_MIX" \
     TARGET_ANCHORED_AUDIT_INTERVAL=0 \
     TARGET_ANCHORED_DIAGNOSTICS=0 \

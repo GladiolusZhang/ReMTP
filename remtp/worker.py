@@ -59,6 +59,22 @@ class CactusMTPWorker(Worker):
         return super().init_device(*args, **kwargs)
 
 
+class CactusRegretMTPWorker(Worker):
+    """Unchanged Cactus verification plus one-block MTP-only feedback."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.cactus_mtp import install_cactus_mtp
+        from remtp.cactus_regret_feedback import (
+            install_cactus_regret_feedback,
+        )
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_cactus_mtp()
+        install_cactus_regret_feedback()
+        return super().init_device(*args, **kwargs)
+
+
 class BlockVerificationMTPWorker(Worker):
     """Probabilistic native MTP with lossless joint block verification."""
 

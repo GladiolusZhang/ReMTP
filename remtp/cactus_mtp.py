@@ -24,6 +24,7 @@ import torch
 
 _V1_REJECTION_MODULE = "vllm.v1.sample.rejection_sampler"
 _DIAGNOSTIC_EMITTED = False
+_POST_VERIFICATION_HOOK: Any | None = None
 
 
 def cactus_target_distribution(
@@ -162,7 +163,7 @@ def _cactus_rejection_sample_v1(
     # vLLM applies softmax internally. Passing log(h) makes the unmodified
     # rejection sampler use min(1, h(D)/q_mtp(D)) and residual (h-q_mtp)+.
     cactus_logits = torch.log(cactus_probs.clamp_min(1e-30))
-    return original(
+    output_token_ids = original(
         draft_token_ids,
         num_draft_tokens,
         max_spec_len,
@@ -172,6 +173,23 @@ def _cactus_rejection_sample_v1(
         bonus_token_ids,
         sampling_metadata,
     )
+    if _POST_VERIFICATION_HOOK is not None:
+        _POST_VERIFICATION_HOOK(
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            draft_token_ids=draft_token_ids,
+            cactus_probs=cactus_probs,
+            output_token_ids=output_token_ids,
+            sampling_metadata=sampling_metadata,
+        )
+    return output_token_ids
+
+
+def set_post_verification_hook(hook: Any | None) -> None:
+    """Observe a completed Cactus round without changing its distribution."""
+    global _POST_VERIFICATION_HOOK
+
+    _POST_VERIFICATION_HOOK = hook
 
 
 def install_cactus_mtp() -> None:

@@ -27,6 +27,7 @@ PROTOCOL_KEYS = (
 PROFILE_LABELS = {
     "native_mtp": "Native probabilistic MTP",
     "cactus": "Cactus + MTP",
+    "cactus_regret": "Cactus + residual regret feedback",
     "spec_cascade": "SpecCascade TokenV3 + MTP",
     "native_block": "Native MTP + Block Verification",
     "cactus_block": "Cactus + Block Verification",
