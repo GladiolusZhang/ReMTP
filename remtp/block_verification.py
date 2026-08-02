@@ -24,6 +24,8 @@ import torch
 
 _REJECTION_MODULE = "vllm.v1.sample.rejection_sampler"
 _DIAGNOSTIC_EMITTED = False
+_AUDIT_ROUND = 0
+_AUDIT_TOTAL = torch.zeros(6, dtype=torch.float64)
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,36 @@ class BlockVerificationState:
     subblock_acceptance_probability: torch.Tensor
     correction_scale: torch.Tensor
     residual_mass: torch.Tensor
+
+
+def prefix_joint_probability(
+    candidate_probabilities: torch.Tensor,
+    draft_candidate_probabilities: torch.Tensor,
+) -> torch.Tensor:
+    """Return the running joint survival probability of every prefix.
+
+    Unlike token-wise rejection sampling, a candidate probability above its
+    draft probability is not necessarily wasted.  When an earlier prefix has
+    survival below one, a later ratio greater than one can repair that
+    deficit before the recurrence saturates.
+    """
+    if candidate_probabilities.ndim != 1:
+        raise ValueError("candidate probabilities must have shape [rows]")
+    if candidate_probabilities.shape != draft_candidate_probabilities.shape:
+        raise ValueError("candidate and draft probabilities must align")
+    prefix_values: list[torch.Tensor] = []
+    running = torch.ones(
+        (),
+        device=candidate_probabilities.device,
+        dtype=candidate_probabilities.dtype,
+    )
+    for depth in range(candidate_probabilities.shape[0]):
+        ratio = candidate_probabilities[depth] / (
+            draft_candidate_probabilities[depth].clamp_min(1e-30)
+        )
+        running = torch.minimum(running * ratio, torch.ones_like(running))
+        prefix_values.append(running)
+    return torch.stack(prefix_values)
 
 
 def block_verification_state(
@@ -74,13 +106,7 @@ def block_verification_state(
     p_y = target[row_ids, ids]
     q_y = draft[row_ids, ids]
 
-    prefix_values: list[torch.Tensor] = []
-    running = torch.ones((), device=target.device, dtype=torch.float32)
-    for depth in range(rows):
-        ratio = p_y[depth] / q_y[depth].clamp_min(1e-30)
-        running = torch.minimum(running * ratio, torch.ones_like(running))
-        prefix_values.append(running)
-    prefix = torch.stack(prefix_values)
+    prefix = prefix_joint_probability(p_y, q_y)
 
     # A correction after tau accepted drafts uses a_tau * p_tau - q_tau.
     correction_scale = torch.cat((torch.ones_like(prefix[:1]), prefix[:-1]))
@@ -160,7 +186,7 @@ def _block_rejection_sample(
     sampling_metadata: Any,
 ) -> torch.Tensor:
     """Drop-in replacement for vLLM's token-wise rejection sampler."""
-    global _DIAGNOSTIC_EMITTED
+    global _DIAGNOSTIC_EMITTED, _AUDIT_ROUND, _AUDIT_TOTAL
 
     original = getattr(_block_rejection_sample, "_remtp_original")
     if (
@@ -188,7 +214,7 @@ def _block_rejection_sample(
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
     fast_state = getattr(_block_rejection_sample, "_remtp_fast_state")
     (
-        prefix_joint_probability,
+        prefix_joint,
         subblock_acceptance_probability,
         correction_scale,
         residual_mass,
@@ -198,7 +224,7 @@ def _block_rejection_sample(
         draft_token_ids,
     )
     state = BlockVerificationState(
-        prefix_joint_probability=prefix_joint_probability,
+        prefix_joint_probability=prefix_joint,
         subblock_acceptance_probability=subblock_acceptance_probability,
         correction_scale=correction_scale,
         residual_mass=residual_mass,
@@ -213,6 +239,58 @@ def _block_rejection_sample(
         state.subblock_acceptance_probability,
         uniforms,
     )
+
+    audit_interval = getattr(
+        _block_rejection_sample,
+        "_remtp_audit_interval",
+        0,
+    )
+    if audit_interval > 0:
+        ids = draft_token_ids.to(device=target_probs.device, dtype=torch.int64)
+        row_ids = torch.arange(num_drafts, device=target_probs.device)
+        h_y = target_probs[row_ids, ids]
+        q_y = draft_probs[row_ids, ids]
+        capped_prefix = prefix_joint_probability(
+            torch.minimum(h_y, q_y),
+            q_y,
+        )
+        repair = (
+            state.prefix_joint_probability - capped_prefix
+        ).clamp_min(0.0)
+        previous_survival = torch.cat(
+            (
+                torch.ones_like(state.prefix_joint_probability[:1]),
+                state.prefix_joint_probability[:-1],
+            )
+        )
+        over_q = h_y > q_y + 1e-12
+        direct_repair = over_q & (previous_survival < 1.0 - 1e-12)
+        _AUDIT_ROUND += 1
+        _AUDIT_TOTAL += torch.tensor(
+            (
+                over_q.sum().item(),
+                direct_repair.sum().item(),
+                (h_y - q_y).clamp_min(0.0).sum().item(),
+                repair.sum().item(),
+                repair[-1].item(),
+                accepted_length.item(),
+            ),
+            dtype=torch.float64,
+        )
+        if _AUDIT_ROUND % audit_interval == 0:
+            values = (_AUDIT_TOTAL / audit_interval).tolist()
+            print(
+                "[ReMTP][BlockVerify][audit] "
+                f"rounds={_AUDIT_ROUND-audit_interval+1}-{_AUDIT_ROUND} "
+                f"mean_over_q_positions={values[0]:.6f} "
+                f"mean_direct_repair_positions={values[1]:.6f} "
+                f"mean_over_q_mass={values[2]:.6f} "
+                f"mean_prefix_repair_sum={values[3]:.6f} "
+                f"mean_final_prefix_repair={values[4]:.6f} "
+                f"mean_committed_drafts={values[5]:.6f}",
+                flush=True,
+            )
+            _AUDIT_TOTAL.zero_()
 
     # vLLM's exponential-race kernel does not require normalized inputs.
     # Scaling each target row by a_tau therefore samples exactly from
@@ -279,6 +357,9 @@ def _block_rejection_sample(
 def install_block_verification() -> None:
     """Install joint stochastic verification below any target adapter."""
     compile_fast_path = os.getenv("REMTP_BLOCK_VERIFY_COMPILE", "1") == "1"
+    audit_interval = int(os.getenv("REMTP_BLOCK_VERIFY_AUDIT_INTERVAL", "0"))
+    if audit_interval < 0:
+        raise ValueError("REMTP_BLOCK_VERIFY_AUDIT_INTERVAL must be non-negative")
     fast_state = _block_verification_tensors
     if compile_fast_path:
         fast_state = torch.compile(fast_state, fullgraph=True, dynamic=False)
@@ -289,10 +370,11 @@ def install_block_verification() -> None:
         wrapper._remtp_block_verification = True
         wrapper._remtp_original = current
         wrapper._remtp_fast_state = fast_state
+        wrapper._remtp_audit_interval = audit_interval
         module.rejection_sample = wrapper
     print(
         "[ReMTP][BlockVerify] exact joint stochastic block verification enabled "
         "(single request; greedy delegates to vLLM) "
-        f"compiled={int(compile_fast_path)}",
+        f"compiled={int(compile_fast_path)} audit_interval={audit_interval}",
         flush=True,
     )

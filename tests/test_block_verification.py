@@ -6,6 +6,7 @@ import torch
 from remtp.block_verification import (
     block_verification_state,
     longest_accepted_prefix,
+    prefix_joint_probability,
 )
 
 
@@ -81,6 +82,19 @@ class BlockVerificationTest(unittest.TestCase):
             torch.tensor([0.5, 0.2, 0.3]),
         )
         self.assertEqual(accepted.item(), 3)
+
+    def test_probability_above_q_repairs_an_earlier_prefix_deficit(self) -> None:
+        q_y = torch.tensor([0.8, 0.2])
+        capped = prefix_joint_probability(
+            torch.tensor([0.4, 0.2]),
+            q_y,
+        )
+        repaired = prefix_joint_probability(
+            torch.tensor([0.4, 0.4]),
+            q_y,
+        )
+        torch.testing.assert_close(capped, torch.tensor([0.5, 0.5]))
+        torch.testing.assert_close(repaired, torch.tensor([0.5, 1.0]))
 
 
 if __name__ == "__main__":
