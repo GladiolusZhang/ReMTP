@@ -7,20 +7,19 @@ cd "$PROJECT_DIR"
 
 usage() {
   cat <<'EOF'
-Run the locked GSM8K comparison for Target-Risk-Gated Block Relaxation.
+Run the locked GSM8K comparison for Regret-Calibrated Block Relaxation.
 
 The comparison contains native probabilistic MTP, Cactus, SpecCascade
 TokenV3, native joint Block Verification, Cactus + Block Verification, and
-the proposed unified method. There is no automatic fallback to another
-method or a learned router.
+our unified relaxation plus current-block regret negative feedback method.
 
 Usage:
-  ./scripts/run_gsm8k_risk_gated_block_gate.sh
+  ./scripts/run_gsm8k_regret_calibrated_block.sh
 
 Environment:
   SAMPLES=100
-  SAMPLE_SEED=20261013
-  SECOND_SAMPLE_SEED=20261027
+  SAMPLE_SEED=20261103
+  SECOND_SAMPLE_SEED=20261117
   TEMPERATURE=0.7
   SEED=42
   MAX_TOKENS=384
@@ -28,17 +27,19 @@ Environment:
   CACTUS_DELTA=1.0
   CASCADE_RULE=token_v3
   CASCADE_ALPHA=0.5
+  REGRET_FEEDBACK_SCALE=0.05
   RISK_SWAP_SOFT_LOG_GAP=4.0
   RISK_SWAP_HARD_LOG_GAP=10.0
   RISK_SWAP_DESTINATION_LOG_GAP=2.0
   BLOCK_SHIELD_CACTUS_MIX=0.30
   PROGRESS_EVERY=10
   SERVER_START_TIMEOUT=180
+  CONFIRM_ON_SUCCESS=1
   RUN_TAG=<timestamp>
 
-Only Target-Risk-Gated Block Relaxation is tested against the Pareto gate:
-Accuracy > Cactus, MAL > Cactus, and E2E >= Cactus. If it passes the first
-seed, the unchanged method is automatically repeated on the second seed.
+Success requires our unchanged method to have Accuracy > Cactus,
+MAL > Cactus, and E2E >= Cactus. A first-seed success is repeated unchanged
+on the second seed. There is no method switch or learned fallback.
 Results and logs remain in ignored local directories.
 EOF
 }
@@ -54,8 +55,8 @@ if (( $# > 0 )); then
 fi
 
 SAMPLES="${SAMPLES:-100}"
-SAMPLE_SEED="${SAMPLE_SEED:-20261013}"
-SECOND_SAMPLE_SEED="${SECOND_SAMPLE_SEED:-20261027}"
+SAMPLE_SEED="${SAMPLE_SEED:-20261103}"
+SECOND_SAMPLE_SEED="${SECOND_SAMPLE_SEED:-20261117}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 SEED="${SEED:-42}"
 MAX_TOKENS="${MAX_TOKENS:-384}"
@@ -63,12 +64,14 @@ MTP_TOKENS="${MTP_TOKENS:-6}"
 CACTUS_DELTA="${CACTUS_DELTA:-1.0}"
 CASCADE_RULE="${CASCADE_RULE:-token_v3}"
 CASCADE_ALPHA="${CASCADE_ALPHA:-0.5}"
+REGRET_FEEDBACK_SCALE="${REGRET_FEEDBACK_SCALE:-0.05}"
 RISK_SWAP_SOFT_LOG_GAP="${RISK_SWAP_SOFT_LOG_GAP:-4.0}"
 RISK_SWAP_HARD_LOG_GAP="${RISK_SWAP_HARD_LOG_GAP:-10.0}"
 RISK_SWAP_DESTINATION_LOG_GAP="${RISK_SWAP_DESTINATION_LOG_GAP:-2.0}"
 BLOCK_SHIELD_CACTUS_MIX="${BLOCK_SHIELD_CACTUS_MIX:-0.30}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
+CONFIRM_ON_SUCCESS="${CONFIRM_ON_SUCCESS:-1}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 
@@ -80,6 +83,10 @@ if [[ "$SAMPLE_SEED" == "$SECOND_SAMPLE_SEED" ]]; then
   echo "SAMPLE_SEED and SECOND_SAMPLE_SEED must differ." >&2
   exit 2
 fi
+if [[ "$CONFIRM_ON_SUCCESS" != "0" && "$CONFIRM_ON_SUCCESS" != "1" ]]; then
+  echo "CONFIRM_ON_SUCCESS must be 0 or 1." >&2
+  exit 2
+fi
 if [[ ! -f "$PROJECT_DIR/data/gsm8k/test.jsonl" ]]; then
   echo "Missing data/gsm8k/test.jsonl. Download GSM8K first." >&2
   exit 2
@@ -89,8 +96,8 @@ if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
   exit 2
 fi
 
-RUN_ROOT="$PROJECT_DIR/results/gsm8k_risk_gated_block_gate_${RUN_TAG}"
-LOG_ROOT="$PROJECT_DIR/logs/gsm8k_risk_gated_block_gate_${RUN_TAG}"
+RUN_ROOT="$PROJECT_DIR/results/gsm8k_regret_calibrated_block_${RUN_TAG}"
+LOG_ROOT="$PROJECT_DIR/logs/gsm8k_regret_calibrated_block_${RUN_TAG}"
 server_pid=""
 
 cleanup_server() {
@@ -160,8 +167,8 @@ profile_server() {
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_cactus_block_mtp.sh"
       PROFILE_ENV=(REMTP_CACTUS_DIAGNOSTICS=0)
       ;;
-    risk_gated_block)
-      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_risk_gated_block_mtp.sh"
+    regret_calibrated_block)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_regret_calibrated_block_mtp.sh"
       ;;
     *)
       echo "Unknown profile: $profile" >&2
@@ -186,6 +193,7 @@ run_method() {
     CACTUS_DELTA="$CACTUS_DELTA" \
     CASCADE_RULE="$CASCADE_RULE" \
     CASCADE_ALPHA="$CASCADE_ALPHA" \
+    REGRET_FEEDBACK_SCALE="$REGRET_FEEDBACK_SCALE" \
     RISK_SWAP_SOFT_LOG_GAP="$RISK_SWAP_SOFT_LOG_GAP" \
     RISK_SWAP_HARD_LOG_GAP="$RISK_SWAP_HARD_LOG_GAP" \
     RISK_SWAP_DESTINATION_LOG_GAP="$RISK_SWAP_DESTINATION_LOG_GAP" \
@@ -218,7 +226,8 @@ run_stage() {
   local stage_root="$RUN_ROOT/seed_${sample_seed}"
   local log_stage="$LOG_ROOT/seed_${sample_seed}"
   local profiles=(
-    native_mtp spec_cascade native_block cactus_block risk_gated_block
+    native_mtp spec_cascade native_block cactus_block
+    regret_calibrated_block
   )
   mkdir -p "$log_stage"
   mkdir "$stage_root"
@@ -228,18 +237,20 @@ run_stage() {
     run_method "$stage_root" "$log_stage" "$sample_seed" "$profile"
   done
   python -m remtp.current_block_debt_compare \
-    "$stage_root" "${profiles[@]}"
+    "$stage_root" "${profiles[@]}" \
+    --eligible regret_calibrated_block
 }
 
 mkdir -p "$LOG_ROOT"
 mkdir "$RUN_ROOT"
 
-echo "GSM8K Target-Risk-Gated Block Relaxation gate"
+echo "GSM8K Regret-Calibrated Block Relaxation comparison"
 echo "samples=$SAMPLES seeds=$SAMPLE_SEED,$SECOND_SAMPLE_SEED"
 echo "temperature=$TEMPERATURE generation_seed=$SEED max_tokens=$MAX_TOKENS"
 echo "mtp_tokens=$MTP_TOKENS cactus_delta=$CACTUS_DELTA"
 echo "cascade_rule=$CASCADE_RULE cascade_alpha=$CASCADE_ALPHA"
-echo "risk_gap=$RISK_SWAP_SOFT_LOG_GAP:$RISK_SWAP_HARD_LOG_GAP"
+echo "regret_scale=$REGRET_FEEDBACK_SCALE"
+echo "correction_gap=$RISK_SWAP_SOFT_LOG_GAP:$RISK_SWAP_HARD_LOG_GAP"
 echo "destination_gap=$RISK_SWAP_DESTINATION_LOG_GAP cactus_mix=$BLOCK_SHIELD_CACTUS_MIX"
 echo "local_results=$RUN_ROOT"
 
@@ -248,32 +259,40 @@ first_stage="$RUN_ROOT/seed_${SAMPLE_SEED}"
 first_pass="$(python -c '
 import json, sys
 rows = {x["directory"]: x for x in json.load(open(sys.argv[1]))}
-print(int(rows["risk_gated_block"]["pareto_pass"]))
+print(int(rows["regret_calibrated_block"]["pareto_pass"]))
 ' "$first_stage/comparison.json")"
 
 if [[ "$first_pass" != "1" ]]; then
   echo
-  echo "Target-Risk-Gated Block Relaxation did not pass the first-seed gate."
-  echo "No fallback is selected and the second seed is not run."
+  echo "Regret-Calibrated Block Relaxation did not satisfy all criteria."
+  echo "The second seed is not run and no alternate method is selected."
+  echo "Result: $first_stage/comparison.md"
+  exit 0
+fi
+
+if [[ "$CONFIRM_ON_SUCCESS" == "0" ]]; then
+  echo
+  echo "The method satisfied the first-seed criteria."
+  echo "Confirmation was disabled for this mechanism screen."
   echo "Result: $first_stage/comparison.md"
   exit 0
 fi
 
 echo
-echo "The unified method passed seed $SAMPLE_SEED; confirming unchanged."
+echo "The method satisfied seed $SAMPLE_SEED; repeating unchanged."
 run_stage "$SECOND_SAMPLE_SEED"
 second_stage="$RUN_ROOT/seed_${SECOND_SAMPLE_SEED}"
 second_pass="$(python -c '
 import json, sys
 rows = {x["directory"]: x for x in json.load(open(sys.argv[1]))}
-print(int(rows["risk_gated_block"]["pareto_pass"]))
+print(int(rows["regret_calibrated_block"]["pareto_pass"]))
 ' "$second_stage/comparison.json")"
 
 echo
 if [[ "$second_pass" == "1" ]]; then
-  echo "REPRODUCED: risk_gated_block"
+  echo "REPRODUCED: regret_calibrated_block"
 else
-  echo "NOT REPRODUCED: risk_gated_block"
+  echo "NOT REPRODUCED: regret_calibrated_block"
 fi
 echo "Seed 1: $first_stage/comparison.md"
 echo "Seed 2: $second_stage/comparison.md"

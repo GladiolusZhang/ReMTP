@@ -708,6 +708,136 @@ class TargetAnchoredMTPTest(unittest.TestCase):
                 historical.boosted_candidate_probs,
             )
 
+    def test_regret_calibration_is_inactive_without_causal_debt(self) -> None:
+        target = torch.tensor([[0.89, 0.01, 0.10]])
+        draft = torch.tensor([[0.895, 0.005, 0.10]])
+        result = target_anchored_distribution(
+            target,
+            draft,
+            torch.tensor([1]),
+            self.config(
+                "tv_regret_calibrated_block",
+                expected_draft_tokens=1,
+                head_reliability=(1.0,),
+                cactus_delta=0.01,
+                risk_swap_soft_log_gap=1.0,
+                risk_swap_hard_log_gap=4.0,
+                risk_swap_destination_log_gap=1.0,
+                regret_feedback_scale=0.05,
+            ),
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        self.assertEqual(result.strict_acceptance.item(), 1.0)
+        self.assertEqual(
+            result.provisional_acceptance_residual.item(),
+            0.0,
+        )
+        self.assertEqual(result.regret_feedback_strength.item(), 0.0)
+        torch.testing.assert_close(result.allocated_tv, result.cactus_tv)
+
+    def test_regret_calibration_closes_the_negative_feedback_loop(self) -> None:
+        target = torch.tensor(
+            [
+                [0.55, 0.35, 0.10],
+                [0.89, 0.01, 0.10],
+            ]
+        )
+        draft = torch.tensor(
+            [
+                [0.10, 0.80, 0.10],
+                [0.40, 0.50, 0.10],
+            ]
+        )
+        ids = torch.tensor([1, 1])
+        common = {
+            "expected_draft_tokens": 2,
+            "head_reliability": (1.0, 1.0),
+            "cactus_delta": 0.01,
+            "risk_swap_soft_log_gap": 1.0,
+            "risk_swap_hard_log_gap": 4.0,
+            "risk_swap_destination_log_gap": 1.0,
+            "block_shield_cactus_mix": 0.30,
+        }
+        result = target_anchored_distribution(
+            target,
+            draft,
+            ids,
+            self.config(
+                "tv_regret_calibrated_block",
+                regret_feedback_scale=0.05,
+                **common,
+            ),
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        corrected = target_anchored_distribution(
+            target,
+            draft,
+            ids,
+            self.config("tv_block_shield", **common),
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        feedback = result.regret_feedback_strength
+        self.assertGreater(feedback.item(), 0.0)
+        self.assertLess(feedback.item(), 1.0)
+        self.assertEqual(result.regret_contribution[0].item(), 0.0)
+        self.assertGreater(result.regret_contribution[1].item(), 0.0)
+        torch.testing.assert_close(
+            result.allocated_tv,
+            result.cactus_tv
+            + feedback * (corrected.allocated_tv - result.cactus_tv),
+        )
+        self.assertLessEqual(
+            result.allocated_tv.sum().item(),
+            result.cactus_tv.sum().item() + 1e-6,
+        )
+        self.assertLess(result.allocated_tv[1], result.cactus_tv[1])
+
+    def test_smaller_regret_scale_produces_stronger_feedback(self) -> None:
+        target = torch.tensor([[0.89, 0.01, 0.10]])
+        draft = torch.tensor([[0.40, 0.50, 0.10]])
+        ids = torch.tensor([1])
+        common = {
+            "expected_draft_tokens": 1,
+            "head_reliability": (1.0,),
+            "cactus_delta": 0.01,
+            "risk_swap_soft_log_gap": 1.0,
+            "risk_swap_hard_log_gap": 4.0,
+            "risk_swap_destination_log_gap": 1.0,
+            "block_shield_cactus_mix": 0.30,
+        }
+        strong = target_anchored_distribution(
+            target,
+            draft,
+            ids,
+            self.config(
+                "tv_regret_calibrated_block",
+                regret_feedback_scale=0.01,
+                **common,
+            ),
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        weak = target_anchored_distribution(
+            target,
+            draft,
+            ids,
+            self.config(
+                "tv_regret_calibrated_block",
+                regret_feedback_scale=0.10,
+                **common,
+            ),
+            assume_normalized=True,
+            construct_probs=False,
+        )
+        self.assertGreater(
+            strong.regret_feedback_strength,
+            weak.regret_feedback_strength,
+        )
+        self.assertLess(strong.allocated_tv[0], weak.allocated_tv[0])
+
     def test_aligned_hidden_cosine_and_fallback(self) -> None:
         draft = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         target = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
@@ -818,6 +948,8 @@ class TargetAnchoredMTPTest(unittest.TestCase):
             ).validate()
         with self.assertRaises(ValueError):
             TargetAnchoredConfig(block_shield_cactus_mix=1.1).validate()
+        with self.assertRaises(ValueError):
+            TargetAnchoredConfig(regret_feedback_scale=0.0).validate()
         with self.assertRaises(ValueError):
             TargetAnchoredConfig(recovery_mode="unsafe").validate()
 

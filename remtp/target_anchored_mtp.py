@@ -5,7 +5,7 @@ exact candidate-probability mass (and therefore exact total-variation mass)
 that per-position Cactus would request, but stops boosting a candidate once
 ``h(y) == q(y)`` because its speculative acceptance is already saturated.
 
-Three ablations are implemented:
+The module keeps historical ablations alongside the current method:
 
 * ``cactus_cap``: independent Cactus boosts capped at ``q(y)``;
 * ``tv_head``: redistribute Cactus' block TV using target support and a
@@ -30,6 +30,10 @@ Three ablations are implemented:
 * ``tv_risk_gated_block``: apply that same shield only when the current block
   contains a candidate beyond the target-risk soft boundary. The historical
   ``tv_event_shield`` name remains as an exact alias.
+* ``tv_regret_calibrated_block``: construct a provisional Cactus relaxation,
+  measure its target-opposed acceptance residual, and use that expected
+  current-block regret as continuous negative feedback on the final exact-TV
+  allocation before joint Block Verification commits any token.
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ _AUDIT_TV = torch.zeros(3, dtype=torch.float64)
 _AUDIT_DEBT = torch.zeros(6, dtype=torch.float64)
 _AUDIT_SURPLUS = torch.zeros(4, dtype=torch.float64)
 _AUDIT_ELIGIBILITY = torch.zeros(10, dtype=torch.float64)
+_AUDIT_REGRET = torch.zeros(3, dtype=torch.float64)
 _DEFAULT_HEAD_RELIABILITY = (1.0, 0.85, 0.70, 0.55, 0.40, 0.30)
 _PRE_VERIFICATION_HOOK: Any | None = None
 _POST_VERIFICATION_HOOK: Any | None = None
@@ -102,6 +107,7 @@ class TargetAnchoredConfig:
     risk_swap_hard_log_gap: float = 10.0
     risk_swap_destination_log_gap: float = 2.0
     block_shield_cactus_mix: float = 0.30
+    regret_feedback_scale: float = 0.05
     recovery_mode: str = "residual"
 
     def validate(self) -> None:
@@ -116,6 +122,7 @@ class TargetAnchoredConfig:
             "tv_block_shield",
             "tv_event_shield",
             "tv_risk_gated_block",
+            "tv_regret_calibrated_block",
         }:
             raise ValueError(f"unsupported target-anchored variant: {self.variant}")
         if self.cactus_delta < 0:
@@ -168,6 +175,8 @@ class TargetAnchoredConfig:
             )
         if not 0.0 <= self.block_shield_cactus_mix <= 1.0:
             raise ValueError("block_shield_cactus_mix must be in [0,1]")
+        if self.regret_feedback_scale <= 0.0:
+            raise ValueError("regret_feedback_scale must be positive")
         if self.recovery_mode not in {"residual", "target"}:
             raise ValueError("recovery_mode must be residual or target")
 
@@ -244,6 +253,9 @@ class TargetAnchoredConfig:
             block_shield_cactus_mix=float(
                 os.getenv("REMTP_TA_BLOCK_SHIELD_CACTUS_MIX", "0.30")
             ),
+            regret_feedback_scale=float(
+                os.getenv("REMTP_TA_REGRET_FEEDBACK_SCALE", "0.05")
+            ),
             recovery_mode=os.getenv(
                 "REMTP_TA_RECOVERY_MODE",
                 "residual",
@@ -278,6 +290,9 @@ class TargetAnchoredResult:
     relaxed_acceptance: torch.Tensor
     acceptance_residual: torch.Tensor
     cumulative_debt: torch.Tensor
+    provisional_acceptance_residual: torch.Tensor
+    regret_contribution: torch.Tensor
+    regret_feedback_strength: torch.Tensor
     fallback_mask: torch.Tensor
     stopped_mask: torch.Tensor
 
@@ -514,6 +529,92 @@ def _risk_swap_tv(
     )
 
 
+def _regret_calibrated_tv(
+    *,
+    p_y: torch.Tensor,
+    q_y: torch.Tensor,
+    log_gap: torch.Tensor,
+    strict_acceptance: torch.Tensor,
+    cactus_tv: torch.Tensor,
+    soft_log_gap: float,
+    hard_log_gap: float,
+    destination_log_gap: float,
+    cactus_mix: float,
+    feedback_scale: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Apply causal current-block regret as continuous negative feedback.
+
+    Cactus first defines a provisional relaxation. Its acceptance residual
+    over strict speculative verification is the amount of acceptance caused
+    by relaxation itself. Only the residual aligned with target opposition
+    contributes regret, and provisional prefix reach discounts debt at a
+    position unlikely to be committed. The resulting scalar continuously
+    interpolates Cactus toward the target-anchored block allocation.
+    """
+    (
+        risk_allocated,
+        cactus_floor,
+        kept_cactus,
+        destination_capacity,
+        keep_multiplier,
+    ) = _risk_swap_tv(
+        p_y=p_y,
+        q_y=q_y,
+        log_gap=log_gap,
+        cactus_tv=cactus_tv,
+        soft_log_gap=soft_log_gap,
+        hard_log_gap=hard_log_gap,
+        destination_log_gap=destination_log_gap,
+    )
+    corrected = (
+        (1.0 - cactus_mix) * risk_allocated
+        + cactus_mix * cactus_tv
+    )
+
+    cactus_acceptance = _acceptance_from_candidate_probability(
+        p_y + cactus_tv,
+        q_y,
+    )
+    provisional_residual = (
+        cactus_acceptance - strict_acceptance
+    ).clamp_min(0.0)
+    prefix_reach = torch.ones_like(cactus_acceptance)
+    for depth in range(1, cactus_acceptance.shape[0]):
+        prefix_reach[depth] = (
+            prefix_reach[depth - 1] * cactus_acceptance[depth - 1]
+        )
+    opposition = (1.0 - keep_multiplier).clamp(0.0, 1.0)
+    regret_contribution = (
+        prefix_reach * provisional_residual * opposition
+    )
+    block_regret = regret_contribution.sum()
+    feedback_strength = block_regret / (
+        block_regret + feedback_scale
+    )
+    allocated = cactus_tv + feedback_strength * (
+        corrected - cactus_tv
+    )
+    return (
+        allocated,
+        cactus_floor,
+        kept_cactus,
+        destination_capacity,
+        keep_multiplier,
+        provisional_residual,
+        regret_contribution,
+        feedback_strength,
+    )
+
+
 def _debt_controlled_tv(
     *,
     p_y: torch.Tensor,
@@ -742,6 +843,9 @@ def target_anchored_distribution(
     relaxed_acceptance = strict_acceptance.clone()
     acceptance_residual = torch.zeros_like(useful_capacity)
     cumulative_debt = torch.zeros_like(useful_capacity)
+    provisional_acceptance_residual = torch.zeros_like(useful_capacity)
+    regret_contribution = torch.zeros_like(useful_capacity)
+    regret_feedback_strength = torch.zeros_like(p_y[0])
     fallback_mask = torch.zeros_like(useful_capacity, dtype=torch.bool)
     stopped_mask = torch.zeros_like(useful_capacity, dtype=torch.bool)
     if config.variant == "cactus_cap":
@@ -767,6 +871,31 @@ def target_anchored_distribution(
         raw_allocated = allocated.clone()
         risk_capacity = destination_capacity
         risk_multiplier = target_supported.to(torch.float32)
+    elif config.variant == "tv_regret_calibrated_block":
+        (
+            allocated,
+            cactus_floor,
+            kept_cactus,
+            destination_capacity,
+            keep_multiplier,
+            provisional_acceptance_residual,
+            regret_contribution,
+            regret_feedback_strength,
+        ) = _regret_calibrated_tv(
+            p_y=p_y,
+            q_y=q_y,
+            log_gap=log_gap,
+            strict_acceptance=strict_acceptance,
+            cactus_tv=cactus_tv,
+            soft_log_gap=config.risk_swap_soft_log_gap,
+            hard_log_gap=config.risk_swap_hard_log_gap,
+            destination_log_gap=config.risk_swap_destination_log_gap,
+            cactus_mix=config.block_shield_cactus_mix,
+            feedback_scale=config.regret_feedback_scale,
+        )
+        raw_allocated = cactus_tv.clone()
+        risk_capacity = kept_cactus + destination_capacity
+        risk_multiplier = keep_multiplier
     elif config.variant in {
         "tv_risk_swap",
         "tv_block_shield",
@@ -885,6 +1014,9 @@ def target_anchored_distribution(
         relaxed_acceptance=relaxed_acceptance,
         acceptance_residual=acceptance_residual,
         cumulative_debt=cumulative_debt,
+        provisional_acceptance_residual=provisional_acceptance_residual,
+        regret_contribution=regret_contribution,
+        regret_feedback_strength=regret_feedback_strength,
         fallback_mask=fallback_mask,
         stopped_mask=stopped_mask,
     )
@@ -1036,7 +1168,7 @@ def _target_anchored_rejection_sample(
     sampling_metadata: Any,
 ) -> torch.Tensor:
     global _AUDIT_ROUND, _AUDIT_TV, _AUDIT_DEBT, _AUDIT_SURPLUS
-    global _AUDIT_ELIGIBILITY
+    global _AUDIT_ELIGIBILITY, _AUDIT_REGRET
     global _DIAGNOSTIC_EMITTED
     global _HIDDEN_FALLBACK_EMITTED
 
@@ -1170,6 +1302,11 @@ def _target_anchored_rejection_sample(
             f"relaxed_A={result.relaxed_acceptance.tolist()} "
             f"acceptance_debt={result.acceptance_residual.tolist()} "
             f"cumulative_debt={result.cumulative_debt.tolist()} "
+            f"provisional_acceptance_residual="
+            f"{result.provisional_acceptance_residual.tolist()} "
+            f"regret_contribution={result.regret_contribution.tolist()} "
+            f"regret_feedback_strength="
+            f"{result.regret_feedback_strength.item():.6f} "
             f"fallback={result.fallback_mask.tolist()} "
             f"stopped={result.stopped_mask.tolist()} "
             f"target_supported={result.risk_multiplier.tolist()} "
@@ -1203,6 +1340,14 @@ def _target_anchored_rejection_sample(
                 (
                     result.raw_allocated_tv - result.allocated_tv
                 ).clamp_min(0.0).sum().item(),
+            ),
+            dtype=torch.float64,
+        )
+        _AUDIT_REGRET += torch.tensor(
+            (
+                result.provisional_acceptance_residual.sum().item(),
+                result.regret_contribution.sum().item(),
+                result.regret_feedback_strength.item(),
             ),
             dtype=torch.float64,
         )
@@ -1256,6 +1401,7 @@ def _target_anchored_rejection_sample(
             eligibility = (
                 _AUDIT_ELIGIBILITY / audit_interval
             ).tolist()
+            regret_values = (_AUDIT_REGRET / audit_interval).tolist()
             surplus_suffix = ""
             if config.variant in {"tv_top1_surplus", "tv_target_surplus"}:
                 surplus_suffix = (
@@ -1287,6 +1433,10 @@ def _target_anchored_rejection_sample(
                 f"mean_fallback_positions={debt_values[3]:.6f} "
                 f"mean_stopped_positions={debt_values[4]:.6f} "
                 f"mean_risk_pruned_TV={debt_values[5]:.6f}"
+                f" mean_provisional_acceptance_residual="
+                f"{regret_values[0]:.6f}"
+                f" mean_target_opposed_regret={regret_values[1]:.6f}"
+                f" mean_regret_feedback={regret_values[2]:.6f}"
                 f"{surplus_suffix}",
                 flush=True,
             )
@@ -1294,6 +1444,7 @@ def _target_anchored_rejection_sample(
             _AUDIT_DEBT.zero_()
             _AUDIT_SURPLUS.zero_()
             _AUDIT_ELIGIBILITY.zero_()
+            _AUDIT_REGRET.zero_()
 
     original_top_ids = (
         logits.argmax(dim=-1) if sampling_metadata.all_greedy else None
@@ -1413,7 +1564,9 @@ def install_target_anchored_mtp() -> None:
         fast = torch.compile(fast, fullgraph=True, dynamic=False)
 
     candidate_cap = (
-        "Cactus/risk interpolation"
+        "Cactus/regret interpolation"
+        if config.variant == "tv_regret_calibrated_block"
+        else "Cactus/risk interpolation"
         if config.variant in {
             "tv_block_shield",
             "tv_event_shield",
@@ -1456,6 +1609,7 @@ def install_target_anchored_mtp() -> None:
         f"risk_swap_destination_gap="
         f"{config.risk_swap_destination_log_gap:g} "
         f"block_shield_cactus_mix={config.block_shield_cactus_mix:g} "
+        f"regret_feedback_scale={config.regret_feedback_scale:g} "
         f"recovery={config.recovery_mode} "
         f"compiled={int(compile_fast_path)} "
         f"budget=exact-Cactus-TV cap={candidate_cap} "

@@ -59,6 +59,7 @@ def _profile_label(directory: str) -> str:
         "block_shield": "Block-surplus-shielded risk control",
         "event_shield": "Event-triggered Block Shield",
         "risk_gated_block": "Target-Risk-Gated Block Relaxation",
+        "regret_calibrated_block": "Regret-Calibrated Block Relaxation",
     }
     return labels.get(directory, directory)
 
@@ -215,7 +216,12 @@ def _attach_intervals(
             row[f"{metric}_ci95_high"] = upper
 
 
-def compare(run_root: Path, profiles: list[str]) -> list[dict[str, Any]]:
+def compare(
+    run_root: Path,
+    profiles: list[str],
+    *,
+    eligible_profiles: set[str] | None = None,
+) -> list[dict[str, Any]]:
     baseline_config, baseline, baseline_manifest = _load_run(
         run_root / "cactus"
     )
@@ -245,8 +251,13 @@ def compare(run_root: Path, profiles: list[str]) -> list[dict[str, Any]]:
             summary["e2e_output_tok_s"]
             - baseline["e2e_output_tok_s"]
         )
-        pareto_pass = (
+        eligible = (
             directory not in {"cactus", "native_mtp"}
+            if eligible_profiles is None
+            else directory in eligible_profiles
+        )
+        pareto_pass = (
+            eligible
             and accuracy_delta > 0.0
             and mal_delta > 0.0
             and e2e_delta >= 0.0
@@ -293,7 +304,7 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
     lines = [
-        "# Relaxed-MTP Pareto gate",
+        "# Relaxed-MTP Pareto comparison",
         "",
         "Pass condition: Accuracy > Cactus, MAL > Cactus, and E2E >= Cactus.",
         "",
@@ -370,9 +381,21 @@ def main() -> int:
     parser.add_argument("profiles", nargs="+")
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260802)
+    parser.add_argument(
+        "--eligible",
+        action="append",
+        default=None,
+        help="profile eligible for selection; repeat for multiple profiles",
+    )
     args = parser.parse_args()
     run_root = args.run_root.resolve()
-    rows = compare(run_root, args.profiles)
+    rows = compare(
+        run_root,
+        args.profiles,
+        eligible_profiles=(
+            None if args.eligible is None else set(args.eligible)
+        ),
+    )
     intervals = paired_bootstrap_intervals(
         run_root,
         args.profiles,
@@ -382,12 +405,20 @@ def main() -> int:
     _attach_intervals(rows, intervals)
     _write_outputs(run_root, rows)
     selection = _select(rows)
+    selection_text = (
+        json.dumps(selection, ensure_ascii=False, indent=2) + "\n"
+    )
+    (run_root / "selection.json").write_text(
+        selection_text,
+        encoding="utf-8",
+    )
+    # Compatibility for historical experiment scripts.
     (run_root / "gate_selection.json").write_text(
-        json.dumps(selection, ensure_ascii=False, indent=2) + "\n",
+        selection_text,
         encoding="utf-8",
     )
     print((run_root / "comparison.md").read_text(encoding="utf-8"))
-    print("GATE_SELECTION=" + json.dumps(selection, sort_keys=True))
+    print("SELECTION=" + json.dumps(selection, sort_keys=True))
     return 0
 
 

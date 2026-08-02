@@ -99,6 +99,21 @@ class CurrentBlockDebtCompareTest(unittest.TestCase):
             self.assertFalse(status["native_mtp"])
             self.assertTrue(status["candidate"])
 
+    def test_explicit_eligibility_limits_selection_to_our_method(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "cactus", acc=0.80, e2e=180.0, mal=4.9)
+            self._write(root, "paper", acc=0.90, e2e=190.0, mal=5.2)
+            self._write(root, "ours", acc=0.81, e2e=181.0, mal=5.0)
+            rows = compare(
+                root,
+                ["paper", "ours"],
+                eligible_profiles={"ours"},
+            )
+            status = {row["directory"]: row["pareto_pass"] for row in rows}
+            self.assertFalse(status["paper"])
+            self.assertTrue(status["ours"])
+
     def test_paired_bootstrap_is_zero_for_identical_requests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
