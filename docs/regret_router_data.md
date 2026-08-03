@@ -127,8 +127,18 @@ MAX_TOKENS=256 \
 ./scripts/collect_regret_router.sh
 
 REGRET_ROUTER_TRACE_DIR=data/regret_router/traces_pilot \
-EPOCHS=10 BATCH_SIZE=64 ./scripts/train_regret_router.sh
+REGRET_ROUTER_CHECKPOINT=checkpoints/regret_router_v2.pt \
+EPOCHS=8 BATCH_SIZE=128 ./scripts/train_regret_router_v2.sh
 ```
+
+主实验使用 V2 的 selective logit-only 训练：它先在每个非零债务位置上用
+紧凑 P/Q 分布搜索有界的最优 logit scale，再蒸馏到仅使用因果历史状态的
+小型 Router。hidden steering 和下一块预算缩放在本阶段固定关闭，Exact-TV
+验证器保持不变。如果 held-out request 上的模型收益不超过恒等策略，生成的
+checkpoint 会带有 `policy.enabled=false`，推理时自动完全旁路 Router。
+
+旧的 `scripts/train_regret_router.sh` 保留为原始联合弱监督目标的消融入口，
+不再作为默认训练流程。
 
 每个 trace block 都携带全局唯一的 `collection_id:request_id`。训练器先按
 请求划分 90%/10% train/validation，再展开 block；同一请求的相邻 block

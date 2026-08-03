@@ -26,15 +26,22 @@ from remtp.regret_router_model import (
 )
 
 
-def _load_records(directory: Path) -> list[dict[str, Any]]:
+def _load_records(
+    directory: Path,
+    *,
+    progress_every: int = 0,
+    max_shards: int | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     paths = sorted(directory.glob("router_shard_*.pt"))
     pending = directory / "router_pending.pt"
-    if pending.exists():
+    if max_shards is not None:
+        paths = paths[:max_shards]
+    elif pending.exists():
         paths.append(pending)
     if not paths:
         raise FileNotFoundError(f"no router_shard_*.pt files in {directory}")
-    for path in paths:
+    for index, path in enumerate(paths, 1):
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if payload.get("format_version") != 1:
             raise ValueError(f"unsupported collector shard: {path}")
@@ -42,6 +49,13 @@ def _load_records(directory: Path) -> list[dict[str, Any]]:
         if not isinstance(shard, list):
             raise ValueError(f"invalid collector records: {path}")
         records.extend(shard)
+        if progress_every > 0 and (
+            index == 1 or index % progress_every == 0 or index == len(paths)
+        ):
+            print(
+                f"loaded_shards={index}/{len(paths)} records={len(records)}",
+                flush=True,
+            )
     if not records:
         raise ValueError("collector shards contain no records")
     return records
@@ -111,9 +125,15 @@ def _compact_support(record: dict[str, Any]) -> tuple[torch.Tensor, ...]:
 
 
 class RouterTraceDataset(Dataset[dict[str, torch.Tensor]]):
-    def __init__(self, records: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        progress_every: int = 0,
+        split_name: str = "dataset",
+    ) -> None:
         self.examples: list[dict[str, torch.Tensor]] = []
-        for record in records:
+        for index, record in enumerate(records, 1):
             p_compact, q_compact, direction_delta, support_mask = (
                 _compact_support(record)
             )
@@ -152,6 +172,15 @@ class RouterTraceDataset(Dataset[dict[str, torch.Tensor]]):
                     ),
                 }
             )
+            if progress_every > 0 and (
+                index == 1
+                or index % progress_every == 0
+                or index == len(records)
+            ):
+                print(
+                    f"built_{split_name}_examples={index}/{len(records)}",
+                    flush=True,
+                )
 
     def __len__(self) -> int:
         return len(self.examples)

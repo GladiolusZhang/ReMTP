@@ -152,6 +152,10 @@ class RegretRouterState:
     source_margin: torch.Tensor | None = None
     output_weight: torch.Tensor | None = None
     router: RegretRouter | None = None
+    policy_enabled: bool = True
+    action_mode: str = "full"
+    min_abs_logit_scale: float = 0.0
+    feedback_active: bool = False
     context_root: torch.Tensor | None = None
     context_direction: torch.Tensor | None = None
     context_debt: torch.Tensor | None = None
@@ -165,9 +169,14 @@ class RegretRouterState:
     verification_top_ids: torch.Tensor | None = None
 
     def reset_request(self, request_id: str) -> None:
-        router = self.router
+        preserved = {
+            "router": self.router,
+            "policy_enabled": self.policy_enabled,
+            "action_mode": self.action_mode,
+            "min_abs_logit_scale": self.min_abs_logit_scale,
+        }
         self.__dict__.update(
-            RegretRouterState(request_id=request_id, router=router).__dict__
+            RegretRouterState(request_id=request_id, **preserved).__dict__
         )
 
 
@@ -573,15 +582,25 @@ def _propose_with_router_context(self: Any, *args: Any, **kwargs: Any) -> Any:
     _STATE.context_debt = debt.to(root.device).reshape(1).detach()
     _STATE.context_entropy = entropy.to(root.device).reshape(1).detach()
     _STATE.context_margin = margin.to(root.device).reshape(1).detach()
-    _STATE.proposal_controls = _route(
-        config,
-        entropy=_STATE.context_entropy,
-        margin=_STATE.context_margin,
-    )
+    if (
+        config.mode == "learned"
+        and (not _STATE.policy_enabled or not _STATE.feedback_active)
+    ):
+        # Exact no-op path: do not run the Router, hidden normalization, or a
+        # logits multiplication when the previous block produced no debt.
+        _STATE.proposal_controls = None
+    else:
+        _STATE.proposal_controls = _route(
+            config,
+            entropy=_STATE.context_entropy,
+            margin=_STATE.context_margin,
+        )
     return original(self, *args, **kwargs)
 
 
 def _router_hidden_hook(hidden: torch.Tensor, proposal_depth: int) -> torch.Tensor:
+    if _STATE.action_mode == "logit_only":
+        return hidden
     controls = _STATE.proposal_controls
     direction = _STATE.context_direction
     if controls is None or direction is None or proposal_depth >= controls.direction_strength.numel():
@@ -602,7 +621,14 @@ def _router_logits_hook(
     controls = _STATE.proposal_controls
     if controls is None or proposal_depth >= controls.logit_scale.numel():
         return logits
-    return logits * torch.exp(controls.logit_scale[proposal_depth]).to(logits.dtype)
+    scale = controls.logit_scale[proposal_depth]
+    if _STATE.min_abs_logit_scale > 0.0:
+        scale = torch.where(
+            scale.abs() >= _STATE.min_abs_logit_scale,
+            scale,
+            torch.zeros_like(scale),
+        )
+    return logits * torch.exp(scale).to(logits.dtype)
 
 
 def _pre_verification_budget_hook(
@@ -617,7 +643,14 @@ def _pre_verification_budget_hook(
 ) -> torch.Tensor:
     del draft_probs, draft_token_ids, hidden_similarity, sampling_metadata
     config = _require_config()
-    if config.mode in {"identity", "collect"}:
+    if config.mode in {"identity", "collect"} or (
+        config.mode == "learned"
+        and (
+            not _STATE.policy_enabled
+            or not _STATE.feedback_active
+            or _STATE.action_mode == "logit_only"
+        )
+    ):
         _STATE.verification_entropy = None
         _STATE.verification_margin = None
         _STATE.verification_top_probs = None
@@ -854,6 +887,7 @@ def _post_verification_regret_hook(
     new_debt = event_weight.sum().reshape(1)
     _STATE.debt = (old_debt.to(target_probs.device) * decay + new_debt) * reset
     _STATE.direction = direction.detach() * reset
+    _STATE.feedback_active = bool((_STATE.debt > 0.0).item())
     weights = accepted.to(torch.float32)
     normalizer = weights.sum().clamp_min(1.0)
     _STATE.source_entropy = ((entropy * weights).sum() / normalizer).reshape(1)
@@ -931,11 +965,25 @@ def install_regret_router() -> None:
         if router.architecture.num_heads != config.expected_draft_tokens:
             raise ValueError("router checkpoint head count mismatch")
         _STATE.router = router.eval()
+        policy = metadata.get("policy")
+        if isinstance(policy, dict):
+            _STATE.policy_enabled = bool(policy.get("enabled", True))
+            _STATE.action_mode = str(policy.get("action_mode", "full"))
+            _STATE.min_abs_logit_scale = float(
+                policy.get("min_abs_logit_scale", 0.0)
+            )
         print(
             f"[ReMTP][RegretRouter] checkpoint={config.checkpoint} "
             f"metadata={metadata}",
             flush=True,
         )
+        if not _STATE.policy_enabled:
+            print(
+                "[ReMTP][RegretRouter] checkpoint policy is disabled; "
+                "using exact target-anchored verifier without Router hooks",
+                flush=True,
+            )
+            return
     if config.mode == "collect":
         _COLLECTOR = RouterShardWriter(
             Path(config.collector_dir),
@@ -981,6 +1029,8 @@ def install_regret_router() -> None:
         f"rejection_reset={config.rejection_reset:g} "
         f"direction_cap={config.max_direction_strength:g} "
         f"logit_cap={config.max_logit_scale:g} "
-        f"budget_reduction_cap={config.max_budget_reduction:g}",
+        f"budget_reduction_cap={config.max_budget_reduction:g} "
+        f"action_mode={_STATE.action_mode} "
+        f"min_abs_logit_scale={_STATE.min_abs_logit_scale:g}",
         flush=True,
     )

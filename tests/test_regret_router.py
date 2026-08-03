@@ -4,6 +4,9 @@ import torch
 
 from remtp.regret_router import (
     RegretRouterConfig,
+    RegretRouterState,
+    _STATE,
+    _router_hidden_hook,
     accepted_prefix_mask,
     apply_budget_scale,
     apply_direction_to_hidden,
@@ -92,6 +95,33 @@ class RegretRouterTest(unittest.TestCase):
         torch.testing.assert_close(scaled, torch.tensor([0.4, 0.35, 0.3]))
         self.assertTrue(torch.all(scaled >= target))
         self.assertTrue(torch.all(scaled <= boosted))
+
+    def test_request_reset_preserves_policy_but_clears_feedback(self) -> None:
+        state = RegretRouterState(
+            request_id="old",
+            policy_enabled=True,
+            action_mode="logit_only",
+            min_abs_logit_scale=0.01,
+            feedback_active=True,
+            debt=torch.tensor([0.2]),
+        )
+        state.reset_request("new")
+        self.assertEqual(state.request_id, "new")
+        self.assertEqual(state.action_mode, "logit_only")
+        self.assertEqual(state.min_abs_logit_scale, 0.01)
+        self.assertFalse(state.feedback_active)
+        self.assertIsNone(state.debt)
+
+    def test_logit_only_policy_bypasses_hidden_exactly(self) -> None:
+        previous = _STATE.action_mode
+        try:
+            _STATE.action_mode = "logit_only"
+            hidden = torch.randn(3, 8, dtype=torch.bfloat16)
+            output = _router_hidden_hook(hidden, 0)
+            self.assertIs(output, hidden)
+            self.assertTrue(torch.equal(output, hidden))
+        finally:
+            _STATE.action_mode = previous
 
 
 if __name__ == "__main__":
