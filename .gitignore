@@ -7,6 +7,8 @@ __pycache__/
 data/spec_bench/question.jsonl
 data/gsm8k/test.jsonl
 data/humaneval/
+data/regret_router/
+checkpoints/
 results/
 logs/
 dse_results/

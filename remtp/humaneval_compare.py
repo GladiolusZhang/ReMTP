@@ -34,6 +34,10 @@ PROFILE_LABELS = {
     "debt_balanced": "Current-block debt (balanced)",
     "target_surplus": "Cactus-dominant target surplus",
     "tv_head": "Exact-TV + head calibration",
+    "tv_hidden_veto": "Exact-TV + head/hidden + future veto",
+    "exact_tv": "Exact-TV + target-only future veto",
+    "exact_tv_regret_fixed": "Exact-TV + fixed regret feedback",
+    "exact_tv_regret_router": "Exact-TV + learned expected-regret Router",
     "regret_calibrated_block": "Regret-Calibrated Block Relaxation",
 }
 

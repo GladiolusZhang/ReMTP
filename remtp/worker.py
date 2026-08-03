@@ -117,6 +117,20 @@ class TargetAnchoredMTPWorker(Worker):
         return super().init_device(*args, **kwargs)
 
 
+class ExactTVRegretRouterWorker(Worker):
+    """Exact-TV verification plus expected-debt regret routing."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+        from remtp.regret_router import install_regret_router
+        from remtp.target_anchored_mtp import install_target_anchored_mtp
+
+        install_probabilistic_mtp()
+        install_target_anchored_mtp()
+        install_regret_router()
+        return super().init_device(*args, **kwargs)
+
+
 class TargetAnchoredBlockMTPWorker(Worker):
     """Target-anchored relaxation followed by joint block verification."""
 

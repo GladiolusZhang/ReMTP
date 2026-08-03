@@ -186,6 +186,35 @@ class TargetAnchoredMTPTest(unittest.TestCase):
         )
         self.assertTrue(torch.all(result.priority <= base + 1e-6).item())
 
+    def test_router_base_uses_future_veto_but_not_hidden_reward(self) -> None:
+        config = self.config("tv_router", max_target_log_gap=100.0)
+        low_hidden = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            config,
+            hidden_similarity=torch.zeros(4),
+        )
+        high_hidden = target_anchored_distribution(
+            self.target,
+            self.draft,
+            self.ids,
+            config,
+            hidden_similarity=torch.ones(4),
+        )
+        torch.testing.assert_close(low_hidden.priority, high_hidden.priority)
+        base = (
+            low_hidden.strict_acceptance.sqrt()
+            * (1.0 - low_hidden.strict_acceptance)
+            * low_hidden.prefix_value
+            * low_hidden.target_support
+            * low_hidden.head_reliability
+        )
+        torch.testing.assert_close(
+            low_hidden.priority,
+            base * low_hidden.future_veto,
+        )
+
     def test_hidden_cosine_downweights_inconsistent_position(self) -> None:
         result = target_anchored_distribution(
             self.target,

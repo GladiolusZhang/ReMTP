@@ -17,10 +17,10 @@ fi
 
 variant="${TARGET_ANCHORED_VARIANT:-tv_hidden_veto}"
 case "$variant" in
-  cactus_cap|tv_head|tv_hidden_veto|tv_debt_control|tv_top1_surplus|tv_target_surplus|tv_risk_swap|tv_block_shield|tv_event_shield|tv_risk_gated_block|tv_regret_calibrated_block) ;;
+  cactus_cap|tv_head|tv_hidden_veto|tv_router|tv_debt_control|tv_top1_surplus|tv_target_surplus|tv_risk_swap|tv_block_shield|tv_event_shield|tv_risk_gated_block|tv_regret_calibrated_block) ;;
   *)
     echo "Unknown TARGET_ANCHORED_VARIANT=$variant" >&2
-    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, tv_debt_control, tv_top1_surplus, tv_target_surplus, tv_risk_swap, tv_block_shield, tv_event_shield, tv_risk_gated_block, or tv_regret_calibrated_block" >&2
+    echo "Expected: cactus_cap, tv_head, tv_hidden_veto, tv_router, tv_debt_control, tv_top1_surplus, tv_target_surplus, tv_risk_swap, tv_block_shield, tv_event_shield, tv_risk_gated_block, or tv_regret_calibrated_block" >&2
     exit 2
     ;;
 esac

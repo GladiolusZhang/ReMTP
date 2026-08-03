@@ -19,6 +19,9 @@ Default methods:
   - current-block debt (balanced historical variant)
   - Cactus-dominant target surplus
   - Exact-TV + head calibration
+  - Exact-TV + head/hidden + future veto
+  - Exact-TV + target-only future veto
+  - Exact-TV + learned expected-regret Router
   - Regret-Calibrated Block Relaxation (ours)
 
 Generated code is never executed by the vLLM benchmark process. Each solution
@@ -36,7 +39,8 @@ Useful environment variables:
   MAX_TOKENS=512
   MTP_TOKENS=6
   CACTUS_REGRET_ALPHA=0.03
-  PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head regret_calibrated_block"
+  PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head tv_hidden_veto exact_tv exact_tv_regret_router regret_calibrated_block"
+  REGRET_ROUTER_CHECKPOINT=checkpoints/regret_router.pt
   EVAL_TIMEOUT=8
   HUMANEVAL_DOCKER_IMAGE=python:3-slim
   PROGRESS_EVERY=10
@@ -81,6 +85,7 @@ CACTUS_REGRET_RESIDUAL_SPACE="${CACTUS_REGRET_RESIDUAL_SPACE:-output}"
 CACTUS_REGRET_AUDIT_INTERVAL="${CACTUS_REGRET_AUDIT_INTERVAL:-0}"
 CACTUS_REGRET_DIAGNOSTICS="${CACTUS_REGRET_DIAGNOSTICS:-0}"
 BLOCK_SHIELD_CACTUS_MIX="${BLOCK_SHIELD_CACTUS_MIX:-0.30}"
+REGRET_ROUTER_CHECKPOINT="${REGRET_ROUTER_CHECKPOINT:-$PROJECT_DIR/checkpoints/regret_router.pt}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
 EVAL_TIMEOUT="${EVAL_TIMEOUT:-8}"
@@ -213,6 +218,25 @@ profile_server() {
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_anchored_mtp.sh"
       PROFILE_ENV=(TARGET_ANCHORED_VARIANT=tv_head)
       ;;
+    tv_hidden_veto)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_anchored_mtp.sh"
+      PROFILE_ENV=(TARGET_ANCHORED_VARIANT=tv_hidden_veto)
+      ;;
+    exact_tv)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_anchored_mtp.sh"
+      PROFILE_ENV=(TARGET_ANCHORED_VARIANT=tv_router)
+      ;;
+    exact_tv_regret_fixed)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_exact_tv_regret_router.sh"
+      PROFILE_ENV=(REGRET_ROUTER_MODE=fixed)
+      ;;
+    exact_tv_regret_router)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_exact_tv_regret_router.sh"
+      PROFILE_ENV=(
+        REGRET_ROUTER_MODE=learned
+        REGRET_ROUTER_CHECKPOINT="$REGRET_ROUTER_CHECKPOINT"
+      )
+      ;;
     regret_calibrated_block)
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_regret_calibrated_block_mtp.sh"
       ;;
@@ -249,6 +273,7 @@ run_method() {
     CACTUS_REGRET_AUDIT_INTERVAL="$CACTUS_REGRET_AUDIT_INTERVAL" \
     CACTUS_REGRET_DIAGNOSTICS="$CACTUS_REGRET_DIAGNOSTICS" \
     BLOCK_SHIELD_CACTUS_MIX="$BLOCK_SHIELD_CACTUS_MIX" \
+    REGRET_ROUTER_CHECKPOINT="$REGRET_ROUTER_CHECKPOINT" \
     TARGET_ANCHORED_AUDIT_INTERVAL=0 \
     TARGET_ANCHORED_DIAGNOSTICS=0 \
     BLOCK_VERIFY_DIAGNOSTICS=0 \

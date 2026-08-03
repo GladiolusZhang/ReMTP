@@ -70,6 +70,15 @@ MTP_TOKENS=6 \
 
 可用 `PROFILES` 选择子集，但正式对比强制包含 `native_mtp` 和 `cactus`。
 
+### Exact-TV + 期望遗憾 Router
+
+Router 的无标签 trace 收集、训练和完整 HumanEval 对比命令见
+[exact_tv_regret_router.md](exact_tv_regret_router.md)。训练完成后可直接运行：
+
+```bash
+SAMPLES=164 ./scripts/run_humaneval_regret_router.sh
+```
+
 ### Cactus 不变、只反馈后续 MTP 的实验
 
 该入口保持 Cactus verifier 完全不变，只把 causal Cactus acceptance 中

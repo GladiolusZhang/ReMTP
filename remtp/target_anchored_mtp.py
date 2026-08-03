@@ -13,6 +13,9 @@ The module keeps historical ablations alongside the current method:
 * ``tv_hidden_veto``: additionally use aligned current MTP/target hidden
   cosine and allow later target support only to veto, never reward, an
   earlier candidate.
+* ``tv_router``: the learnable-regret base verifier. It keeps saturation,
+  prefix value, target margin, static head reliability, and future target
+  support as a veto, but deliberately excludes hidden consistency rewards.
 * ``tv_debt_control``: keep saturation-aware block-TV recycling, but treat
   the increase in speculative acceptance probability as verification debt.
   Per-position risk caps and a cumulative block limit act before a risky
@@ -115,6 +118,7 @@ class TargetAnchoredConfig:
             "cactus_cap",
             "tv_head",
             "tv_hidden_veto",
+            "tv_router",
             "tv_debt_control",
             "tv_top1_surplus",
             "tv_target_surplus",
@@ -834,6 +838,8 @@ def target_anchored_distribution(
     priority = rescue * prefix_value * local_support * head_prior
     if config.variant == "tv_hidden_veto":
         priority = priority * hidden_reliability * future_veto
+    elif config.variant == "tv_router":
+        priority = priority * future_veto
 
     cactus_tv = cactus_tv_increment(p_y, config.cactus_delta)
     useful_capacity = (q_y - p_y).clamp_min(0.0)
