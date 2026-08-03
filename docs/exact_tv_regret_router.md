@@ -25,8 +25,10 @@ budget scale。实现没有额外增加目标模型 forward。
 
 ## 1. 准备无标签 Router 语料
 
-不要使用 HumanEval 测试题或 GSM8K 测试答案训练 Router。准备普通文本、
-代码或指令 JSON/JSONL；每行支持以下任一格式：
+不要使用 HumanEval、HumanEval+、MBPP、MBPP+、GSM8K 或 IFEval 测试
+prompt 收集 Router trace。推荐的 4k/8k 混合语料构建、统一去污染和来源
+审计流程见 [regret_router_data.md](regret_router_data.md)。收集器支持普通
+文本、代码或指令 JSON/JSONL；每行支持以下任一格式：
 
 ```json
 {"prompt": "Explain how a hash table handles collisions."}
@@ -49,6 +51,7 @@ MAX_TOKENS=256 \
 
 trace 默认保存在 `data/regret_router/traces/`，只包含推理期 `P/Q/H` 摘要、
 hidden/direction 和验证标量，不读取任务答案标签。该目录被 Git 忽略。
+每个 block 会记录请求级 ID，训练/验证切分严格在请求层完成。
 
 ## 3. 训练小型 Router
 

@@ -65,6 +65,7 @@ class RegretRouterConfig:
     max_logit_scale: float = 0.08
     max_budget_reduction: float = 0.50
     collector_dir: str = ""
+    collection_id: str = ""
     collector_shard_size: int = 128
     audit_interval: int = 0
     diagnostics: bool = False
@@ -131,6 +132,7 @@ class RegretRouterConfig:
                 os.getenv("REMTP_ROUTER_MAX_BUDGET_REDUCTION", "0.50")
             ),
             collector_dir=os.getenv("REMTP_ROUTER_COLLECT_DIR", ""),
+            collection_id=os.getenv("REMTP_ROUTER_COLLECTION_ID", "").strip(),
             collector_shard_size=int(
                 os.getenv("REMTP_ROUTER_COLLECT_SHARD_SIZE", "128")
             ),
@@ -143,6 +145,7 @@ class RegretRouterConfig:
 
 @dataclass
 class RegretRouterState:
+    request_id: str = ""
     debt: torch.Tensor | None = None
     direction: torch.Tensor | None = None
     source_entropy: torch.Tensor | None = None
@@ -161,9 +164,11 @@ class RegretRouterState:
     verification_top_probs: torch.Tensor | None = None
     verification_top_ids: torch.Tensor | None = None
 
-    def reset_request(self) -> None:
+    def reset_request(self, request_id: str) -> None:
         router = self.router
-        self.__dict__.update(RegretRouterState(router=router).__dict__)
+        self.__dict__.update(
+            RegretRouterState(request_id=request_id, router=router).__dict__
+        )
 
 
 @dataclass
@@ -249,6 +254,7 @@ _STATE = RegretRouterState()
 _AUDIT = RegretRouterAudit()
 _COLLECTOR: RouterShardWriter | None = None
 _DIAGNOSTIC_EMITTED = False
+_REQUEST_COUNTER = -1
 
 
 def accepted_prefix_mask(
@@ -685,6 +691,8 @@ def _collector_record(
         # Keep the on-disk tensor schema dense. Short final blocks are rare and
         # do not justify padding ambiguous verifier outcomes into training.
         return
+    if not _STATE.request_id:
+        raise RuntimeError("collector request_id was not initialized")
     p_values = target_top_probs
     p_ids = target_top_ids
     q_values, q_ids = draft_probs.to(torch.float32).topk(
@@ -702,6 +710,7 @@ def _collector_record(
         output_weight[q_ids].to(torch.float32) * vector.view(1, 1, -1)
     ).sum(dim=-1)
     record = {
+        "request_id": _STATE.request_id,
         "root_hidden": root[0].detach().to("cpu", dtype=torch.float16),
         "regret_direction": direction[0].detach().to("cpu", dtype=torch.float16),
         "regret_debt": debt.detach().to("cpu", dtype=torch.float32),
@@ -891,11 +900,16 @@ def _post_verification_regret_hook(
 
 
 def _sample_tokens_with_request_reset(self: Any, *args: Any, **kwargs: Any) -> Any:
+    global _REQUEST_COUNTER
+
     state = getattr(self, "execute_model_state", None)
     if state is None or state.spec_decode_metadata is None:
         if _COLLECTOR is not None:
             _COLLECTOR.checkpoint()
-        _STATE.reset_request()
+        _REQUEST_COUNTER += 1
+        config = _require_config()
+        collection_id = config.collection_id or f"engine-{os.getpid()}"
+        _STATE.reset_request(f"{collection_id}:{_REQUEST_COUNTER}")
     original = getattr(_sample_tokens_with_request_reset, "_remtp_original")
     return original(self, *args, **kwargs)
 

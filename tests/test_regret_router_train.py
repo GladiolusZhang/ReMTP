@@ -8,7 +8,11 @@ from pathlib import Path
 import torch
 
 from remtp.regret_router_model import load_regret_router_checkpoint
-from remtp.regret_router_train import RouterTraceDataset, train
+from remtp.regret_router_train import (
+    RouterTraceDataset,
+    split_records_by_request,
+    train,
+)
 
 
 def synthetic_record(seed: int) -> dict[str, torch.Tensor]:
@@ -32,6 +36,7 @@ def synthetic_record(seed: int) -> dict[str, torch.Tensor]:
     strict = torch.minimum(torch.ones_like(p_y), p_y / q_y)
     relaxed = torch.minimum(torch.ones_like(p_y), (p_y + allocated) / q_y)
     return {
+        "request_id": f"collection-a:{seed // 2}",
         "root_hidden": torch.randn(hidden, generator=generator).to(torch.float16),
         "regret_direction": direction.to(torch.float16),
         "regret_debt": torch.tensor([0.05 + 0.01 * seed]),
@@ -61,6 +66,24 @@ def synthetic_record(seed: int) -> dict[str, torch.Tensor]:
 
 
 class RegretRouterTrainTest(unittest.TestCase):
+    def test_request_split_never_leaks_adjacent_blocks(self) -> None:
+        records = [synthetic_record(index) for index in range(8)]
+        train_records, validation_records, train_ids, validation_ids = (
+            split_records_by_request(
+                records,
+                validation_fraction=0.25,
+                seed=42,
+            )
+        )
+        self.assertFalse(train_ids & validation_ids)
+        self.assertEqual(
+            {record["request_id"] for record in train_records}, train_ids
+        )
+        self.assertEqual(
+            {record["request_id"] for record in validation_records},
+            validation_ids,
+        )
+
     def test_compact_support_is_normalized(self) -> None:
         example = RouterTraceDataset([synthetic_record(1)])[0]
         torch.testing.assert_close(
@@ -106,6 +129,8 @@ class RegretRouterTrainTest(unittest.TestCase):
             self.assertEqual(model.architecture.hidden_size, 8)
             self.assertEqual(model.architecture.num_heads, 2)
             self.assertEqual(metadata["records"], 8)
+            self.assertEqual(metadata["requests"], 4)
+            self.assertEqual(metadata["split_unit"], "request_id")
             self.assertEqual(report["metadata"]["records"], 8)
 
 

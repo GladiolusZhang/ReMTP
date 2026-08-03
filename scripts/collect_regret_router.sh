@@ -19,7 +19,15 @@ COLLECT_DIR="${REGRET_ROUTER_COLLECT_DIR:-$PROJECT_DIR/data/regret_router/traces
 SERVER_LOG="${REGRET_ROUTER_SERVER_LOG:-$PROJECT_DIR/logs/regret_router_collect_server.log}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
+COLLECTION_ID="${REGRET_ROUTER_COLLECTION_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
 mkdir -p "$COLLECT_DIR" "$(dirname "$SERVER_LOG")"
+if compgen -G "$COLLECT_DIR/router_*.pt" >/dev/null; then
+  if [[ "${ALLOW_APPEND_ROUTER_TRACES:-0}" != "1" ]]; then
+    echo "Trace directory already contains router_*.pt: $COLLECT_DIR" >&2
+    echo "Use a fresh directory, or set ALLOW_APPEND_ROUTER_TRACES=1 intentionally." >&2
+    exit 2
+  fi
+fi
 
 server_pid=""
 cleanup() {
@@ -44,6 +52,7 @@ trap cleanup EXIT INT TERM
 setsid env \
   REGRET_ROUTER_MODE=collect \
   REGRET_ROUTER_COLLECT_DIR="$COLLECT_DIR" \
+  REGRET_ROUTER_COLLECTION_ID="$COLLECTION_ID" \
   MTP_TOKENS=6 \
   "$PROJECT_DIR/scripts/serve_exact_tv_regret_router.sh" \
   >"$SERVER_LOG" 2>&1 &

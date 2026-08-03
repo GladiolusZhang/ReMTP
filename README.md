@@ -577,6 +577,8 @@ HumanEval 采用官方功能测试计算 `pass@1`，允许生成实现与参考�
 期望接受责任形成短期遗憾，并通过冻结模型外的小型低秩 Router 同时校准
 下一块 MTP proposal 与 Exact-TV 预算。实现和运行方法见
 [docs/exact_tv_regret_router.md](docs/exact_tv_regret_router.md)。
+Router 混合语料、统一 benchmark 去污染和请求级训练/验证切分见
+[docs/regret_router_data.md](docs/regret_router_data.md)。
 生成和执行完全分离：模型代码只在无网络、只读、限资源的临时 Docker
 容器内执行，判题时间不计入生成吞吐。
 

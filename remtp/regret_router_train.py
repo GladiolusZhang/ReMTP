@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
 from remtp.regret_router_model import (
     RegretRouter,
@@ -298,20 +298,67 @@ def _run_epoch(
     return {key: value / batches for key, value in totals.items()}
 
 
+def split_records_by_request(
+    records: list[dict[str, Any]],
+    *,
+    validation_fraction: float,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str], set[str]]:
+    missing_request_ids = sum("request_id" not in record for record in records)
+    if missing_request_ids:
+        raise ValueError(
+            f"{missing_request_ids} trace blocks have no request_id; "
+            "recollect them to prevent block-level validation leakage"
+        )
+    request_ids = sorted({str(record["request_id"]) for record in records})
+    if len(request_ids) < 2:
+        raise ValueError("at least two collected requests are required")
+    random.Random(seed).shuffle(request_ids)
+    validation_request_count = max(
+        1,
+        round(len(request_ids) * validation_fraction),
+    )
+    validation_request_count = min(
+        validation_request_count,
+        len(request_ids) - 1,
+    )
+    validation_request_ids = set(request_ids[:validation_request_count])
+    training_request_ids = set(request_ids[validation_request_count:])
+    training_records = [
+        record
+        for record in records
+        if str(record["request_id"]) in training_request_ids
+    ]
+    validation_records = [
+        record
+        for record in records
+        if str(record["request_id"]) in validation_request_ids
+    ]
+    return (
+        training_records,
+        validation_records,
+        training_request_ids,
+        validation_request_ids,
+    )
+
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     records = _load_records(args.data_dir)
-    dataset = RouterTraceDataset(records)
-    if len(dataset) < 2:
-        raise ValueError("at least two collected blocks are required")
-    indices = list(range(len(dataset)))
-    random.shuffle(indices)
-    validation_count = max(1, round(len(indices) * args.validation_fraction))
-    validation_count = min(validation_count, len(indices) - 1)
-    validation_indices = indices[:validation_count]
-    training_indices = indices[validation_count:]
-    example = dataset[0]
+    (
+        training_records,
+        validation_records,
+        training_request_ids,
+        validation_request_ids,
+    ) = split_records_by_request(
+        records,
+        validation_fraction=args.validation_fraction,
+        seed=args.seed,
+    )
+    training_dataset = RouterTraceDataset(training_records)
+    validation_dataset = RouterTraceDataset(validation_records)
+    example = training_dataset[0]
     hidden_size = int(example["root_hidden"].numel())
     num_heads = int(example["target_entropy"].numel())
     architecture = RegretRouterArchitecture(
@@ -332,13 +379,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
-        Subset(dataset, training_indices),
+        training_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         generator=generator,
     )
     validation_loader = DataLoader(
-        Subset(dataset, validation_indices),
+        validation_dataset,
         batch_size=args.batch_size,
         shuffle=False,
     )
@@ -378,9 +425,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     assert best_state is not None
     model.load_state_dict(best_state)
     metadata = {
-        "records": len(dataset),
-        "training_records": len(training_indices),
-        "validation_records": len(validation_indices),
+        "records": len(records),
+        "requests": len(training_request_ids | validation_request_ids),
+        "training_records": len(training_records),
+        "validation_records": len(validation_records),
+        "training_requests": len(training_request_ids),
+        "validation_requests": len(validation_request_ids),
+        "split_unit": "request_id",
         "seed": args.seed,
         "best_validation_loss": best_validation,
         "objective": "label-free target alignment + TV efficiency",
