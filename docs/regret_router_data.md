@@ -52,7 +52,7 @@ ROUTER_INSTRUCTION_SOURCE=dolly \
 manifest 中记录 `CC-BY-SA-3.0`。第一版不要加入完整 Tulu 3、FLAN、
 Persona GSM/MATH/Python/Algebra/IF 或任何 benchmark 派生训练集。
 
-## 3. 准备 benchmark prompt 文件
+## 3. 一键下载 benchmark prompt 文件
 
 统一去污染入口需要：
 
@@ -63,19 +63,41 @@ Persona GSM/MATH/Python/Algebra/IF 或任何 benchmark 派生训练集。
 - GSM8K test；
 - IFEval prompts。
 
-HumanEval 和 GSM8K 默认读取仓库已有路径。其余文件由你下载后，通过绝对
-路径传入。任何 JSON、JSONL 或 JSONL.GZ 均可；脚本识别 `prompt`、
-`input_prompt`、`question`、`instruction`、`problem`、`text` 和
-`messages`。
+直接运行：
+
+```bash
+./scripts/download_router_benchmarks.sh
+```
+
+脚本下载固定 Git commit 下的六个文件，逐个校验 SHA256、样本数、prompt
+字段和任务 ID 唯一性，并生成
+`data/regret_router/benchmarks/manifest.json`。已校验通过的文件会自动跳过，
+所以该命令可以重复执行。当前固定版本的样本数为 HumanEval 164、
+HumanEval+ 164、MBPP 974、MBPP+ 378、GSM8K test 1,319、IFEval 541。
+
+仅检查本地文件而不访问网络：
+
+```bash
+CHECK_ONLY=1 ./scripts/download_router_benchmarks.sh
+```
+
+若某个已有文件损坏，脚本会停止而不会静默覆盖。确认需要重新下载时运行：
+
+```bash
+FORCE=1 ./scripts/download_router_benchmarks.sh
+```
 
 ## 4. 执行统一去污染
 
 ```bash
-HUMANEVAL_PLUS_DATA=/path/HumanEvalPlus.jsonl.gz \
-MBPP_DATA=/path/mbpp_test.jsonl \
-MBPP_PLUS_DATA=/path/MbppPlus.jsonl.gz \
-IFEVAL_DATA=/path/ifeval_input_data.jsonl \
 ./scripts/decontaminate_regret_router_corpus.sh
+```
+
+下载和去污染也可以合并成一条命令。若原始混合不存在，它还会先按指定
+profile 构建语料；若已经存在则直接复用：
+
+```bash
+ROUTER_CORPUS_PROFILE=pilot ./scripts/prepare_regret_router_data.sh
 ```
 
 正式模式下缺少任一 benchmark 会直接终止。仅调试脚本时可以设置

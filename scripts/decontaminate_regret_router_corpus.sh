@@ -14,6 +14,7 @@ CORPUS="${ROUTER_CORPUS_RAW:-$PROJECT_DIR/data/regret_router/router_corpus_raw.j
 OUTPUT="${ROUTER_CORPUS:-$PROJECT_DIR/data/regret_router/router_corpus.jsonl}"
 REPORT="${ROUTER_DECONTAMINATION_REPORT:-$PROJECT_DIR/data/regret_router/decontamination_report.json}"
 ALLOW_PARTIAL="${ALLOW_PARTIAL_DECONTAMINATION:-0}"
+BENCHMARK_DIR="${ROUTER_BENCHMARK_DIR:-$PROJECT_DIR/data/regret_router/benchmarks}"
 
 declare -a BENCHMARKS=()
 add_benchmark() {
@@ -31,13 +32,15 @@ add_benchmark() {
 }
 
 add_benchmark humaneval \
-  "${HUMANEVAL_DATA:-$PROJECT_DIR/data/humaneval/HumanEval.jsonl.gz}" 1
-add_benchmark humaneval_plus "${HUMANEVAL_PLUS_DATA:-}" 1
-add_benchmark mbpp "${MBPP_DATA:-}" 1
-add_benchmark mbpp_plus "${MBPP_PLUS_DATA:-}" 1
-add_benchmark gsm8k \
-  "${GSM8K_DATA:-$PROJECT_DIR/data/gsm8k/test.jsonl}" 1
-add_benchmark ifeval "${IFEVAL_DATA:-}" 1
+  "${HUMANEVAL_DATA:-$BENCHMARK_DIR/HumanEval.jsonl.gz}" 1
+add_benchmark humaneval_plus \
+  "${HUMANEVAL_PLUS_DATA:-$BENCHMARK_DIR/HumanEvalPlus.jsonl.gz}" 1
+add_benchmark mbpp "${MBPP_DATA:-$BENCHMARK_DIR/mbpp.jsonl}" 1
+add_benchmark mbpp_plus \
+  "${MBPP_PLUS_DATA:-$BENCHMARK_DIR/MbppPlus.jsonl.gz}" 1
+add_benchmark gsm8k "${GSM8K_DATA:-$BENCHMARK_DIR/gsm8k_test.jsonl}" 1
+add_benchmark ifeval \
+  "${IFEVAL_DATA:-$BENCHMARK_DIR/ifeval_input_data.jsonl}" 1
 
 python -m remtp.router_decontaminate \
   --corpus "$CORPUS" \
