@@ -67,8 +67,21 @@ MTP_TOKENS=6 \
 8. Cactus-dominant target surplus；
 9. Exact-TV + head calibration；
 10. Regret-Calibrated Block Relaxation。
+11. Target-Mode Rescue + within-block regret。
+12. Fused strict-MTP identity control（归因对照）。
 
 可用 `PROFILES` 选择子集，但正式对比强制包含 `native_mtp` 和 `cactus`。
+
+### Target-Mode Rescue + 块内遗憾
+
+当前大改版本只松弛目标概率至少为 `0.5` 的候选，并使用当前块已经分配
+的 TV 作为后续位置的负反馈。它不使用跨块 hidden、旧 token 残差或
+learned Router。完整说明和固定对比入口见
+[target_mode_regret.md](target_mode_regret.md)：
+
+```bash
+SAMPLES=164 ./scripts/run_humaneval_target_mode_regret.sh
+```
 
 ### Exact-TV + 期望遗憾 Router
 

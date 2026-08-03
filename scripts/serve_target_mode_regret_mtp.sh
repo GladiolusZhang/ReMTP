@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+export MTP_TOKENS="${MTP_TOKENS:-6}"
+export REMTP_WORKER_CLS=remtp.worker.TargetModeRegretWorker
+export REMTP_MODE_REGRET_MIN_TARGET_PROB="${MODE_REGRET_MIN_TARGET_PROB:-0.50}"
+export REMTP_MODE_REGRET_PER_TOKEN_TV="${MODE_REGRET_PER_TOKEN_TV:-0.49}"
+export REMTP_MODE_REGRET_BLOCK_TV="${MODE_REGRET_BLOCK_TV:-0.60}"
+export REMTP_MODE_REGRET_DEBT_SLOPE="${MODE_REGRET_DEBT_SLOPE:-0.50}"
+export REMTP_MODE_REGRET_DEPTH_SLOPE="${MODE_REGRET_DEPTH_SLOPE:-0.00}"
+export REMTP_MODE_REGRET_DIAGNOSTICS="${MODE_REGRET_DIAGNOSTICS:-0}"
+
+exec "$PROJECT_DIR/scripts/serve_probabilistic_mtp.sh"

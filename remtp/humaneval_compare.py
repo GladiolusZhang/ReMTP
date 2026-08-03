@@ -39,6 +39,8 @@ PROFILE_LABELS = {
     "exact_tv_regret_fixed": "Exact-TV + fixed regret feedback",
     "exact_tv_regret_router": "Exact-TV + learned expected-regret Router",
     "regret_calibrated_block": "Regret-Calibrated Block Relaxation",
+    "target_mode_regret": "Target-Mode Rescue + within-block regret",
+    "target_mode_identity": "Fused strict-MTP identity control",
 }
 
 
@@ -58,9 +60,46 @@ def _load_run(directory: Path) -> tuple[dict[str, Any], dict[str, Any], str]:
     return dict(config), dict(results[0]), manifest
 
 
+def _generation_fingerprint(directory: Path) -> list[tuple[Any, ...]]:
+    """Load only deterministic generation fields for identity attribution."""
+
+    records: list[tuple[Any, ...]] = []
+    for line in (directory / "requests.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines():
+        row = json.loads(line)
+        records.append(
+            (
+                row.get("task_id"),
+                row.get("seed"),
+                row.get("output_tokens"),
+                row.get("finish_reason"),
+                row.get("candidate"),
+                row.get("raw_output"),
+            )
+        )
+    return records
+
+
+def validate_identity_control(run_root: Path, profiles: list[str]) -> None:
+    """Require the zero-TV fused verifier to reproduce native MTP exactly."""
+
+    if "target_mode_identity" not in profiles:
+        return
+    if "native_mtp" not in profiles:
+        raise ValueError("identity attribution requires native_mtp")
+    native = _generation_fingerprint(run_root / "native_mtp")
+    identity = _generation_fingerprint(run_root / "target_mode_identity")
+    if native != identity:
+        raise ValueError(
+            "fused strict-MTP identity control differs from native MTP output"
+        )
+
+
 def compare(run_root: Path, profiles: list[str]) -> list[dict[str, Any]]:
     if "cactus" not in profiles:
         raise ValueError("profiles must include the Cactus reference")
+    validate_identity_control(run_root, profiles)
     baseline_config, baseline, baseline_manifest = _load_run(
         run_root / "cactus"
     )

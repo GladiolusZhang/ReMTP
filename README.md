@@ -601,6 +601,20 @@ SAMPLES=164 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
 方法。完整说明见 [docs/humaneval.md](docs/humaneval.md)。数据、生成代码、
 判题结果和日志均只保存在本地忽略目录。
 
+## 16. Target-Mode Rescue + 块内遗憾（MTP=6）
+
+当前大改版本停止跨块 Router/hidden steering。它只救援目标概率不低于
+`0.5` 的 MTP 候选，并把前部位置使用的 TV 作为块内遗憾债务，逐步提高
+后续位置的松弛门槛。自定义验证路径只计算一次目标 softmax。
+
+完整算法与运行命令见
+[docs/target_mode_regret.md](docs/target_mode_regret.md)。一键 HumanEval 对比：
+
+```bash
+SAMPLES=164 TEMPERATURE=0.7 SEED=42 MTP_TOKENS=6 \
+./scripts/run_humaneval_target_mode_regret.sh
+```
+
 若只研究“Cactus verifier 不变、遗憾残差仅引导下一块 MTP 草稿”，运行：
 
 ```bash

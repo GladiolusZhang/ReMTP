@@ -50,6 +50,21 @@ class HumanEvalCompareTest(unittest.TestCase):
             "shared\n", encoding="utf-8"
         )
 
+    @staticmethod
+    def _write_requests(root: Path, profile: str, raw_output: str) -> None:
+        row = {
+            "task_id": "HumanEval/0",
+            "seed": 42,
+            "output_tokens": 2,
+            "finish_reason": "stop",
+            "candidate": raw_output,
+            "raw_output": raw_output,
+        }
+        (root / profile / "requests.jsonl").write_text(
+            json.dumps(row) + "\n",
+            encoding="utf-8",
+        )
+
     def test_reports_quality_and_speed_deltas_without_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -71,6 +86,33 @@ class HumanEvalCompareTest(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 compare(root, ["cactus", "native_mtp"])
+
+    def test_identity_control_must_match_native_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "cactus", pass_at_1=0.7, e2e=180, mal=4.9)
+            self._write(root, "native_mtp", pass_at_1=0.8, e2e=140, mal=3.8)
+            self._write(
+                root,
+                "target_mode_identity",
+                pass_at_1=0.8,
+                e2e=140,
+                mal=3.8,
+            )
+            self._write_requests(root, "native_mtp", "same")
+            self._write_requests(root, "target_mode_identity", "different")
+            with self.assertRaisesRegex(ValueError, "identity control"):
+                compare(
+                    root,
+                    ["native_mtp", "target_mode_identity", "cactus"],
+                )
+
+            self._write_requests(root, "target_mode_identity", "same")
+            rows = compare(
+                root,
+                ["native_mtp", "target_mode_identity", "cactus"],
+            )
+            self.assertEqual(len(rows), 3)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ Default methods:
   - Exact-TV + target-only future veto
   - Exact-TV + learned expected-regret Router
   - Regret-Calibrated Block Relaxation (ours)
+  - Target-Mode Rescue + within-block regret (ours)
+  - fused strict-MTP identity control (attribution)
 
 Generated code is never executed by the vLLM benchmark process. Each solution
 is evaluated afterwards in a fresh Docker container with no network, a
@@ -39,7 +41,7 @@ Useful environment variables:
   MAX_TOKENS=512
   MTP_TOKENS=6
   CACTUS_REGRET_ALPHA=0.03
-  PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head tv_hidden_veto exact_tv exact_tv_regret_router regret_calibrated_block"
+  PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head tv_hidden_veto exact_tv exact_tv_regret_router regret_calibrated_block target_mode_identity target_mode_regret"
   REGRET_ROUTER_CHECKPOINT=checkpoints/regret_router.pt
   EVAL_TIMEOUT=8
   HUMANEVAL_DOCKER_IMAGE=python:3-slim
@@ -48,7 +50,7 @@ Useful environment variables:
   RUN_TAG=<timestamp>
 
 For a quick smoke test:
-  SAMPLES=5 PROFILES="native_mtp cactus regret_calibrated_block" \
+  SAMPLES=5 PROFILES="native_mtp cactus target_mode_regret" \
     ./scripts/run_humaneval_comparison.sh
 
 Results and logs remain under ignored local directories.
@@ -95,7 +97,7 @@ HUMANEVAL_DOCKER_IMAGE="${HUMANEVAL_DOCKER_IMAGE:-python:3-slim}"
 HUMANEVAL_DATA="${HUMANEVAL_DATA:-$PROJECT_DIR/data/humaneval/HumanEval.jsonl.gz}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-DEFAULT_PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head regret_calibrated_block"
+DEFAULT_PROFILES="native_mtp target_mode_identity cactus spec_cascade exact_tv target_mode_regret"
 read -r -a profiles <<< "${PROFILES:-$DEFAULT_PROFILES}"
 
 if [[ "$MTP_TOKENS" != "6" ]]; then
@@ -239,6 +241,13 @@ profile_server() {
       ;;
     regret_calibrated_block)
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_regret_calibrated_block_mtp.sh"
+      ;;
+    target_mode_regret)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      ;;
+    target_mode_identity)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(MODE_REGRET_BLOCK_TV=0)
       ;;
     *)
       echo "Unknown profile: $profile" >&2

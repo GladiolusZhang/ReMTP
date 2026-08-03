@@ -35,6 +35,18 @@ class ProbabilisticMTPWorker(Worker):
         return super().init_device(*args, **kwargs)
 
 
+class TargetModeRegretWorker(Worker):
+    """High-confidence target-mode rescue with within-block regret."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+        from remtp.target_mode_regret import install_target_mode_regret
+
+        install_probabilistic_mtp()
+        install_target_mode_regret()
+        return super().init_device(*args, **kwargs)
+
+
 class SpecCascadeMTPWorker(Worker):
     """CUDA worker that installs speculative-cascade MTP verification."""
 
