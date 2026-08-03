@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import atexit
 import importlib
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,7 +57,7 @@ class RegretRouterConfig:
     checkpoint: str = ""
     expected_draft_tokens: int = 6
     head_reliability: tuple[float, ...] = _DEFAULT_HEAD_RELIABILITY
-    top_k: int = 32
+    top_k: int = 8
     cactus_delta: float = 1.0
     debt_decay: float = 0.90
     debt_reference: float = 0.05
@@ -69,6 +70,7 @@ class RegretRouterConfig:
     collector_shard_size: int = 128
     audit_interval: int = 0
     diagnostics: bool = False
+    compile_router: bool = True
 
     def validate(self) -> None:
         if self.mode not in {"identity", "fixed", "collect", "learned"}:
@@ -113,7 +115,7 @@ class RegretRouterConfig:
             head_reliability=_parse_head_reliability(
                 os.getenv("REMTP_ROUTER_HEAD_RELIABILITY", defaults)
             ),
-            top_k=int(os.getenv("REMTP_ROUTER_TOP_K", "32")),
+            top_k=int(os.getenv("REMTP_ROUTER_TOP_K", "8")),
             cactus_delta=float(os.getenv("REMTP_CACTUS_DELTA", "1.0")),
             debt_decay=float(os.getenv("REMTP_ROUTER_DEBT_DECAY", "0.90")),
             debt_reference=float(
@@ -138,6 +140,7 @@ class RegretRouterConfig:
             ),
             audit_interval=int(os.getenv("REMTP_ROUTER_AUDIT_INTERVAL", "0")),
             diagnostics=_env_flag("REMTP_ROUTER_DIAGNOSTICS", False),
+            compile_router=_env_flag("REMTP_ROUTER_COMPILE", True),
         )
         config.validate()
         return config
@@ -152,15 +155,22 @@ class RegretRouterState:
     source_margin: torch.Tensor | None = None
     output_weight: torch.Tensor | None = None
     router: RegretRouter | None = None
+    router_head: Any | None = None
     policy_enabled: bool = True
     action_mode: str = "full"
     min_abs_logit_scale: float = 0.0
+    uses_high_dimensional_context: bool = True
+    uses_regret_direction: bool = True
     feedback_active: bool = False
     context_root: torch.Tensor | None = None
     context_direction: torch.Tensor | None = None
     context_debt: torch.Tensor | None = None
     context_entropy: torch.Tensor | None = None
     context_margin: torch.Tensor | None = None
+    context_root_low: torch.Tensor | None = None
+    context_direction_low: torch.Tensor | None = None
+    context_head_reliability: torch.Tensor | None = None
+    context_head_depth: torch.Tensor | None = None
     proposal_controls: RegretRouterControls | None = None
     verification_controls: RegretRouterControls | None = None
     verification_entropy: torch.Tensor | None = None
@@ -171,9 +181,12 @@ class RegretRouterState:
     def reset_request(self, request_id: str) -> None:
         preserved = {
             "router": self.router,
+            "router_head": self.router_head,
             "policy_enabled": self.policy_enabled,
             "action_mode": self.action_mode,
             "min_abs_logit_scale": self.min_abs_logit_scale,
+            "uses_high_dimensional_context": self.uses_high_dimensional_context,
+            "uses_regret_direction": self.uses_regret_direction,
         }
         self.__dict__.update(
             RegretRouterState(request_id=request_id, **preserved).__dict__
@@ -589,6 +602,39 @@ def _propose_with_router_context(self: Any, *args: Any, **kwargs: Any) -> Any:
         # Exact no-op path: do not run the Router, hidden normalization, or a
         # logits multiplication when the previous block produced no debt.
         _STATE.proposal_controls = None
+    elif config.mode == "learned" and _STATE.action_mode == "contextual_logit":
+        assert _STATE.router is not None
+        if _STATE.uses_high_dimensional_context:
+            (
+                _STATE.context_root_low,
+                _STATE.context_direction_low,
+            ) = _STATE.router.encode_context(
+                _STATE.context_root.to(torch.float32),
+                _STATE.context_direction.to(torch.float32),
+            )
+        else:
+            shape = (1, _STATE.router.architecture.rank)
+            _STATE.context_root_low = torch.zeros(
+                shape,
+                device=root.device,
+                dtype=torch.float32,
+            )
+            _STATE.context_direction_low = torch.zeros_like(
+                _STATE.context_root_low
+            )
+        _STATE.context_head_reliability = torch.as_tensor(
+            config.head_reliability[: config.expected_draft_tokens],
+            device=root.device,
+            dtype=torch.float32,
+        )
+        _STATE.context_head_depth = torch.linspace(
+            0.0,
+            1.0,
+            config.expected_draft_tokens,
+            device=root.device,
+            dtype=torch.float32,
+        )
+        _STATE.proposal_controls = None
     else:
         _STATE.proposal_controls = _route(
             config,
@@ -599,7 +645,7 @@ def _propose_with_router_context(self: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 def _router_hidden_hook(hidden: torch.Tensor, proposal_depth: int) -> torch.Tensor:
-    if _STATE.action_mode == "logit_only":
+    if _STATE.action_mode in {"logit_only", "contextual_logit"}:
         return hidden
     controls = _STATE.proposal_controls
     direction = _STATE.context_direction
@@ -617,7 +663,73 @@ def _router_logits_hook(
     proposal_depth: int,
     temperatures: torch.Tensor,
 ) -> torch.Tensor:
-    del temperatures
+    if _STATE.action_mode == "contextual_logit":
+        config = _require_config()
+        router = _STATE.router
+        root_low = _STATE.context_root_low
+        direction_low = _STATE.context_direction_low
+        debt = _STATE.context_debt
+        entropy = _STATE.context_entropy
+        margin = _STATE.context_margin
+        head_reliability = _STATE.context_head_reliability
+        head_depth = _STATE.context_head_depth
+        if (
+            router is None
+            or root_low is None
+            or direction_low is None
+            or debt is None
+            or entropy is None
+            or margin is None
+            or head_reliability is None
+            or head_depth is None
+            or not _STATE.feedback_active
+            or proposal_depth >= head_reliability.numel()
+        ):
+            return logits
+        temperature = temperatures.to(
+            device=logits.device,
+            dtype=torch.float32,
+        ).clamp_min(1e-5)
+        normalized_logits = logits.to(torch.float32) / temperature.unsqueeze(-1)
+        top_k = min(8, normalized_logits.shape[-1])
+        top_values = normalized_logits.topk(top_k, dim=-1).values
+        top_probs = torch.softmax(top_values, dim=-1)
+        q_entropy = -(
+            top_probs * torch.log(top_probs.clamp_min(1e-30))
+        ).sum(dim=-1) / math.log(float(top_k))
+        if top_k >= 2:
+            q_margin = (
+                top_values[:, 0] - top_values[:, 1]
+            ).clamp(0.0, 8.0) / 8.0
+        else:
+            q_margin = torch.zeros_like(q_entropy)
+        draft_features = torch.stack(
+            (
+                q_entropy,
+                q_margin,
+            ),
+            dim=-1,
+        )
+        route_head = _STATE.router_head or router.forward_head
+        controls = route_head(
+            root_low,
+            direction_low,
+            debt.to(torch.float32) / config.debt_reference,
+            entropy.to(torch.float32),
+            margin.to(torch.float32),
+            head_reliability[proposal_depth : proposal_depth + 1],
+            head_depth[proposal_depth : proposal_depth + 1],
+            draft_features,
+        )
+        scale = controls.logit_scale[0]
+        if _STATE.min_abs_logit_scale > 0.0:
+            scale = torch.where(
+                scale.abs() >= _STATE.min_abs_logit_scale,
+                scale,
+                torch.zeros_like(scale),
+            )
+        return logits * torch.exp(scale).to(logits.dtype)
+
     controls = _STATE.proposal_controls
     if controls is None or proposal_depth >= controls.logit_scale.numel():
         return logits
@@ -648,7 +760,7 @@ def _pre_verification_budget_hook(
         and (
             not _STATE.policy_enabled
             or not _STATE.feedback_active
-            or _STATE.action_mode == "logit_only"
+            or _STATE.action_mode in {"logit_only", "contextual_logit"}
         )
     ):
         _STATE.verification_entropy = None
@@ -860,16 +972,22 @@ def _post_verification_regret_hook(
         target_top_ids=top_ids,
     )
 
-    output_weight = _STATE.output_weight
-    if output_weight is None:
-        raise RuntimeError("router did not capture the shared output head")
-    direction = regret_direction_from_top_mass(
-        top_probs,
-        top_ids,
-        draft_token_ids,
-        event_weight,
-        output_weight,
-    )
+    if _STATE.uses_regret_direction:
+        output_weight = _STATE.output_weight
+        if output_weight is None:
+            raise RuntimeError("router did not capture the shared output head")
+        direction = regret_direction_from_top_mass(
+            top_probs,
+            top_ids,
+            draft_token_ids,
+            event_weight,
+            output_weight,
+        )
+    else:
+        context_root = _STATE.context_root
+        if context_root is None:
+            raise RuntimeError("router did not capture the target root hidden")
+        direction = torch.zeros_like(context_root)
     accepted_count = accepted.to(torch.int64).sum()
     rejected = accepted_count < rows
     reset = torch.where(
@@ -893,17 +1011,22 @@ def _post_verification_regret_hook(
     _STATE.source_entropy = ((entropy * weights).sum() / normalizer).reshape(1)
     _STATE.source_margin = ((margin * weights).sum() / normalizer).reshape(1)
 
-    _AUDIT.rounds += 1
-    _AUDIT.accepted += accepted.sum().item()
-    _AUDIT.strict_expected += (strict_acceptance * accepted).sum().item()
-    _AUDIT.relaxed_expected += (relaxed_acceptance * accepted).sum().item()
-    _AUDIT.debt_added += new_debt.item()
-    _AUDIT.allocated_tv += allocated_tv.sum().item()
-    controls = _STATE.verification_controls or _STATE.proposal_controls
-    if controls is not None:
-        _AUDIT.budget_scale += controls.budget_scale[:rows].mean().item()
-        _AUDIT.direction_strength += controls.direction_strength[:rows].mean().item()
-        _AUDIT.logit_scale += controls.logit_scale[:rows].abs().mean().item()
+    if config.audit_interval > 0:
+        _AUDIT.rounds += 1
+        _AUDIT.accepted += accepted.sum().item()
+        _AUDIT.strict_expected += (strict_acceptance * accepted).sum().item()
+        _AUDIT.relaxed_expected += (relaxed_acceptance * accepted).sum().item()
+        _AUDIT.debt_added += new_debt.item()
+        _AUDIT.allocated_tv += allocated_tv.sum().item()
+        controls = _STATE.verification_controls or _STATE.proposal_controls
+        if controls is not None:
+            _AUDIT.budget_scale += controls.budget_scale[:rows].mean().item()
+            _AUDIT.direction_strength += (
+                controls.direction_strength[:rows].mean().item()
+            )
+            _AUDIT.logit_scale += (
+                controls.logit_scale[:rows].abs().mean().item()
+            )
 
     if config.diagnostics and not _DIAGNOSTIC_EMITTED:
         print(
@@ -972,6 +1095,23 @@ def install_regret_router() -> None:
             _STATE.min_abs_logit_scale = float(
                 policy.get("min_abs_logit_scale", 0.0)
             )
+        _STATE.uses_high_dimensional_context = bool(
+            metadata.get("uses_high_dimensional_context", True)
+        )
+        _STATE.uses_regret_direction = bool(
+            _STATE.uses_high_dimensional_context
+            or router.architecture.draft_feature_count > 2
+        )
+        if (
+            config.compile_router
+            and _STATE.action_mode == "contextual_logit"
+        ):
+            _STATE.router_head = torch.compile(
+                router.forward_head,
+                fullgraph=True,
+                dynamic=False,
+                mode="reduce-overhead",
+            )
         print(
             f"[ReMTP][RegretRouter] checkpoint={config.checkpoint} "
             f"metadata={metadata}",
@@ -1031,6 +1171,7 @@ def install_regret_router() -> None:
         f"logit_cap={config.max_logit_scale:g} "
         f"budget_reduction_cap={config.max_budget_reduction:g} "
         f"action_mode={_STATE.action_mode} "
+        f"compiled_router={int(_STATE.router_head is not None)} "
         f"min_abs_logit_scale={_STATE.min_abs_logit_scale:g}",
         flush=True,
     )

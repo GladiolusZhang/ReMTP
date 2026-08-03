@@ -102,6 +102,9 @@ class RegretRouterTest(unittest.TestCase):
             policy_enabled=True,
             action_mode="logit_only",
             min_abs_logit_scale=0.01,
+            uses_high_dimensional_context=False,
+            uses_regret_direction=False,
+            router_head=lambda *args: args,
             feedback_active=True,
             debt=torch.tensor([0.2]),
         )
@@ -109,6 +112,9 @@ class RegretRouterTest(unittest.TestCase):
         self.assertEqual(state.request_id, "new")
         self.assertEqual(state.action_mode, "logit_only")
         self.assertEqual(state.min_abs_logit_scale, 0.01)
+        self.assertFalse(state.uses_high_dimensional_context)
+        self.assertFalse(state.uses_regret_direction)
+        self.assertIsNotNone(state.router_head)
         self.assertFalse(state.feedback_active)
         self.assertIsNone(state.debt)
 

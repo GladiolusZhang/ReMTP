@@ -63,6 +63,47 @@ class RegretRouterModelTest(unittest.TestCase):
         for expected, actual in zip(model.parameters(), loaded.parameters()):
             torch.testing.assert_close(expected, actual)
 
+    def test_contextual_head_matches_batched_forward(self) -> None:
+        architecture = RegretRouterArchitecture(
+            hidden_size=8,
+            num_heads=3,
+            rank=2,
+            width=6,
+            draft_feature_count=2,
+        )
+        model = RegretRouter(architecture)
+        root = torch.randn(1, 8)
+        direction = torch.randn(1, 8)
+        debt = torch.tensor([1.5])
+        entropy = torch.tensor([[0.2, 0.3, 0.4]])
+        margin = torch.tensor([[0.4, 0.3, 0.2]])
+        reliability = torch.tensor([1.0, 0.7, 0.4])
+        draft = torch.randn(1, 3, 2)
+        batch = model(
+            root,
+            direction,
+            debt,
+            entropy,
+            margin,
+            reliability,
+            draft,
+        )
+        root_low, direction_low = model.encode_context(root, direction)
+        head = model.forward_head(
+            root_low,
+            direction_low,
+            debt,
+            entropy[:, 1],
+            margin[:, 1],
+            reliability[1:2],
+            torch.tensor([0.5]),
+            draft[:, 1],
+        )
+        torch.testing.assert_close(
+            head.logit_scale,
+            batch.logit_scale[:, 1],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

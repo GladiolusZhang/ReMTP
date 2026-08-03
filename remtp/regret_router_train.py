@@ -137,6 +137,26 @@ class RouterTraceDataset(Dataset[dict[str, torch.Tensor]]):
             p_compact, q_compact, direction_delta, support_mask = (
                 _compact_support(record)
             )
+            q_top = record["q_top_probs"][:, :8].to(torch.float32)
+            q_top_conditional = q_top / q_top.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-30)
+            q_entropy = -(
+                q_top_conditional
+                * torch.log(q_top_conditional.clamp_min(1e-30))
+            ).sum(dim=-1) / math.log(q_top.shape[-1])
+            q_margin = (
+                torch.log(q_top[:, 0].clamp_min(1e-30))
+                - torch.log(q_top[:, 1].clamp_min(1e-30))
+            ).clamp(0.0, 8.0) / 8.0
+            draft_features = torch.stack(
+                (
+                    q_entropy,
+                    q_margin,
+                ),
+                dim=-1,
+            )
             self.examples.append(
                 {
                     "root_hidden": record["root_hidden"].to(torch.float32),
@@ -157,6 +177,7 @@ class RouterTraceDataset(Dataset[dict[str, torch.Tensor]]):
                     "head_reliability": record["head_reliability"].to(
                         torch.float32
                     ),
+                    "draft_features": draft_features,
                     "p_compact": p_compact,
                     "q_compact": q_compact,
                     "direction_delta": direction_delta,

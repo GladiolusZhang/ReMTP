@@ -24,6 +24,7 @@ class RegretRouterArchitecture:
     max_direction_strength: float = 0.03
     max_logit_scale: float = 0.08
     max_budget_reduction: float = 0.50
+    draft_feature_count: int = 0
 
     def validate(self) -> None:
         if self.hidden_size < 1:
@@ -32,6 +33,8 @@ class RegretRouterArchitecture:
             raise ValueError("num_heads must be positive")
         if self.rank < 1 or self.width < 1:
             raise ValueError("rank and width must be positive")
+        if self.draft_feature_count < 0:
+            raise ValueError("draft_feature_count must be non-negative")
         if self.max_direction_strength < 0.0:
             raise ValueError("max_direction_strength must be non-negative")
         if self.max_logit_scale < 0.0:
@@ -66,7 +69,11 @@ class RegretRouter(nn.Module):
             architecture.rank,
             bias=False,
         )
-        input_size = 2 * architecture.rank + self.scalar_feature_count
+        input_size = (
+            2 * architecture.rank
+            + self.scalar_feature_count
+            + architecture.draft_feature_count
+        )
         self.mlp = nn.Sequential(
             nn.Linear(input_size, architecture.width),
             nn.SiLU(),
@@ -97,6 +104,7 @@ class RegretRouter(nn.Module):
         entropy: torch.Tensor,
         margin: torch.Tensor,
         head_reliability: torch.Tensor,
+        draft_features: torch.Tensor | None = None,
     ) -> RegretRouterControls:
         """Return controls with shape ``[batch,num_heads]``.
 
@@ -136,12 +144,12 @@ class RegretRouter(nn.Module):
         elif reliability.shape != (batch, heads):
             raise ValueError("head reliability must be [H] or [B,H]")
 
-        root = self._rms_normalize(root_hidden.to(torch.float32))
-        direction = self._rms_normalize(regret_direction.to(torch.float32))
-        root_low = self.root_projection(root).unsqueeze(1).expand(-1, heads, -1)
-        direction_low = self.direction_projection(direction).unsqueeze(1).expand(
-            -1, heads, -1
+        root_low, direction_low = self.encode_context(
+            root_hidden,
+            regret_direction,
         )
+        root_low = root_low.unsqueeze(1).expand(-1, heads, -1)
+        direction_low = direction_low.unsqueeze(1).expand(-1, heads, -1)
         depth = torch.linspace(
             0.0,
             1.0,
@@ -154,7 +162,71 @@ class RegretRouter(nn.Module):
             (debt, debt_gate, entropy, margin, reliability, depth),
             dim=-1,
         )
-        raw = self.mlp(torch.cat((root_low, direction_low, scalar), dim=-1))
+        parts = [root_low, direction_low, scalar]
+        if self.architecture.draft_feature_count > 0:
+            expected = (batch, heads, self.architecture.draft_feature_count)
+            if draft_features is None or draft_features.shape != expected:
+                raise ValueError(
+                    f"draft_features must have shape {expected}"
+                )
+            parts.append(
+                draft_features.to(device=root_hidden.device, dtype=torch.float32)
+            )
+        raw = self.mlp(torch.cat(parts, dim=-1))
+
+        return self._controls_from_raw(raw, debt_gate)
+
+    def encode_context(
+        self,
+        root_hidden: torch.Tensor,
+        regret_direction: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project one block context once for sequential per-head routing."""
+        root = self._rms_normalize(root_hidden.to(torch.float32))
+        direction = self._rms_normalize(regret_direction.to(torch.float32))
+        return self.root_projection(root), self.direction_projection(direction)
+
+    def forward_head(
+        self,
+        root_low: torch.Tensor,
+        direction_low: torch.Tensor,
+        regret_debt: torch.Tensor,
+        entropy: torch.Tensor,
+        margin: torch.Tensor,
+        reliability: torch.Tensor,
+        depth: torch.Tensor,
+        draft_features: torch.Tensor,
+    ) -> RegretRouterControls:
+        """Route one MTP head from cached context and current-Q features."""
+        batch = root_low.shape[0]
+        rank = self.architecture.rank
+        feature_count = self.architecture.draft_feature_count
+        if root_low.shape != (batch, rank) or direction_low.shape != (batch, rank):
+            raise ValueError("cached context projections have invalid shape")
+        scalars = (regret_debt, entropy, margin, reliability, depth)
+        if any(value.shape != (batch,) for value in scalars):
+            raise ValueError("head scalar features must have shape [batch]")
+        if draft_features.shape != (batch, feature_count):
+            raise ValueError("current draft features have invalid shape")
+        debt_gate = (regret_debt / (1.0 + regret_debt)).clamp(0.0, 1.0)
+        scalar = torch.stack(
+            (regret_debt, debt_gate, entropy, margin, reliability, depth),
+            dim=-1,
+        )
+        raw = self.mlp(
+            torch.cat(
+                (root_low, direction_low, scalar, draft_features),
+                dim=-1,
+            )
+        )
+        return self._controls_from_raw(raw, debt_gate)
+
+    def _controls_from_raw(
+        self,
+        raw: torch.Tensor,
+        debt_gate: torch.Tensor,
+    ) -> RegretRouterControls:
+        """Map unconstrained controller outputs to bounded actions."""
 
         direction_strength = (
             self.architecture.max_direction_strength

@@ -4,8 +4,9 @@ The target model, native MTP, Exact-TV allocation, and hidden states remain
 unchanged.  For every actionable trace position, an offline compact-support
 oracle chooses the bounded MTP logit scale that best aligns Q with P while
 penalizing intervention and entropy drift.  The Router distils that action
-from causally available previous-block regret context.  A checkpoint is
-enabled only if it beats the exact no-op policy on held-out requests.
+from causally available regret state and current-Q statistics.  A checkpoint
+is enabled only if it beats the exact no-op policy on both model-selection
+and untouched audit requests.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from remtp.regret_router_model import (
@@ -161,30 +161,30 @@ def selective_batch_loss(
         batch["source_entropy"],
         batch["source_margin"],
         batch["head_reliability"],
+        batch["draft_features"],
     )
     predicted_scale = proposal.logit_scale
     target_scale = oracle["target_scale"]
     actionable = oracle["actionable"]
     if actionable.any():
-        normalized_error = F.smooth_l1_loss(
-            predicted_scale / args.max_logit_scale,
-            target_scale / args.max_logit_scale,
-            reduction="none",
-        )
-        gain_weight = 1.0 + (
-            oracle["oracle_gain"]
-            / oracle["baseline_objective"].clamp_min(1e-6)
-        ).clamp(0.0, 1.0)
-        loss = (normalized_error * gain_weight)[actionable].mean()
+        normalized_error = (
+            (predicted_scale - target_scale) / args.max_logit_scale
+        ).square()
+        loss = normalized_error[actionable].mean()
     else:
         loss = predicted_scale.sum() * 0.0
 
+    applied_scale = torch.where(
+        predicted_scale.abs() >= args.min_action_scale,
+        predicted_scale,
+        torch.zeros_like(predicted_scale),
+    )
     calibrated = _calibrate_q(
         batch["q_compact"],
         batch["direction_delta"],
         batch["support_mask"],
-        torch.zeros_like(predicted_scale),
-        predicted_scale,
+        torch.zeros_like(applied_scale),
+        applied_scale,
     )
     model_objective = compact_objective(
         batch["p_compact"],
@@ -200,7 +200,7 @@ def selective_batch_loss(
         mae = (predicted_scale - target_scale).abs()[actionable].mean()
         identity_mae = target_scale.abs()[actionable].mean()
         predicted_action_rate = (
-            predicted_scale.abs() >= args.min_action_scale
+            applied_scale.abs() >= args.min_action_scale
         )[actionable].to(torch.float32).mean()
         oracle_action_rate = (
             target_scale.abs() >= args.min_action_scale
@@ -272,13 +272,26 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         max_shards=args.max_shards,
     )
     (
+        development_records,
+        audit_records,
+        development_request_ids,
+        audit_request_ids,
+    ) = split_records_by_request(
+        records,
+        validation_fraction=args.audit_fraction,
+        seed=args.seed + 1,
+    )
+    validation_within_development = args.validation_fraction / (
+        1.0 - args.audit_fraction
+    )
+    (
         training_records,
         validation_records,
         training_request_ids,
         validation_request_ids,
     ) = split_records_by_request(
-        records,
-        validation_fraction=args.validation_fraction,
+        development_records,
+        validation_fraction=validation_within_development,
         seed=args.seed,
     )
     print("stage=build_compact_support", flush=True)
@@ -292,10 +305,22 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         progress_every=args.build_progress_every,
         split_name="validation",
     )
+    audit_dataset = RouterTraceDataset(
+        audit_records,
+        progress_every=args.build_progress_every,
+        split_name="audit",
+    )
     record_count = len(records)
     training_record_count = len(training_records)
     validation_record_count = len(validation_records)
-    del records, training_records, validation_records
+    audit_record_count = len(audit_records)
+    del (
+        records,
+        development_records,
+        training_records,
+        validation_records,
+        audit_records,
+    )
     gc.collect()
 
     example = training_dataset[0]
@@ -307,9 +332,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         max_direction_strength=0.0,
         max_logit_scale=args.max_logit_scale,
         max_budget_reduction=0.0,
+        draft_feature_count=2,
     )
     device = torch.device(args.device)
     model = RegretRouter(architecture).to(device)
+    if not args.use_high_dimensional_context:
+        nn.init.zeros_(model.root_projection.weight)
+        nn.init.zeros_(model.direction_projection.weight)
+        model.root_projection.weight.requires_grad_(False)
+        model.direction_projection.weight.requires_grad_(False)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -324,6 +355,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     validation_loader = DataLoader(
         validation_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+    audit_loader = DataLoader(
+        audit_dataset,
         batch_size=args.batch_size,
         shuffle=False,
     )
@@ -380,15 +416,26 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     assert best_state is not None and best_validation is not None
     model.load_state_dict(best_state)
-    enabled = (
-        best_validation["model_gain"] >= args.min_validation_gain
-        and best_validation["logit_mae"] < best_validation["identity_mae"]
-        and best_validation["sign_accuracy"] >= args.min_sign_accuracy
+    audit = run_epoch(
+        model,
+        audit_loader,
+        device=device,
+        optimizer=None,
+        args=args,
     )
+
+    def passes_held_out(metrics: dict[str, float]) -> bool:
+        return (
+            metrics["model_gain"] >= args.min_validation_gain
+            and metrics["logit_mae"] < metrics["identity_mae"]
+            and metrics["sign_accuracy"] >= args.min_sign_accuracy
+        )
+
+    enabled = passes_held_out(best_validation) and passes_held_out(audit)
     policy = {
         "version": 2,
         "enabled": enabled,
-        "action_mode": "logit_only",
+        "action_mode": "contextual_logit",
         "min_abs_logit_scale": args.min_action_scale,
         "zero_debt_fast_path": True,
         "hidden_steering": False,
@@ -396,17 +443,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     }
     metadata = {
         "records": record_count,
-        "requests": len(training_request_ids | validation_request_ids),
+        "requests": len(development_request_ids | audit_request_ids),
         "training_records": training_record_count,
         "validation_records": validation_record_count,
+        "audit_records": audit_record_count,
         "training_requests": len(training_request_ids),
         "validation_requests": len(validation_request_ids),
+        "audit_requests": len(audit_request_ids),
         "split_unit": "request_id",
         "seed": args.seed,
         "best_epoch": best_epoch,
         "best_validation_model_gain": best_gain,
+        "audit": audit,
         "objective": "selective compact-support oracle logit distillation",
         "policy": policy,
+        "uses_high_dimensional_context": args.use_high_dimensional_context,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     save_regret_router_checkpoint(args.output, model.cpu(), metadata=metadata)
@@ -426,7 +477,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     print(
         f"policy_enabled={enabled} best_epoch={best_epoch} "
-        f"validation_model_gain={best_gain:.6f}",
+        f"validation_model_gain={best_gain:.6f} "
+        f"audit_model_gain={audit['model_gain']:.6f} "
+        f"audit_sign_accuracy={audit['sign_accuracy']:.4f}",
         flush=True,
     )
     print(f"saved checkpoint: {args.output}", flush=True)
@@ -441,11 +494,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
-    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--validation-fraction", type=float, default=0.10)
+    parser.add_argument("--audit-fraction", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--width", type=int, default=32)
@@ -454,23 +508,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-oracle-gain", type=float, default=1e-4)
     parser.add_argument("--min-validation-gain", type=float, default=1e-4)
     parser.add_argument("--min-sign-accuracy", type=float, default=0.55)
-    parser.add_argument("--min-action-scale", type=float, default=0.005)
+    parser.add_argument("--min-action-scale", type=float, default=0.01)
     parser.add_argument("--intervention-weight", type=float, default=0.25)
     parser.add_argument("--entropy-weight", type=float, default=0.10)
     parser.add_argument("--debt-reference", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--early-stop-delta", type=float, default=1e-5)
     parser.add_argument("--load-progress-every", type=int, default=100)
     parser.add_argument("--build-progress-every", type=int, default=10000)
     parser.add_argument("--max-shards", type=int)
+    parser.add_argument("--use-high-dimensional-context", action="store_true")
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.patience < 1:
         parser.error("epochs, batch-size, and patience must be positive")
     if args.oracle_grid_size < 3 or args.oracle_grid_size % 2 == 0:
         parser.error("oracle-grid-size must be an odd integer >= 3")
-    if not 0.0 < args.validation_fraction < 1.0:
-        parser.error("validation-fraction must be in (0,1)")
+    if (
+        not 0.0 < args.validation_fraction < 1.0
+        or not 0.0 < args.audit_fraction < 1.0
+        or args.validation_fraction + args.audit_fraction >= 1.0
+    ):
+        parser.error(
+            "validation and audit fractions must be positive and sum to < 1"
+        )
     if args.max_logit_scale <= 0.0 or args.debt_reference <= 0.0:
         parser.error("max-logit-scale and debt-reference must be positive")
     return args

@@ -12,15 +12,15 @@ python -m remtp.regret_router_selective_train \
   --data-dir "$TRACE_DIR" \
   --output "$CHECKPOINT" \
   --device "${DEVICE:-cuda}" \
-  --epochs "${EPOCHS:-8}" \
+  --epochs "${EPOCHS:-20}" \
   --batch-size "${BATCH_SIZE:-128}" \
-  --learning-rate "${LEARNING_RATE:-3e-4}" \
+  --learning-rate "${LEARNING_RATE:-1e-3}" \
   --debt-reference "${REGRET_ROUTER_DEBT_REFERENCE:-0.05}" \
   --oracle-grid-size "${ORACLE_GRID_SIZE:-17}" \
   --min-oracle-gain "${MIN_ORACLE_GAIN:-1e-4}" \
   --min-validation-gain "${MIN_VALIDATION_GAIN:-1e-4}" \
   --min-sign-accuracy "${MIN_SIGN_ACCURACY:-0.55}" \
-  --min-action-scale "${MIN_ACTION_SCALE:-0.005}" \
-  --patience "${PATIENCE:-3}" \
+  --min-action-scale "${MIN_ACTION_SCALE:-0.01}" \
+  --patience "${PATIENCE:-6}" \
   --seed "${SEED:-42}" \
   "$@"

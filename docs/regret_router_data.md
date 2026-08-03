@@ -128,23 +128,29 @@ MAX_TOKENS=256 \
 
 REGRET_ROUTER_TRACE_DIR=data/regret_router/traces_pilot \
 REGRET_ROUTER_CHECKPOINT=checkpoints/regret_router_v2.pt \
-EPOCHS=8 BATCH_SIZE=128 ./scripts/train_regret_router_v2.sh
+BATCH_SIZE=128 ./scripts/train_regret_router_v2.sh
 ```
 
 主实验使用 V2 的 selective logit-only 训练：它先在每个非零债务位置上用
-紧凑 P/Q 分布搜索有界的最优 logit scale，再蒸馏到仅使用因果历史状态的
-小型 Router。hidden steering 和下一块预算缩放在本阶段固定关闭，Exact-TV
-验证器保持不变。如果 held-out request 上的模型收益不超过恒等策略，生成的
-checkpoint 会带有 `policy.enabled=false`，推理时自动完全旁路 Router。
+紧凑 P/Q 分布搜索有界的最优 logit scale，再蒸馏到使用遗憾债务、当前
+MTP top-8 条件熵与 margin 的小型 Router。hidden steering 和下一块预算
+缩放在本阶段固定关闭，Exact-TV 验证器保持不变。推理只在 softmax 前读取
+top-8 logits 并执行一次标量温度校准，不会再次遍历和归一化完整词表。
+
+训练默认使用 20 epochs、学习率 `1e-3`、请求级 80%/10%/10%
+train/validation/audit 划分。validation 负责选择 epoch；完全独立的 audit
+集合负责最终准入。只有两套 held-out 请求都优于恒等策略时，checkpoint
+才带有 `policy.enabled=true`；否则推理时完全旁路 Router，回到原始
+Exact-TV。
 
 旧的 `scripts/train_regret_router.sh` 保留为原始联合弱监督目标的消融入口，
 不再作为默认训练流程。
 
 每个 trace block 都携带全局唯一的 `collection_id:request_id`。训练器先按
-请求划分 90%/10% train/validation，再展开 block；同一请求的相邻 block
-不会跨集合。checkpoint 元数据会记录 `split_unit=request_id` 以及两侧的
-请求数和 block 数。旧版没有 `request_id` 的 trace 会被明确拒绝，必须
-重新收集。
+请求划分 80%/10%/10% train/validation/audit，再展开 block；同一请求的
+相邻 block 不会跨集合。checkpoint 元数据会记录
+`split_unit=request_id` 以及三侧的请求数和 block 数。旧版没有
+`request_id` 的 trace 会被明确拒绝，必须重新收集。
 
 收集脚本默认拒绝向已有 trace 目录追加，防止把不同数据版本无意混合。只有
 明确希望合并同协议的多次收集时，才设置 `ALLOW_APPEND_ROUTER_TRACES=1`；
