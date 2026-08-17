@@ -15,6 +15,7 @@ ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 REMTP_COMPILATION_CONFIG="${REMTP_COMPILATION_CONFIG:-}"
 REMTP_WORKER_CLS="${REMTP_WORKER_CLS:-}"
 MTP_REJECTION_SAMPLE_METHOD="${MTP_REJECTION_SAMPLE_METHOD:-}"
+ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-auto}"
 
 if ! command -v vllm >/dev/null 2>&1; then
   echo "vllm is not installed. Run: ./scripts/install.sh" >&2
@@ -64,6 +65,16 @@ if [[ -n "$REMTP_COMPILATION_CONFIG" ]]; then
   vllm_args+=(--compilation-config "$REMTP_COMPILATION_CONFIG")
 fi
 
-echo "[ReMTP] model=$MODEL_PATH method=$MTP_METHOD draft_tokens=$MTP_TOKENS trace=$REMTP_TRACE eager=$ENFORCE_EAGER rejection=${MTP_REJECTION_SAMPLE_METHOD:-default}"
+case "$ASYNC_SCHEDULING" in
+  auto) ;;
+  1) vllm_args+=(--async-scheduling) ;;
+  0) vllm_args+=(--no-async-scheduling) ;;
+  *)
+    echo "ASYNC_SCHEDULING must be auto, 0, or 1." >&2
+    exit 2
+    ;;
+esac
+
+echo "[ReMTP] model=$MODEL_PATH method=$MTP_METHOD draft_tokens=$MTP_TOKENS trace=$REMTP_TRACE eager=$ENFORCE_EAGER rejection=${MTP_REJECTION_SAMPLE_METHOD:-default} async=$ASYNC_SCHEDULING"
 
 vllm "${vllm_args[@]}"

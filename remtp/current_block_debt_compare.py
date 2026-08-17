@@ -60,6 +60,17 @@ def _profile_label(directory: str) -> str:
         "event_shield": "Event-triggered Block Shield",
         "risk_gated_block": "Target-Risk-Gated Block Relaxation",
         "regret_calibrated_block": "Regret-Calibrated Block Relaxation",
+        "scheme1": "Scheme 1: cumulative marginal-entropy relaxation",
+        "scheme2": "Scheme 2: sentinel + target anchor + risk debt",
+        "scheme2_relaxed": "Scheme 2: stronger soft-sentinel relaxation",
+        "scheme2_strong": "Scheme 2: high-relaxation soft sentinel",
+        "scheme2_ultra": "Scheme 2: ultra-relaxation soft sentinel",
+        "scheme3": "Scheme 3: entropy-aware adaptive chain fallback",
+        "scheme12": "Scheme 1 + Scheme 2",
+        "scheme12_joint": "Joint Scheme 1+2 risk-credit allocation",
+        "scheme12_anchored": "Target-anchored dual-pool Scheme 1+2",
+        "remtp": "ReMTP (margin-calibrated prefix relaxation)",
+        "remtp_block": "ReMTP-Block (target prefix certificate)",
     }
     return labels.get(directory, directory)
 

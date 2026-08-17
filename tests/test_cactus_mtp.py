@@ -54,6 +54,24 @@ class CactusMTPTest(unittest.TestCase):
         ).sum()
         self.assertLessEqual(kl.item(), delta + 1e-6)
 
+    def test_candidate_acceptance_cannot_drop_below_native(self) -> None:
+        target = torch.tensor(
+            [[0.05, 0.25, 0.70], [0.60, 0.30, 0.10]]
+        )
+        ids = torch.tensor([0, 1])
+        draft_at_candidate = torch.tensor([0.40, 0.80])
+        cactus = cactus_target_distribution(target, ids, delta=1.0)
+        rows = torch.arange(ids.numel())
+        native_alpha = torch.minimum(
+            torch.ones_like(draft_at_candidate),
+            target[rows, ids] / draft_at_candidate,
+        )
+        cactus_alpha = torch.minimum(
+            torch.ones_like(draft_at_candidate),
+            cactus[rows, ids] / draft_at_candidate,
+        )
+        self.assertTrue(bool(torch.all(cactus_alpha >= native_alpha)))
+
     def test_negative_delta_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             cactus_target_distribution(

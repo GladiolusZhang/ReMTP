@@ -41,6 +41,38 @@ PROFILE_LABELS = {
     "regret_calibrated_block": "Regret-Calibrated Block Relaxation",
     "target_mode_regret": "Target-Mode Rescue + within-block regret",
     "target_mode_identity": "Fused strict-MTP identity control",
+    "target_mode_p05_b060": "p>=0.5 baseline (block=0.60, debt=0.50)",
+    "target_mode_p05_b075": "p>=0.5 mild (block=0.75, debt=0.35)",
+    "target_mode_p05_b090": "p>=0.5 aggressive (block=0.90, debt=0.20)",
+    "target_mode_p05_b095": "p>=0.5 max rescue (block=0.95, debt=0.00)",
+    "target_mode_top1_m000": "Target top-1 (margin>=0.00, block=0.75)",
+    "target_mode_top1_m010": "Target top-1 (margin>=0.10, block=0.75)",
+    "target_mode_top1_m025": "Target top-1 (margin>=0.25, block=0.75)",
+    "target_mode_top1_m050": "Target top-1 (margin>=0.50, block=0.75)",
+    "target_band_r2_g025": "Target band (rank<=2, gap<=0.25)",
+    "target_band_r4_g050": "Target band (rank<=4, gap<=0.50)",
+    "target_band_r4_g075": "Target band (rank<=4, gap<=0.75)",
+    "target_band_r8_g100": "Target band (rank<=8, gap<=1.00)",
+    "prefix_credit_token_cap": "Target top-1 + joint verify (token cap)",
+    "prefix_credit_atomic": "Prefix-Credit MTP (atomic repair)",
+    "prefix_credit": "Prefix-Credit MTP (gain/TV>=0.50)",
+    "prefix_credit_g025": "Prefix-Credit MTP (gain/TV>=0.25)",
+    "prefix_credit_g050": "Prefix-Credit MTP (gain/TV>=0.50)",
+    "prefix_credit_g100": "Prefix-Credit MTP (gain/TV>=1.00)",
+    "prefix_credit_b060": "Prefix-Credit MTP (block=0.60)",
+    "prefix_credit_b075": "Prefix-Credit MTP (block=0.75)",
+    "prefix_credit_b090": "Prefix-Credit MTP (block=0.90)",
+    "scheme1": "Scheme 1: cumulative marginal-entropy relaxation",
+    "scheme2": "Scheme 2: sentinel + target anchor + risk debt",
+    "scheme2_relaxed": "Scheme 2: stronger soft-sentinel relaxation",
+    "scheme2_strong": "Scheme 2: high-relaxation soft sentinel",
+    "scheme2_ultra": "Scheme 2: ultra-relaxation soft sentinel",
+    "scheme3": "Scheme 3: entropy-aware adaptive chain fallback",
+    "scheme12": "Scheme 1 + Scheme 2",
+    "scheme12_joint": "Joint Scheme 1+2 risk-credit allocation",
+    "scheme12_anchored": "Target-anchored dual-pool Scheme 1+2",
+    "remtp": "ReMTP (margin-calibrated prefix relaxation)",
+    "remtp_block": "ReMTP-Block (target prefix certificate)",
 }
 
 
@@ -121,6 +153,9 @@ def compare(run_root: Path, profiles: list[str]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "directory": profile,
+                "result_source": (
+                    "historical" if (run_root / profile).is_symlink() else "new"
+                ),
                 "method": PROFILE_LABELS.get(profile, profile),
                 "samples": summary["samples"],
                 "pass_at_1": summary["pass_at_1"],
@@ -163,13 +198,14 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         "Quality is official-test `pass@1`; speed excludes Docker evaluation time.",
         "All rows use the same tasks, prompts, sampling parameters, and container policy.",
         "",
-        "| method | pass@1 | vs Cactus | decode tok/s | e2e tok/s | "
+        "| method | source | pass@1 | vs Cactus | decode tok/s | e2e tok/s | "
         "vs Cactus | MAL | draft acceptance | truncation | timeouts |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['method']} | {100.0 * row['pass_at_1']:.1f}% | "
+            f"| {row['method']} | {row['result_source']} | "
+            f"{100.0 * row['pass_at_1']:.1f}% | "
             f"{row['pass_at_1_delta_pp']:+.1f} pp | "
             f"{row['decode_tok_s']:.3f} | {row['e2e_tok_s']:.3f} | "
             f"{row['e2e_delta_pct']:+.2f}% | "

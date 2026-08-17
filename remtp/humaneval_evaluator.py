@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import subprocess
 import sys
@@ -196,6 +197,7 @@ def evaluate_run(
     memory: str,
     cpus: str,
     progress_every: int,
+    workers: int = 1,
 ) -> dict[str, Any]:
     config, summary, records = _load_run(run_dir)
     tasks = {row["task_id"]: row for row in load_humaneval(data_path)}
@@ -204,17 +206,18 @@ def evaluate_run(
         raise ValueError(f"tasks missing from HumanEval data: {missing[:3]}")
 
     counts: Counter[str] = Counter()
-    evaluations: list[dict[str, Any]] = []
-    print(f"Evaluating {len(records)} candidates in restricted Docker containers")
-    for index, record in enumerate(records, start=1):
-        task = tasks[record["task_id"]]
-        result = evaluate_source_docker(
-            build_candidate_source(task, record),
-            image=image,
-            timeout=timeout,
-            memory=memory,
-            cpus=cpus,
-        )
+    evaluations_by_index: list[dict[str, Any] | None] = [None] * len(records)
+    print(
+        f"Evaluating {len(records)} candidates in restricted Docker "
+        f"containers (workers={workers})"
+    )
+
+    def consume_result(
+        index: int,
+        result: dict[str, str],
+        completed: int,
+    ) -> None:
+        record = records[index]
         status = result["status"]
         correct = status == "passed"
         counts[status] += 1
@@ -226,13 +229,56 @@ def evaluate_run(
             "status": status,
             "detail": result["detail"],
         }
-        evaluations.append(evaluation)
-        if index == 1 or index % progress_every == 0 or index == len(records):
+        evaluations_by_index[index] = evaluation
+        if (
+            completed == 1
+            or completed % progress_every == 0
+            or completed == len(records)
+        ):
             marker = "✓" if correct else "✗"
             print(
-                f"  [{index:03d}/{len(records):03d}] "
+                f"  [{completed:03d}/{len(records):03d}] "
                 f"task={record['task_id']} {status} {marker}"
             )
+
+    if workers == 1:
+        for index, record in enumerate(records):
+            task = tasks[record["task_id"]]
+            result = evaluate_source_docker(
+                build_candidate_source(task, record),
+                image=image,
+                timeout=timeout,
+                memory=memory,
+                cpus=cpus,
+            )
+            consume_result(index, result, index + 1)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="humaneval-docker",
+        ) as executor:
+            pending = {
+                executor.submit(
+                    evaluate_source_docker,
+                    build_candidate_source(tasks[record["task_id"]], record),
+                    image=image,
+                    timeout=timeout,
+                    memory=memory,
+                    cpus=cpus,
+                ): index
+                for index, record in enumerate(records)
+            }
+            for completed, future in enumerate(
+                concurrent.futures.as_completed(pending),
+                start=1,
+            ):
+                consume_result(pending[future], future.result(), completed)
+
+    evaluations = [
+        evaluation
+        for evaluation in evaluations_by_index
+        if evaluation is not None
+    ]
 
     correct_count = counts["passed"]
     summary.update(
@@ -278,14 +324,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=8.0)
     parser.add_argument("--memory", default="512m")
     parser.add_argument("--cpus", default="1.0")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="number of isolated Docker evaluations to run concurrently",
+    )
     parser.add_argument("--progress-every", type=int, default=10)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.timeout <= 0 or args.progress_every <= 0:
-        print("timeout and progress-every must be positive", file=sys.stderr)
+    if args.timeout <= 0 or args.progress_every <= 0 or args.workers <= 0:
+        print(
+            "timeout, progress-every, and workers must be positive",
+            file=sys.stderr,
+        )
         return 2
     if not args.run_dir.is_dir():
         print(f"run directory not found: {args.run_dir}", file=sys.stderr)
@@ -307,6 +362,7 @@ def main() -> int:
         memory=args.memory,
         cpus=args.cpus,
         progress_every=args.progress_every,
+        workers=args.workers,
     )
     print(
         f"pass@1={100.0 * summary['pass_at_1']:.1f}% "

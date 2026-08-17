@@ -1,4 +1,5 @@
 .venv/
+.vscode/
 .cache/
 models/
 __pycache__/
@@ -12,4 +13,5 @@ checkpoints/
 results/
 logs/
 dse_results/
+/docs/four_way_comparison_summary.md
 参考论文/

@@ -23,6 +23,10 @@ from remtp.benchmark import (
     fetch_metrics,
     metric_delta,
 )
+from remtp.benchmark_checkpoint import (
+    append_benchmark_checkpoint,
+    initialize_benchmark_output,
+)
 
 
 NUMBER_PATTERN = re.compile(
@@ -42,6 +46,18 @@ At the very end, write the final numeric answer on a separate line exactly as:
 
 Problem:
 {question}"""
+
+
+def benchmark_messages(
+    content: str,
+    *,
+    empty_system_prompt: bool,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    if empty_system_prompt:
+        messages.append({"role": "system", "content": ""})
+    messages.append({"role": "user", "content": content})
+    return messages
 
 
 def normalize_number(value: str) -> str | None:
@@ -176,6 +192,11 @@ def write_gsm8k_summary(
 
     accuracy = summary["accuracy"]
     acceptance_rate = summary["draft_token_acceptance_rate"]
+    acceptance_text = (
+        "n/a"
+        if acceptance_rate is None
+        else f"{100.0 * acceptance_rate:.1f}%"
+    )
     parse_rate = summary["parse_rate"]
     format_rate = summary["format_compliance_rate"]
     truncation_rate = summary["truncation_rate"]
@@ -197,7 +218,7 @@ def write_gsm8k_summary(
         f"{_display(summary['decode_tok_s'])} | "
         f"{_display(summary['e2e_output_tok_s'])} | "
         f"{_display(summary['mean_acceptance_length'])} | "
-        f"{100.0 * acceptance_rate:.1f}% | "
+        f"{acceptance_text} | "
         f"{100.0 * parse_rate:.1f}% |",
         "",
         f"Requested `#### <number>` format compliance: "
@@ -238,6 +259,16 @@ def parse_args() -> argparse.Namespace:
         help="print one progress row every N samples",
     )
     parser.add_argument("--skip-warmup", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume an output directory from requests.checkpoint.jsonl",
+    )
+    parser.add_argument(
+        "--empty-system-prompt",
+        action="store_true",
+        help="prepend the explicit empty system message recommended by MiMo",
+    )
     return parser.parse_args()
 
 
@@ -284,8 +315,6 @@ def main() -> int:
             / f"gsm8k_{safe_run_name}_n{args.samples}"
             f"_t{args.temperature:g}_{stamp}"
         )
-    output_dir.mkdir(parents=True, exist_ok=False)
-
     manifest = [
         {
             "question_id": int(row["question_id"]),
@@ -296,41 +325,42 @@ def main() -> int:
         }
         for row in selected
     ]
-    (output_dir / "sample_manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    records, checkpoint_path = initialize_benchmark_output(
+        output_dir,
+        manifest,
+        resume=args.resume,
+        identity_key="question_id",
     )
 
     if not args.skip_warmup:
         warmup = selected[0]
         print(f"Warmup: question {warmup['question_id']} (excluded)")
+        warmup_content = PROMPT_TEMPLATE.format(question=warmup["question"])
         chat_completion(
             base_url,
             args.model,
-            [
-                {
-                    "role": "user",
-                    "content": PROMPT_TEMPLATE.format(
-                        question=warmup["question"]
-                    ),
-                }
-            ],
+            benchmark_messages(
+                warmup_content,
+                empty_system_prompt=args.empty_system_prompt,
+            ),
             args.temperature,
             args.generation_seed,
             min(64, args.max_tokens),
             args.timeout,
         )
 
-    records: list[dict[str, Any]] = []
+    completed = len(records)
+    if completed:
+        print(f"Resuming GSM8K from sample {completed + 1}/{len(selected)}")
     print(f"\nTask gsm8k: {len(selected)} samples")
     for sample_index, row in enumerate(selected, start=1):
+        if sample_index <= completed:
+            continue
         request_seed = args.generation_seed + int(row["question_id"]) * 10
-        messages = [
-            {
-                "role": "user",
-                "content": PROMPT_TEMPLATE.format(question=row["question"]),
-            }
-        ]
+        messages = benchmark_messages(
+            PROMPT_TEMPLATE.format(question=row["question"]),
+            empty_system_prompt=args.empty_system_prompt,
+        )
         before = fetch_metrics(base_url, args.timeout)
         started = time.perf_counter()
         response = chat_completion(
@@ -367,6 +397,7 @@ def main() -> int:
             "metrics": metric_delta(before, after),
         }
         records.append(record)
+        append_benchmark_checkpoint(checkpoint_path, record)
         status = "✓" if correct else "✗"
         if (
             sample_index == 1
@@ -399,6 +430,7 @@ def main() -> int:
         "progress_every": args.progress_every,
         "answer_metric": "normalized_numeric_exact_match",
         "answer_extraction": "####, then boxed, then last numeric token",
+        "system_prompt": "" if args.empty_system_prompt else "tokenizer_default",
     }
     with (output_dir / "requests.jsonl").open(
         "w",

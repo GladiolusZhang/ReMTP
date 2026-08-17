@@ -24,6 +24,7 @@ Default methods:
   - Exact-TV + learned expected-regret Router
   - Regret-Calibrated Block Relaxation (ours)
   - Target-Mode Rescue + within-block regret (ours)
+  - Prefix-Credit native MTP relaxation + joint verification (ours)
   - fused strict-MTP identity control (attribution)
 
 Generated code is never executed by the vLLM benchmark process. Each solution
@@ -41,13 +42,17 @@ Useful environment variables:
   MAX_TOKENS=512
   MTP_TOKENS=6
   CACTUS_REGRET_ALPHA=0.03
-  PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head tv_hidden_veto exact_tv exact_tv_regret_router regret_calibrated_block target_mode_identity target_mode_regret"
+  PROFILES="native_mtp cactus cactus_regret spec_cascade native_block cactus_block debt_balanced target_surplus tv_head tv_hidden_veto exact_tv exact_tv_regret_router regret_calibrated_block target_mode_identity target_mode_regret target_mode_p05_b060 target_mode_p05_b075 target_mode_p05_b090 target_mode_p05_b095 target_mode_top1_m000 target_mode_top1_m010 target_mode_top1_m025 target_mode_top1_m050 target_band_r2_g025 target_band_r4_g050 target_band_r4_g075 target_band_r8_g100 prefix_credit_token_cap prefix_credit_atomic prefix_credit prefix_credit_g025 prefix_credit_g050 prefix_credit_g100 prefix_credit_b060 prefix_credit_b075 prefix_credit_b090"
   REGRET_ROUTER_CHECKPOINT=checkpoints/regret_router.pt
   EVAL_TIMEOUT=8
+  EVAL_WORKERS=1
   HUMANEVAL_DOCKER_IMAGE=python:3-slim
   PROGRESS_EVERY=10
   SERVER_START_TIMEOUT=180
   RUN_TAG=<timestamp>
+  REUSE_PROFILES="native_mtp cactus spec_cascade"
+  REUSE_RESULT_ROOTS="results/old_run_a:results/old_run_b"
+  REUSE_REQUIRED=1
 
 For a quick smoke test:
   SAMPLES=5 PROFILES="native_mtp cactus target_mode_regret" \
@@ -93,10 +98,14 @@ SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-180}"
 EVAL_TIMEOUT="${EVAL_TIMEOUT:-8}"
 EVAL_MEMORY="${EVAL_MEMORY:-512m}"
 EVAL_CPUS="${EVAL_CPUS:-1.0}"
+EVAL_WORKERS="${EVAL_WORKERS:-1}"
 HUMANEVAL_DOCKER_IMAGE="${HUMANEVAL_DOCKER_IMAGE:-python:3-slim}"
 HUMANEVAL_DATA="${HUMANEVAL_DATA:-$PROJECT_DIR/data/humaneval/HumanEval.jsonl.gz}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
+REUSE_PROFILES="${REUSE_PROFILES:-}"
+REUSE_RESULT_ROOTS="${REUSE_RESULT_ROOTS:-}"
+REUSE_REQUIRED="${REUSE_REQUIRED:-1}"
 DEFAULT_PROFILES="native_mtp target_mode_identity cactus spec_cascade exact_tv target_mode_regret"
 read -r -a profiles <<< "${PROFILES:-$DEFAULT_PROFILES}"
 
@@ -139,6 +148,39 @@ RUN_ROOT="$PROJECT_DIR/results/humaneval_comparison_${RUN_TAG}"
 LOG_ROOT="$PROJECT_DIR/logs/humaneval_comparison_${RUN_TAG}"
 mkdir -p "$RUN_ROOT" "$LOG_ROOT"
 server_pid=""
+
+if [[ -n "$REUSE_PROFILES" ]]; then
+  if [[ -z "$REUSE_RESULT_ROOTS" ]]; then
+    echo "REUSE_RESULT_ROOTS is required when REUSE_PROFILES is set." >&2
+    exit 2
+  fi
+  read -r -a reuse_profiles <<< "$REUSE_PROFILES"
+  IFS=':' read -r -a reuse_roots <<< "$REUSE_RESULT_ROOTS"
+  reuse_args=()
+  for root in "${reuse_roots[@]}"; do
+    reuse_args+=(--source-root "$root")
+  done
+  image_id="$(docker image inspect --format '{{.Id}}' "$HUMANEVAL_DOCKER_IMAGE")"
+  allow_missing=()
+  if [[ "$REUSE_REQUIRED" == "0" ]]; then
+    allow_missing=(--allow-missing)
+  fi
+  python -m remtp.humaneval_reuse \
+    --destination-root "$RUN_ROOT" \
+    "${reuse_args[@]}" \
+    --profiles "${reuse_profiles[@]}" \
+    --samples "$SAMPLES" \
+    --sample-seed "$SAMPLE_SEED" \
+    --temperature "$TEMPERATURE" \
+    --generation-seed "$SEED" \
+    --max-tokens "$MAX_TOKENS" \
+    --mtp-tokens "$MTP_TOKENS" \
+    --data "$HUMANEVAL_DATA" \
+    --evaluation-image "$HUMANEVAL_DOCKER_IMAGE" \
+    --evaluation-image-id "$image_id" \
+    --evaluation-timeout "$EVAL_TIMEOUT" \
+    "${allow_missing[@]}"
+fi
 
 cleanup_server() {
   if [[ -z "$server_pid" ]]; then
@@ -247,7 +289,221 @@ profile_server() {
       ;;
     target_mode_identity)
       PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
-      PROFILE_ENV=(MODE_REGRET_BLOCK_TV=0)
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=probability
+        MODE_REGRET_BLOCK_TV=0
+        MODE_REGRET_COMPILE=0
+      )
+      ;;
+    target_mode_p05_b060)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=probability
+        MODE_REGRET_MIN_TARGET_PROB=0.50
+        MODE_REGRET_PER_TOKEN_TV=0.49
+        MODE_REGRET_BLOCK_TV=0.60
+        MODE_REGRET_DEBT_SLOPE=0.50
+        MODE_REGRET_DEPTH_SLOPE=0.00
+      )
+      ;;
+    target_mode_p05_b075)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=probability
+        MODE_REGRET_MIN_TARGET_PROB=0.50
+        MODE_REGRET_PER_TOKEN_TV=0.49
+        MODE_REGRET_BLOCK_TV=0.75
+        MODE_REGRET_DEBT_SLOPE=0.35
+        MODE_REGRET_DEPTH_SLOPE=0.00
+      )
+      ;;
+    target_mode_p05_b090)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=probability
+        MODE_REGRET_MIN_TARGET_PROB=0.50
+        MODE_REGRET_PER_TOKEN_TV=0.49
+        MODE_REGRET_BLOCK_TV=0.90
+        MODE_REGRET_DEBT_SLOPE=0.20
+        MODE_REGRET_DEPTH_SLOPE=0.00
+      )
+      ;;
+    target_mode_p05_b095)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=probability
+        MODE_REGRET_MIN_TARGET_PROB=0.50
+        MODE_REGRET_PER_TOKEN_TV=0.49
+        MODE_REGRET_BLOCK_TV=0.95
+        MODE_REGRET_DEBT_SLOPE=0.00
+        MODE_REGRET_DEPTH_SLOPE=0.00
+      )
+      ;;
+    target_mode_top1_m000|target_mode_top1_m010|target_mode_top1_m025|target_mode_top1_m050)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      case "$profile" in
+        target_mode_top1_m000) margin=0.00 ;;
+        target_mode_top1_m010) margin=0.10 ;;
+        target_mode_top1_m025) margin=0.25 ;;
+        target_mode_top1_m050) margin=0.50 ;;
+      esac
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=top1_margin
+        MODE_REGRET_MIN_TOP1_MARGIN="$margin"
+        MODE_REGRET_PER_TOKEN_TV=0.49
+        MODE_REGRET_BLOCK_TV=0.75
+        MODE_REGRET_MARGIN_DEBT_SLOPE=0.35
+        MODE_REGRET_MARGIN_DEPTH_SLOPE=0.00
+      )
+      ;;
+    target_band_r2_g025)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=target_band
+        MODE_REGRET_MAX_TARGET_RANK=2
+        MODE_REGRET_MAX_CANDIDATE_GAP=0.25
+        MODE_REGRET_PER_TOKEN_TV=0.20
+        MODE_REGRET_BLOCK_TV=0.60
+        MODE_REGRET_BAND_DEBT_SLOPE=0.75
+        MODE_REGRET_BAND_DEPTH_SLOPE=0.00
+      )
+      ;;
+    target_band_r4_g050)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=target_band
+        MODE_REGRET_MAX_TARGET_RANK=4
+        MODE_REGRET_MAX_CANDIDATE_GAP=0.50
+        MODE_REGRET_PER_TOKEN_TV=0.25
+        MODE_REGRET_BLOCK_TV=0.75
+        MODE_REGRET_BAND_DEBT_SLOPE=0.75
+        MODE_REGRET_BAND_DEPTH_SLOPE=0.00
+      )
+      ;;
+    target_band_r4_g075)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=target_band
+        MODE_REGRET_MAX_TARGET_RANK=4
+        MODE_REGRET_MAX_CANDIDATE_GAP=0.75
+        MODE_REGRET_PER_TOKEN_TV=0.30
+        MODE_REGRET_BLOCK_TV=0.85
+        MODE_REGRET_BAND_DEBT_SLOPE=0.50
+        MODE_REGRET_BAND_DEPTH_SLOPE=0.00
+      )
+      ;;
+    target_band_r8_g100)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_target_mode_regret_mtp.sh"
+      PROFILE_ENV=(
+        MODE_REGRET_ELIGIBILITY=target_band
+        MODE_REGRET_MAX_TARGET_RANK=8
+        MODE_REGRET_MAX_CANDIDATE_GAP=1.00
+        MODE_REGRET_PER_TOKEN_TV=0.35
+        MODE_REGRET_BLOCK_TV=0.95
+        MODE_REGRET_BAND_DEBT_SLOPE=0.35
+        MODE_REGRET_BAND_DEPTH_SLOPE=0.00
+      )
+      ;;
+    prefix_credit_token_cap)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_prefix_credit_mtp.sh"
+      PROFILE_ENV=(
+        PREFIX_CREDIT_ALLOCATION=token_cap
+        PREFIX_CREDIT_MIN_TOP1_MARGIN=0.10
+        PREFIX_CREDIT_PER_TOKEN_TV=0.49
+        PREFIX_CREDIT_BLOCK_TV=0.75
+      )
+      ;;
+    prefix_credit_atomic)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_prefix_credit_mtp.sh"
+      PROFILE_ENV=(
+        PREFIX_CREDIT_ALLOCATION=atomic_credit
+        PREFIX_CREDIT_MIN_TOP1_MARGIN=0.10
+        PREFIX_CREDIT_PER_TOKEN_TV=0.49
+        PREFIX_CREDIT_BLOCK_TV=0.75
+      )
+      ;;
+    prefix_credit|prefix_credit_g050|prefix_credit_b075)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_prefix_credit_mtp.sh"
+      PROFILE_ENV=(
+        PREFIX_CREDIT_ALLOCATION=prefix_credit
+        PREFIX_CREDIT_MIN_TOP1_MARGIN=0.10
+        PREFIX_CREDIT_PER_TOKEN_TV=0.49
+        PREFIX_CREDIT_BLOCK_TV=0.75
+        PREFIX_CREDIT_MIN_GAIN_PER_TV=0.50
+      )
+      ;;
+    prefix_credit_g025)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_prefix_credit_mtp.sh"
+      PROFILE_ENV=(
+        PREFIX_CREDIT_ALLOCATION=prefix_credit
+        PREFIX_CREDIT_MIN_TOP1_MARGIN=0.10
+        PREFIX_CREDIT_PER_TOKEN_TV=0.49
+        PREFIX_CREDIT_BLOCK_TV=0.75
+        PREFIX_CREDIT_MIN_GAIN_PER_TV=0.25
+      )
+      ;;
+    prefix_credit_g100)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_prefix_credit_mtp.sh"
+      PROFILE_ENV=(
+        PREFIX_CREDIT_ALLOCATION=prefix_credit
+        PREFIX_CREDIT_MIN_TOP1_MARGIN=0.10
+        PREFIX_CREDIT_PER_TOKEN_TV=0.49
+        PREFIX_CREDIT_BLOCK_TV=0.75
+        PREFIX_CREDIT_MIN_GAIN_PER_TV=1.00
+      )
+      ;;
+    prefix_credit_b060)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_prefix_credit_mtp.sh"
+      PROFILE_ENV=(
+        PREFIX_CREDIT_ALLOCATION=prefix_credit
+        PREFIX_CREDIT_MIN_TOP1_MARGIN=0.10
+        PREFIX_CREDIT_PER_TOKEN_TV=0.49
+        PREFIX_CREDIT_BLOCK_TV=0.60
+        PREFIX_CREDIT_MIN_GAIN_PER_TV=0.50
+      )
+      ;;
+    prefix_credit_b090)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_prefix_credit_mtp.sh"
+      PROFILE_ENV=(
+        PREFIX_CREDIT_ALLOCATION=prefix_credit
+        PREFIX_CREDIT_MIN_TOP1_MARGIN=0.10
+        PREFIX_CREDIT_PER_TOKEN_TV=0.49
+        PREFIX_CREDIT_BLOCK_TV=0.90
+        PREFIX_CREDIT_MIN_GAIN_PER_TV=0.50
+      )
+      ;;
+    scheme1)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme1_mtp.sh"
+      ;;
+    scheme2)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme2_mtp.sh"
+      ;;
+    scheme2_relaxed)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme2_relaxed_mtp.sh"
+      ;;
+    scheme2_strong)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme2_strong_mtp.sh"
+      ;;
+    scheme2_ultra)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme2_ultra_mtp.sh"
+      ;;
+    scheme3)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme3_adaptive_chain_mtp.sh"
+      ;;
+    scheme12)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme12_mtp.sh"
+      ;;
+    scheme12_joint)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme12_joint_mtp.sh"
+      ;;
+    scheme12_anchored)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_scheme12_anchored_mtp.sh"
+      ;;
+    remtp)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_remtp_mtp.sh"
+      ;;
+    remtp_block)
+      PROFILE_SCRIPT="$PROJECT_DIR/scripts/serve_remtp_block_mtp.sh"
       ;;
     *)
       echo "Unknown profile: $profile" >&2
@@ -313,6 +569,7 @@ run_method() {
     --timeout "$EVAL_TIMEOUT" \
     --memory "$EVAL_MEMORY" \
     --cpus "$EVAL_CPUS" \
+    --workers "$EVAL_WORKERS" \
     --progress-every "$PROGRESS_EVERY" \
     2>&1 | tee "$evaluation_log"
 }
@@ -326,7 +583,11 @@ echo "container=$HUMANEVAL_DOCKER_IMAGE timeout=${EVAL_TIMEOUT}s"
 echo "local_results=$RUN_ROOT"
 
 for profile in "${profiles[@]}"; do
-  run_method "$profile"
+  if [[ -L "$RUN_ROOT/$profile" ]]; then
+    echo "[reuse] skipping inference and evaluation for $profile"
+  else
+    run_method "$profile"
+  fi
 done
 
 python -m remtp.humaneval_compare "$RUN_ROOT" "${profiles[@]}"

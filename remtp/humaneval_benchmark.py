@@ -28,6 +28,10 @@ from remtp.benchmark import (
     fetch_metrics,
     metric_delta,
 )
+from remtp.benchmark_checkpoint import (
+    append_benchmark_checkpoint,
+    initialize_benchmark_output,
+)
 
 
 PROMPT_TEMPLATE = """Complete the Python function below.
@@ -38,6 +42,19 @@ Requirements:
 - Do not use Markdown fences and do not include an explanation.
 
 {prompt}"""
+
+
+def benchmark_messages(
+    content: str,
+    *,
+    empty_system_prompt: bool,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    if empty_system_prompt:
+        messages.append({"role": "system", "content": ""})
+    messages.append({"role": "user", "content": content})
+    return messages
+
 
 THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 FENCE_PATTERN = re.compile(
@@ -242,6 +259,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--skip-warmup", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume an output directory from requests.checkpoint.jsonl",
+    )
+    parser.add_argument(
+        "--empty-system-prompt",
+        action="store_true",
+        help="prepend the explicit empty system message recommended by MiMo",
+    )
     return parser.parse_args()
 
 
@@ -278,8 +305,6 @@ def main() -> int:
         output_dir = Path("results") / (
             f"humaneval_{safe_name}_n{args.samples}_t{args.temperature:g}_{stamp}"
         )
-    output_dir.mkdir(parents=True, exist_ok=False)
-
     manifest = [
         {
             "task_id": row["task_id"],
@@ -292,36 +317,44 @@ def main() -> int:
         }
         for row in selected
     ]
-    (output_dir / "sample_manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    records, checkpoint_path = initialize_benchmark_output(
+        output_dir,
+        manifest,
+        resume=args.resume,
+        identity_key="task_id",
     )
 
     if not args.skip_warmup:
         warmup = selected[0]
         print(f"Warmup: {warmup['task_id']} (excluded)")
+        warmup_content = PROMPT_TEMPLATE.format(prompt=warmup["prompt"])
         chat_completion(
             base_url,
             args.model,
-            [{"role": "user", "content": PROMPT_TEMPLATE.format(prompt=warmup["prompt"])}],
+            benchmark_messages(
+                warmup_content,
+                empty_system_prompt=args.empty_system_prompt,
+            ),
             args.temperature,
             args.generation_seed,
             min(96, args.max_tokens),
             args.timeout,
         )
 
-    records: list[dict[str, Any]] = []
+    completed = len(records)
+    if completed:
+        print(f"Resuming HumanEval from sample {completed + 1}/{len(selected)}")
     print(f"\nTask humaneval: {len(selected)} samples (generation only)")
     for sample_index, row in enumerate(selected, start=1):
+        if sample_index <= completed:
+            continue
         task_number = _task_sort_key(row)[1]
         seed_offset = task_number if isinstance(task_number, int) else sample_index
         request_seed = args.generation_seed + int(seed_offset) * 10
-        messages = [
-            {
-                "role": "user",
-                "content": PROMPT_TEMPLATE.format(prompt=row["prompt"]),
-            }
-        ]
+        messages = benchmark_messages(
+            PROMPT_TEMPLATE.format(prompt=row["prompt"]),
+            empty_system_prompt=args.empty_system_prompt,
+        )
         before = fetch_metrics(base_url, args.timeout)
         started = time.perf_counter()
         response = chat_completion(
@@ -360,6 +393,7 @@ def main() -> int:
             "metrics": metric_delta(before, after),
         }
         records.append(record)
+        append_benchmark_checkpoint(checkpoint_path, record)
         if (
             sample_index == 1
             or sample_index % args.progress_every == 0
@@ -389,6 +423,7 @@ def main() -> int:
         "progress_every": args.progress_every,
         "answer_metric": "HumanEval pass@1 (official tests, one sample per task)",
         "execution_policy": "separate restricted Docker container per task",
+        "system_prompt": "" if args.empty_system_prompt else "tokenizer_default",
     }
     with (output_dir / "requests.jsonl").open("w", encoding="utf-8") as handle:
         for record in records:

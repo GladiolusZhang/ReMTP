@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "head_transforms": [
+    {
+      "kind": "temperature",
+      "temperature": 0.7,
+      "top_k": 3,
+      "strength": 0.0
+    },
+    {
+      "kind": "temperature",
+      "temperature": 0.5,
+      "top_k": 3,
+      "strength": 0.0
+    },
+    {
+      "kind": "temperature",
+      "temperature": 0.3,
+      "top_k": 3,
+      "strength": 0.0
+    },
+    {
+      "kind": "temperature",
+      "temperature": 0.5,
+      "top_k": 3,
+      "strength": 0.0
+    },
+    {
+      "kind": "temperature",
+      "temperature": 0.4,
+      "top_k": 3,
+      "strength": 0.0
+    },
+    {
+      "kind": "temperature",
+      "temperature": 0.4,
+      "top_k": 3,
+      "strength": 0.0
+    }
+  ],
+  "depth_policy": "For MTP depth < 6 use the leading transforms; for depth > 6 reuse the sixth-head transform."
+}

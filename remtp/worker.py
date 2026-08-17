@@ -36,7 +36,7 @@ class ProbabilisticMTPWorker(Worker):
 
 
 class TargetModeRegretWorker(Worker):
-    """High-confidence target-mode rescue with within-block regret."""
+    """Target-anchored mode/band rescue with within-block regret."""
 
     def init_device(self, *args: Any, **kwargs: Any) -> Any:
         from remtp.probabilistic_mtp import install_probabilistic_mtp
@@ -44,6 +44,64 @@ class TargetModeRegretWorker(Worker):
 
         install_probabilistic_mtp()
         install_target_mode_regret()
+        return super().init_device(*args, **kwargs)
+
+
+class RiskEntropyMTPWorker(Worker):
+    """Schemes 1, 2 and 1+2 over full-distribution native MTP."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+        from remtp.risk_entropy_mtp import install_risk_entropy_mtp
+
+        install_probabilistic_mtp()
+        install_risk_entropy_mtp()
+        return super().init_device(*args, **kwargs)
+
+
+class AdaptiveChainMTPWorker(Worker):
+    """Scheme 3's entropy-aware dynamic-chain fallback."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.adaptive_chain_mtp import install_adaptive_chain_mtp
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_adaptive_chain_mtp()
+        return super().init_device(*args, **kwargs)
+
+
+class Fixed6MicroTreeWorker(Worker):
+    """Experimental strict Fixed-6 worker; non-chain GDN is opt-in."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.fixed6_vllm import install_fixed6_microtree
+
+        install_fixed6_microtree()
+        return super().init_device(*args, **kwargs)
+
+
+class ProposalCalibratedMTPWorker(Worker):
+    """Strict probabilistic MTP with target-free proposal calibration."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+        from remtp.proposal_calibration import install_proposal_calibration
+
+        install_probabilistic_mtp()
+        install_proposal_calibration()
+        return super().init_device(*args, **kwargs)
+
+
+class PrefixCreditMTPWorker(Worker):
+    """Native-MTP prefix-credit relaxation and joint verification."""
+
+    def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.prefix_credit_mtp import install_prefix_credit_mtp
+        from remtp.probabilistic_mtp import install_probabilistic_mtp
+
+        install_probabilistic_mtp()
+        install_prefix_credit_mtp()
         return super().init_device(*args, **kwargs)
 
 

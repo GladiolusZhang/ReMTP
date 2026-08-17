@@ -32,12 +32,16 @@ _CAPTURE_ALIGNED_HIDDEN_STATES = False
 _BONUS_LOGITS_HOOK: Any | None = None
 _DRAFT_HIDDEN_HOOK: Any | None = None
 _DRAFT_LOGITS_HOOK: Any | None = None
+_DRAFT_PROBS_HOOK: Any | None = None
+_DRAFT_TEMPERATURE_HOOK: Any | None = None
 
 
 def sample_mtp_logits(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     generators: dict[int, torch.Generator],
+    *,
+    proposal_depth: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Temperature-sample MTP logits and return both token IDs and q.
 
@@ -62,10 +66,28 @@ def sample_mtp_logits(
         torch.ones_like(temperatures),
         temperatures,
     )
+    if _DRAFT_TEMPERATURE_HOOK is not None:
+        safe_temperatures = _DRAFT_TEMPERATURE_HOOK(
+            safe_temperatures,
+            proposal_depth,
+        )
+        if safe_temperatures.shape != temperatures.shape:
+            raise RuntimeError("draft temperature hook changed tensor shape")
     probs = torch.softmax(
         raw_logits / safe_temperatures.unsqueeze(-1),
         dim=-1,
     )
+    if _DRAFT_PROBS_HOOK is not None:
+        probs = _DRAFT_PROBS_HOOK(
+            probs,
+            raw_logits,
+            temperatures,
+            proposal_depth,
+        )
+        if probs.shape != raw_logits.shape:
+            raise RuntimeError("draft probability hook changed tensor shape")
+        probs = probs.to(device=raw_logits.device, dtype=torch.float32)
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-30)
 
     exponential_noise = torch.empty_like(probs)
     exponential_noise.exponential_()
@@ -134,6 +156,7 @@ def _sample_from_full_mtp_distribution(
         logits,
         temperatures,
         sampling_metadata.generators,
+        proposal_depth=proposal_depth,
     )
     _LAST_GENERATOR_ROWS = tuple(sorted(sampling_metadata.generators))
     self._remtp_current_draft_probs.append(probs.contiguous())
@@ -357,6 +380,26 @@ def set_draft_logits_hook(hook: Any | None) -> None:
     global _DRAFT_LOGITS_HOOK
 
     _DRAFT_LOGITS_HOOK = hook
+
+
+def set_draft_probs_hook(hook: Any | None) -> None:
+    """Optionally calibrate q after its single required softmax.
+
+    A probability hook is preferable for top-k mass transforms because the
+    calibrated tensor is sampled directly and is the same tensor cached for
+    strict rejection/residual sampling.  With no hook installed, the native
+    probabilistic-MTP path is bit-for-bit unchanged.
+    """
+    global _DRAFT_PROBS_HOOK
+
+    _DRAFT_PROBS_HOOK = hook
+
+
+def set_draft_temperature_hook(hook: Any | None) -> None:
+    """Fold head calibration into the native proposal softmax temperature."""
+    global _DRAFT_TEMPERATURE_HOOK
+
+    _DRAFT_TEMPERATURE_HOOK = hook
 
 
 def install_probabilistic_mtp() -> None:

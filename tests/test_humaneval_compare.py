@@ -72,6 +72,7 @@ class HumanEvalCompareTest(unittest.TestCase):
             self._write(root, "native_mtp", pass_at_1=0.8, e2e=140, mal=3.8)
             rows = compare(root, ["cactus", "native_mtp"])
             native = rows[1]
+            self.assertEqual(native["result_source"], "new")
             self.assertAlmostEqual(native["pass_at_1_delta_pp"], 10.0)
             self.assertLess(native["e2e_delta_pct"], 0)
             self.assertNotIn("pareto_pass", native)

@@ -1,6 +1,11 @@
 # ReMTP：最小可观察 Qwen3.5 MTP
 
-这个仓库只做一件事：用 vLLM 启动 `Qwen/Qwen3.5-4B` 的 MTP，并在服务端终端逐轮打印：
+> 当前仓库已经从最小 Qwen MTP trace 扩展到概率 MTP、Cactus、
+> SpecCascade、ReMTP、GSM8K/HumanEval、MiMo/FastMTP 与树验证研究。
+> 所有阶段、负结果、有效入口和后续修改统一记录在
+> [研究与开发总日志](docs/research_and_development_log.md)。
+
+这个仓库最初用于用 vLLM 启动 `Qwen/Qwen3.5-4B` 的 MTP，并在服务端终端逐轮打印：
 
 1. MTP 草稿 token；
 2. 目标模型对每个草稿位置生成的 token；
