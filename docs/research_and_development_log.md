@@ -2497,7 +2497,7 @@ MTP-only 稀疏纠正覆盖树、单次 Tree Attention 目标验证、候选条�
 
 ### 2026-08-17：整理并准备上传当前 Residual-Aligned Tree MTP 代码快照
 
-状态：`代码快照已通过 CPU 测试并准备推送；本条不声称新增 GPU 实验`
+状态：`代码快照已通过 CPU 测试并推送 GitHub；本条不声称新增 GPU 实验`
 
 鉴于工作区已经从早期 proposal calibration 扩展为 FastMTP/MiMo 适配、动态树验证、
 精确残差命中和完整 benchmark 工具链，新建分支
@@ -2533,3 +2533,8 @@ HumanEval，因此 GPU 可运行性和历史性能仅以此前相应日志条目
 部分文档记录 pilot 数值，但原始结果 artifacts 仍只在本地 ignored 目录。上传不会包含
 模型权重、数据、实验输出或本地 `.vscode` 配置。正式质量结论仍需选定方法的独立大样本
 与第二 seed 验证。
+
+上传记录：代码快照提交为 `389a4b1`（`add residual-aligned tree MTP
+research stack`），已成功推送到
+`origin/research/residual-aligned-tree-mtp`。原 `research/proposal-calibrated-mtp`
+和 `main` 均未被改写。
