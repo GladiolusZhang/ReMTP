@@ -2538,3 +2538,992 @@ HumanEval，因此 GPU 可运行性和历史性能仅以此前相应日志条目
 research stack`），已成功推送到
 `origin/research/residual-aligned-tree-mtp`。原 `research/proposal-calibrated-mtp`
 和 `main` 均未被改写。
+
+### 2026-08-17：建立 Neurocomputing 中文论文初稿与 Elsevier 模板工程
+
+状态：`中文初稿与实验框架完成；静态检查通过；PDF 未编译；正式实验仍待补`
+
+按用户指定地址下载 Elsevier `elsarticle.zip` 并解压到独立论文目录。下载文件
+`paper_zh/template_download/elsarticle.zip` 的 SHA-256 为
+`0b093093e84db49f99bcc9a7c3f69ed1fb61b0147c6d296427aff7963e7f50f6`。
+论文采用 `elsarticle` 数字引用格式与 XeLaTeX/CTeX 中文工程，题目暂定为
+“面向端侧原生多 Token 预测的残差对齐树式松弛验证”。
+
+论文方法部分以当前选定的 `residual_hit_anchor` runtime 为唯一正式方法：FastMTP 的
+一个训练物理 MTP head 递归构造三步 sampled primary path，在最多 9 个节点内增加
+高 Q sibling；目标模型一次 Tree Attention forward 验证全树；主路径使用候选条件化
+临时分布 `H` 完成概率接受与 `max(H-Q,0)` 残差纠正；correction 必须先独立采样，随后
+才允许查询 sibling token-ID 精确命中；命中只复用已验证状态并追加一个原始 target
+anchor。论文没有把候选树写成 correction 选择器，也明确指出该松弛分布建立在已有
+constrained relaxed sampling 思路上，避免把已发表的候选概率提升公式误写为独立原创。
+
+初步结果只引用本地 ignored 目录
+`results/fastmtp_residual_anchor_n100/` 中已经真实完成的 100 条 GSM8K 与 100 条
+HumanEval。正文填入 Native FastMTP、Cactus、SpecCascade 和当前方法的质量、MAL、
+吞吐与节点数；同时加入 Wilson 95% 区间、相对 Native 的配对翻转计数和 McNemar 精确
+检验。稿件明确报告当前方法虽将 MAL 提高到 `3.581/3.523`，但 E2E 只有
+`117.576/115.666 tok/s`，低于链式实现；现有结果只支持算法级接受长度和 residual
+reuse 机制，不支持“已经端侧加速”或“能源效率提升”。消费级 RTX 4090 以外的嵌入式
+平台、功耗、全量任务、多 seed、kernel 优化和节点预算消融均标为待测。
+
+新增/受影响文件：
+
+- `paper_zh/main.tex`、`paper_zh/math_commands.tex`：Elsevier 主文件和统一记号；
+- `paper_zh/sections/*.tex`：中文摘要、引言、相关工作、预备知识、方法、系统实现、
+  实验、讨论、结论、声明和补充材料；
+- `paper_zh/figures/*.tex`：方法流程与 residual-hit 示例的 TikZ 图；
+- `paper_zh/references.bib`：正文实际引用的 18 篇文献；
+- `paper_zh/PAPER_PLAN.md`、`paper_zh/CLAIMS_EVIDENCE.md`、`paper_zh/README.md`：
+  论文叙事、证据边界、编译与补实验说明；
+- `paper_zh/template_download/`、`paper_zh/elsarticle_template/`：用户指定的原始模板与
+  解压内容；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：重新核对当前 100 题汇总、逐题质量记录和 tree audit；静态检查 15 个 TeX 文件、
+18 个 BibTeX key、18 个正文 citation key、36 个 label 和 22 个 ref/eqref，未发现缺失
+引用、未定义 label、重复 label 或大括号不平衡；`git diff --check` 通过；模板 checksum
+与下载后记录一致。另用当前实现做 CPU 数值核对，验证候选条件化分布归一化、
+`TV(H,P)=H(y)-P(y)`，并核对两项 100 题审计均满足
+`MAL=1+ordinary_depth+all_round_hit_rate`。当前机器未安装 `xelatex`、`latexmk`、
+`pdflatex`、`lualatex` 或
+`tectonic`，因此未运行 LaTeX/PDF 编译，也未声称编译通过。按 `paper-write` 流程两次
+请求外部 Claude 交叉审阅，但默认与 Sonnet 通道均因服务端 `503 model_not_found`
+失败，未获得或伪造外部审阅意见。
+
+限制：作者姓名、单位、基金与 CRediT 仍需作者填写；中文稿还需在方法和实验冻结后翻译
+为英文。正式投稿前必须完成 `paper_zh/CLAIMS_EVIDENCE.md` 列出的多 seed、全量任务、
+嵌入式设备、能耗、树节点 Pareto 与 fused-kernel 实验，并按届时有效的 Neurocomputing
+作者指南更新格式和生成式 AI 使用声明。实验 artifacts 继续只保留在 ignored
+`results/` 与 `logs/`，本次没有发布或上传报告数据。
+
+### 2026-08-17：生成并验收 Neurocomputing 中文论文 PDF
+
+状态：`PDF 编译成功；28 页；引用完整；仍是含占位信息和待补实验的中文初稿`
+
+在没有系统级 TeX Live、且无免密 sudo 的环境中，于用户目录安装 Tectonic 0.15.0，
+实际执行 XeTeX、BibTeX 与两次附加 TeX rerun，生成
+`paper_zh/build/main.pdf`。初稿创建条目中“PDF 未编译”的状态由本条显式取代。
+
+为使文稿可编译且可读，本工作单元修复了 TikZ 样式名与内置 `anchor` key 冲突、
+LaTeX 正文中的未转义 `TREE_ATTN` 下划线，将机制审计表和附录宽表缩放到版心内，
+把两张方法图固定到对应方法段落，并调整总览图说明框以消除节点遮挡；同时启用彩色
+文本链接，移除默认的红色引用边框。`paper_zh/README.md` 已更新为当前可复现的 Tectonic
+命令和 PDF 输出位置。
+
+受影响文件：
+
+- `paper_zh/main.tex`：加入浮动体控制和可读的超链接样式；
+- `paper_zh/figures/method_overview.tex`、`paper_zh/figures/residual_hit_example.tex`：
+  修复 TikZ 冲突、遮挡与布局；
+- `paper_zh/sections/04_method.tex`、`05_implementation.tex`、`06_experiments.tex`、
+  `A_supplement.tex`：图表定位、转义和宽表修复；
+- `paper_zh/README.md`：记录实际编译方式与历史状态取代说明；
+- `paper_zh/build/main.pdf`、`paper_zh/compile.log`、`paper_zh/build/main.log`：本地构建产物；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：Tectonic 最终退出码为 0；`pdfinfo` 报告 Letter 页面、28 页、PDF 1.5，最终文件
+约 518 KiB；`pdffonts` 确认中文 Fandol 与 Latin Modern 字体均已嵌入；编译日志未发现
+未定义 citation、reference、重复 label 或致命错误。使用 `pdftoppm` 和本地图像查看器
+人工抽查标题页、方法总览图、残差命中图、主结果表、机制审计表与附录表，确认正文和
+表格未被裁切，方法图不再重叠。没有在本工作单元运行 GPU smoke、GSM8K 或 HumanEval，
+论文中的实验值仍完全沿用此前已经记录的本地结果。
+
+限制：作者、单位、基金和 CRediT 仍为占位内容；文稿仍有少量不影响裁切的 overfull/
+underfull 排版警告，以及若干参考文献缺页码的 BibTeX warning；Tectonic bundle 自带的
+`algorithm.sty` 还报告一个包内部 UTF-8 replacement warning。当前 PDF 是中文审阅稿，
+不是可直接提交的英文终稿；正式投稿所需的大样本、多 seed、端侧设备、能耗与 kernel
+实验仍待完成。PDF 与编译日志属于本地论文构建产物，本条不表示已推送 GitHub。
+
+### 2026-08-18：调整论文写作风格、章节结构与规模化实验图位
+
+状态：`中文稿改写完成；PDF 重新编译成功；未新增或改写实验事实`
+
+按作者写作偏好完成全稿措辞清理：删除使用“只有……才……”“只……不……”以及
+“不是……而是……”强化边界的表达，改用正向陈述、执行顺序和概率语义说明方法约束。
+同时撤销独立的“讨论”章节，将其中的机制解释、质量行为、MAL 与端到端速度差距、
+运行时优化方向及有效性范围融入实验章节；引言中的章节导航和 README 结构说明同步
+更新。原 `paper_zh/sections/07_discussion.tex` 已删除，改写前原稿备份位于仓库外临时
+目录 `/tmp/remtp-paper-backup-20260818-cUnYX5/paper_zh`。
+
+实验章节新增三处正式规模插图位：质量--MAL Pareto、节点规模--系统收益、不同拒绝
+深度的 residual-hit 来源。占位图明确给出横纵轴、颜色、点形、节点大小、多 seed
+误差条和多设备分面要求。`paper_zh/PAPER_PLAN.md` 进一步记录图表规范，并根据当前
+100 题结果给出内部运行检查区间；这些区间明确标记为规划用途，没有写入论文正文，
+也没有伪装成已完成的大规模实验结果。
+
+受影响文件：
+
+- `paper_zh/main.tex`：移除独立讨论章节入口；
+- `paper_zh/sections/00_abstract.tex`、`01_introduction.tex`、`02_related_work.tex`、
+  `03_background.tex`、`04_method.tex`、`05_implementation.tex`、`06_experiments.tex`、
+  `08_conclusion.tex`：措辞、结构、实验分析和结论改写；
+- `paper_zh/sections/07_discussion.tex`：内容并入实验与结论后删除；
+- `paper_zh/PAPER_PLAN.md`、`CLAIMS_EVIDENCE.md`、`README.md`：图表计划、证据措辞、
+  章节与编译状态同步；
+- `paper_zh/build/main.pdf`、`paper_zh/compile.log`、`paper_zh/build/main.log`：重新构建；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：对正文、论文计划、证据表和 README 扫描指定句式，未发现“只有”“才”“不是”
+“而是”“而非”“不只是”或残留“讨论”章节引用；所有 `sections/*.tex` 均被 `main.tex`
+引用，无过期章节文件。使用 Tectonic 0.15.0 实际运行 XeTeX、BibTeX 和两次附加 TeX
+rerun，退出码为 0，生成 29 页 PDF；编译日志未发现未定义 citation/reference、重复
+label 或致命错误。人工抽查三个新增图位、机制表、结论与参考文献页面，未见裁切。
+本工作单元没有运行 GPU smoke、GSM8K、HumanEval 或新的大规模实验，正文数值继续来自
+此前记录的同一批本地 100 题结果。
+
+限制：新增插图仍为排版占位框，需要正式多 seed 与多设备结果生成真实曲线后替换；
+内部检查区间来源于单 seed 小样本，不构成论文证据。作者信息、基金、CRediT、嵌入式
+设备、能耗、全量任务和 fused-kernel 结果仍待补充。编译仍保留少量表格 overfull/
+underfull warning、参考文献缺页码 warning，以及 Tectonic bundle 的
+`algorithm.sty` UTF-8 replacement warning；这些警告未造成当前抽查页面裁切。
+
+### 2026-08-18：RAVEN 引入 native-MTP 深度校准松弛
+
+状态：`代码与中文方法稿已实现；CPU/单元测试通过；GPU pilot 尚未运行`
+
+将 RAVEN 主路径的统一松弛参数改为 native-MTP 深度相关参数
+`delta_i = delta * w_i`。新增的 `relaxation_depth_weights` 使用 1-based 逻辑 MTP
+深度；空 schedule 保持历史 uniform-delta 行为，显式 schedule 需要非负、有限且单调
+不增。当运行深度超过 schedule 长度时延用末项，避免后续逻辑 head 恢复为更激进的
+首位置预算。该有效 `delta_i` 同时用于构造候选条件化验证分布、接受概率和
+`(H_i-Q_i)_+` rejection residual，因此接受分支与纠正分支继续以同一个临时分布为
+概率目标。逐节点 audit 新增 `relaxation_depth_weight` 与
+`effective_relaxation_delta`，可直接核对运行时是否采用预期 schedule。
+
+中文活动稿 `paper_zh/修改版.md` 同步加入深度可靠度标定：先从无答案标签的严格验证
+trace 估计各位置接受率，再通过单调包络和归一化权重形成 `w_i`。根据现有 GSM8K
+`88.9/78.3/69.9%` 与 HumanEval `88.4/74.6/65.3%` 统计，新增均值为 1、保持
+`sum(delta_i)=D*delta` 名义预算的 pilot 配置 `(1.143, 0.986, 0.871)`，并提供平方
+重分配消融 `(1.290, 0.960, 0.750)`。由于候选概率提升为非线性变换，逐节点审计另行
+记录 `relaxation_tv=H_i(y_i)-P_i(y_i)`，不把名义预算相同解释为实际 TV 完全相同。
+原 `main.tex`、`sections/` 和 29 页 PDF 尚未同步该公式，
+`paper_zh/README.md` 已加入醒目的历史/取代说明，当前审阅以 `修改版.md` 为准。
+
+新增统一实验入口 `scripts/run_fastmtp_raven_depth_relaxation.sh`。默认一次运行
+`uniform`、`empirical` 与 `squared` 三个 RAVEN profile，并在相同 FastMTP、采样题目、
+温度、seed、空 system 与 no-think 协议下共享 Native/Cactus/SpecCascade 基线。脚本支持
+自定义三项 schedule、复用协议一致的历史 baseline、逐请求进度与断点续跑。新增报告器
+将 GSM8K 和 HumanEval 的质量、MAL、E2E、draft acceptance、节点数与截断率汇总到同一
+Markdown，并按深度报告实际有效 delta、实际 TV 和主路径接受率。`CONTROL_ROOT` 还能
+复用协议一致的历史 uniform RAVEN 与三项 baseline，使后续 100 题实验集中运行新增的
+深度校准 profile；旧 audit 缺少的实际 TV 在合并表中保持为空，不进行推算。
+
+受影响文件：
+
+- `remtp/dynamic_mtp_tree.py`：深度 schedule、有效 delta、三类动态树验证路径与审计字段；
+- `remtp/dynamic_tree_vllm.py`：环境变量解析和启动 marker；
+- `scripts/serve_fastmtp_verified.sh`、`scripts/serve_fastmtp_dynamic_tree.sh`、
+  `scripts/run_fastmtp_verified_comparison.sh`：运行时参数透传；
+- `scripts/run_fastmtp_raven_depth_relaxation.sh`：可复现的三 profile 测试入口；
+- `remtp/raven_depth_relaxation_report.py`：合并报告和逐深度机制审计；
+- `tests/test_dynamic_mtp_tree.py`、`tests/test_raven_depth_relaxation_report.py`：数值、
+  参数约束、环境解析和报告审计测试；
+- `paper_zh/修改版.md`、`paper_zh/README.md`：方法公式、算法伪代码、贡献表述和版本说明；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：四个 shell 入口通过 `bash -n`；三个 Python 模块通过 `py_compile`；仓库完整测试
+为 `338 passed in 6.39s`；深度数值测试验证 `w=(1,0.5,0.25)` 时三个位置分别使用
+`delta_i=(1,0.5,0.25)`，并按对应公式生成不同的 `H_i(y_i)`；`git diff --check`
+通过。实验脚本的 `--help` 已实际执行并正确展示默认、定制与 baseline 复用命令。
+
+限制：本工作单元未启动 vLLM、未运行 GPU smoke，也未产生新的 GSM8K/HumanEval
+结果，因而尚不能声称深度校准提高质量、MAL 或吞吐。当前 schedule 来自既有单 seed
+统计，正式论文应使用与测试集隔离的校准请求、多 seed 复现，并报告 uniform、经验衰减
+和更强衰减的质量--MAL Pareto。实验 artifacts 继续保留在 ignored `results/` 与
+`logs/`，本次未上传任何结果或报告。
+
+### 2026-08-18：RAVEN 深度校准 pilot 启动失败与服务归属检查修复
+
+状态：`GPU pilot 未进入生成阶段；根因已定位；启动防护已修复；待释放 GPU 后重跑`
+
+首次执行 `scripts/run_fastmtp_raven_depth_relaxation.sh` 时，uniform profile 在 native
+基线启动后报告缺少 `[ReMTP][ProbMTP][diagnostic]`。该提示不是算法 adapter 的根因。
+现场检查确认 PID 224375 的旧 dynamic-tree vLLM 服务仍监听 8000 端口，其 EngineCore
+占用约 22056 MiB 显存。新 native EngineCore 仅检测到 1.71/23.65 GiB 空闲显存，低于
+`gpu_memory_utilization=0.9` 所需的 21.28 GiB，因而在模型初始化阶段退出。旧服务仍能
+响应 `/health`，原等待逻辑错误地将该响应归属于本次新进程，随后才在 adapter marker
+检查中暴露异常。本次运行没有进入 GSM8K/HumanEval 生成阶段，不形成可用实验结果。
+
+修复包含两部分。第一，比较脚本在整套实验开始前和每个方法启动前使用 TCP 连接检查
+端口占用，发现已有监听者时立即退出并给出 `ss` 排查命令。第二，服务健康判定同时要求
+本次启动日志出现预期 Worker marker、`Application startup complete.`，本次 server PID
+仍存活并且 `/health` 可访问，避免其他进程的健康端点造成假阳性。四个 verified Worker
+的 `worker=active` marker 也移动到 `super().init_device()` 成功返回以后；以后该 marker
+表示 GPU Worker 完成初始化，不再表示运行时补丁刚安装但模型尚未初始化。
+
+受影响文件：
+
+- `scripts/run_fastmtp_verified_comparison.sh`：TCP 端口占用检查、方法级启动前复检，以及
+  与本次启动日志绑定的健康判定；
+- `remtp/fastmtp_verified_worker.py`：四类 Worker 的 active marker 延后到设备初始化成功后；
+- `docs/research_and_development_log.md`：本条失败实验与修复记录。
+
+验证：在旧 PID 仍占 8000 的现场实际执行入口脚本，脚本以退出码 2 立即停止，并准确
+报告 `Port for http://127.0.0.1:8000 is already occupied`；两个 shell 入口通过
+`bash -n`，Worker 模块通过 `py_compile`，仓库测试为 `338 passed in 6.57s`。没有终止
+用户已有进程，也没有在修复后再次运行 GPU smoke 或 benchmark。
+
+限制：旧 dynamic-tree 进程及其 EngineCore 仍由用户控制；重跑前需正常停止进程组
+224375 并确认 8000 端口及显存释放。启动归属修复解决错误诊断，不代表 RAVEN 的 uniform、
+empirical 或 squared profile 已通过 GPU 验证，也不提供任何质量、MAL 或吞吐结论。
+
+### 2026-08-18：中文活动稿 Markdown 数学公式恢复
+
+状态：`文档修复完成；数学定界符静态检查通过；未重新编译 PDF`
+
+修复 `paper_zh/修改版.md` 中由错误转义和富文本转换造成的公式丢失。原文件第 3、4 节
+存在 `**\$\$...`、空变量、截断下标、零宽字符混入正部运算符等问题，导致前缀
+`y_{<i}`、严格接受率、拒绝残差、候选树条件和目标条件分布无法正常渲染。本次将这些
+内容统一恢复为标准 Markdown 行内数学 `$...$` 和独立展示数学 `$$...$$`。
+
+恢复的数学内容包括：递归 native-MTP proposal、严格概率接受与 residual correction、
+松弛接受与统一残差、MAL 定义、稀疏树候选条件、Tree Attention 条件分布、基于严格
+接受率的单调深度可靠度、归一化权重、`delta_i=delta*w_i`、候选条件化临时分布、精确
+TV、松弛接受率、残差对齐 correction、exact sibling match 与 target anchor。另从
+LaTeX 方法源稿恢复概率语义说明和 MAL 分解，并补充单轮时间与算法级吞吐表达式。新加入
+的 native-MTP 深度校准公式及 empirical/squared 权重保持不变。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：第 1--4 节标题规范化，第 3、4 节全部数学表达恢复，并补回概率
+  语义、MAL 分解与计算开销公式；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：静态扫描未发现残留的转义美元符号、`$$$$`、粗体包裹展示公式或截断数学标记；
+检测到 58 条成对展示定界符，对应 29 个闭合展示公式块；所有非代码行的行内美元符号
+成对，展示公式和代码围栏均闭合；`git diff --check -- paper_zh/修改版.md` 通过。
+
+限制：`paper_zh/修改版.md` 当前仍是未纳入 Git 基线的活动稿，无法生成可靠的历史逐行
+diff。本工作单元没有把活动稿同步到 `sections/*.tex`，没有运行论文 PDF 编译，也没有
+修改算法代码或运行 GPU/benchmark。新增吞吐表达式是系统分析用近似式，正式投稿版本
+仍需结合真实 measured latency 说明其适用范围。
+
+### 2026-08-18：生成并嵌入 RAVEN 图 1 架构图
+
+状态：`论文位图已生成、人工检查并嵌入中文活动稿；尚未进入 LaTeX PDF`
+
+使用内置图像生成能力制作 RAVEN 单轮 speculative decoding 总体架构图。图采用横向
+五阶段布局，依次表示 committed prefix、native-MTP sparse proposal tree、单次 target
+Tree-Attention forward、native-MTP 深度校准松弛、acceptance/rejection recovery 与
+最终 commit。主路径和接受流使用蓝色，backup state 与 residual exact hit 使用绿色，
+rejection/correction 使用橙色，target-model computation 使用灰色。图中显式展示
+`delta_i = delta * w_i`、`P_i -> H_i` 和松弛接受概率，并将 `Sample correction c_i`
+放在 `Exact token-ID match` 之前，保持先确定 correction、再查询预验证树状态的因果顺序。
+
+首版生成后进行了单点图像修订，将三行普通 `delta1/delta2/delta3` 改为带希腊字母和下标
+的 `δ₁/δ₂/δ₃`，其余布局和标记保持不变。最终 PNG 为 1692x929、8-bit RGB、约 1.1 MiB；
+中文活动稿原图位占位符已替换为相对路径 Markdown 图片引用。
+
+受影响文件：
+
+- `paper_zh/figures/raven_figure1_architecture.png`：新增图 1 位图；
+- `paper_zh/修改版.md`：图 1 占位符替换为实际图片引用；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：使用本地图片查看工具按高细节重新打开最终文件，人工核对五阶段顺序、三层 MTP
+主路径、backup siblings、一次 target forward、三项深度预算、接受/拒绝分支、MISS/HIT、
+validated-state reuse、target anchor 与颜色图例。`file` 确认输出为 1692x929 非隔行 PNG；
+未覆盖仓库已有图；Markdown 引用使用项目内相对路径。
+
+限制：该图由位图模型生成，文字与线条无法像原生 TikZ/SVG 一样逐对象编辑，正式双栏
+排版中的最小字号仍需在 PDF 实际尺寸下检查。当前 `main.tex` 继续使用原有
+`figures/method_overview`，本工作单元没有切换 LaTeX 图源、没有编译 PDF，也没有运行
+算法测试或 GPU benchmark。
+
+### 2026-08-19：RAVEN 饱和感知的块内自适应松弛
+
+状态：`算法、运行入口和审计报告已实现；完整 CPU 测试通过；100 题 GPU 实验待用户运行`
+
+根据 20 题 depth-relaxation pilot 中 uniform profile 优于固定 empirical/squared
+schedule 的现象，将固定深度重加权替换为当前块自适应的实际 TV 分配。新机制以 uniform
+候选条件化变换产生的逐位置实际 TV 为控制预算。对于 sampled-Q 主路径，每个位置先将
+候选提升量截断到 `h_i(y_i)=q_i(y_i)` 的接受饱和点；该截断保持该位置接受概率为 1，
+同时回收继续提升候选但无法增加接受率的 TV。未饱和位置保留 uniform 提升量，因此自适应
+配置在数值误差范围内不会降低任一主路径位置的 uniform 接受概率。
+
+回收预算的默认 50% 通过 16 次小步分配给当前块仍未饱和的位置。每步效用采用链式期望
+MAL 对候选 TV 的局部斜率 `reach_i * suffix_i / q_i(y_i)`，再乘轻量目标相对支持项
+`(p_i(y_i)/p_i,max)^0.25`。`reach_i` 表示前缀到达概率，`suffix_i` 表示该位置能够解锁的
+后续长度价值。单位置实际 TV 受 uniform TV 的 1.5 倍和接受饱和点双重约束；块内实际 TV
+总量不超过 uniform 控制。实现将最终实际 TV 反解为逐块、逐位置动态 `delta_i` 与
+`w_i=delta_i/delta`，所以论文与 audit 仍可使用深度松弛记号，同时权重会随 P/Q、前缀
+可达率和后续价值改变。该分配使用本轮完整验证后已有的 P/Q，属于 block-aware relaxed
+verification；它没有增加 target forward，输出分布仍是近似的松弛目标，不能表述为严格
+恢复原目标分布。
+
+新增 `scripts/run_fastmtp_raven_adaptive_relaxation.sh` 作为 100 题确认入口。默认在相同
+FastMTP、temperature=0.6、seed=42、空 system、no-think、MTP depth=3 与 9 节点残差树
+协议下运行 Native、Cactus、SpecCascade、RAVEN uniform 和 RAVEN adaptive。三项链式
+baseline 运行一次后通过只读链接复用于 adaptive profile；脚本逐题输出进度、支持
+`RESUME_PARTIAL=1` 断点续跑，也可通过 `CONTROL_ROOT` 复用协议一致的历史 uniform
+结果。合并报告同时给出质量、MAL、E2E、draft acceptance、节点数、逐深度动态权重/
+delta/TV/主路径接受率，以及每块 baseline TV、实际 TV、可回收 TV 与重新分配 TV。
+
+受影响文件：
+
+- `remtp/dynamic_mtp_tree.py`：自适应配置、饱和截断、期望-MAL 边际分配、显式候选分布
+  构造、动态 delta/weight 与逐节点审计；
+- `remtp/dynamic_tree_vllm.py`：五项自适应环境变量解析和运行时 marker；
+- `scripts/serve_fastmtp_verified.sh`、`scripts/serve_fastmtp_dynamic_tree.sh`、
+  `scripts/run_fastmtp_verified_comparison.sh`：自适应参数透传与配置打印；
+- `scripts/run_fastmtp_raven_adaptive_relaxation.sh`：uniform/adaptive 100 题统一实验入口；
+- `remtp/raven_adaptive_relaxation_report.py`：质量、性能、逐深度和块 TV 合并报告；
+- `tests/test_dynamic_mtp_tree.py`、`tests/test_raven_adaptive_relaxation_report.py`：饱和
+  回收、TV 上界、审计字段、随机分布性质和块预算去重统计测试；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：四个相关 shell 入口通过 `bash -n`；新报告器和实验入口的 `--help` 已实际执行；
+Python 源码通过 `compileall`；`git diff --check` 通过；仓库完整测试为
+`342 passed in 6.13s`。新增 32 组随机分布性质测试逐组确认 adaptive acceptance 不低于
+uniform、各位置 TV 不越过接受饱和点、块 TV 不超过 uniform。未运行 vLLM/GPU smoke，
+也未产生新的 GSM8K/HumanEval 指标。
+
+限制：该版本默认参数 `mix=0.5、max_ratio=1.5、target_power=0.25、steps=16` 是基于现有
+pilot 失败模式选择的单一确认配置，尚无 100 题或第二 seed 证据。块内分配读取后续验证
+位置的 P/Q 来估计长度边际价值，因而属于 relaxed block verification，并会改变 primary
+临时分布及 rejection residual；报告需同时核对任务质量和实际 TV。当前 Python 小步规划
+包含一次小型 GPU-to-CPU 同步，D=3 时计算量很小，但正式吞吐优化仍可改成融合 GPU
+实现。实验 artifacts 继续保留在 ignored `results/` 与 `logs/`，本次没有发布结果文件。
+
+### 2026-08-19：RAVEN-A 中文完整论文稿与 100 题确认结果回填
+
+状态：`中文 Markdown 完整稿已重写；RAVEN-A 两项 100 题结果已回填；LaTeX/PDF 尚未同步`
+
+将 `paper_zh/修改版.md` 从停留在方法第 4 节的深度固定权重活动稿重写为完整中文论文。
+当前故事以 RAVEN-A 为方法主体：uniform candidate-conditioned transform 提供块级实际 TV
+控制，接受饱和点回收无效预算，当前块的前缀可达率、后续长度价值、`q_i(y_i)` 与目标
+相对支持共同决定动态分配效用；第一次拒绝后仍按同一临时分布的正残差采样 correction，
+随后通过 exact token-ID sibling hit 复用目标状态并追加 target anchor。正文补齐摘要、
+引言、相关工作、预备知识、完整公式与伪代码、vLLM 实现、实验设置、主结果、机制归因、
+固定深度消融、实际 TV 审计、系统瓶颈、复现边界、结论、声明与 31 条参考文献。文稿延续
+既定写作约束，没有增加独立“讨论”章节，也没有使用强调式“只有……才”“不是……而是”
+句式。
+
+写作开始时 RAVEN-A 100 题任务由用户已有进程继续运行。该进程在本工作单元期间完成，
+本次没有启动、停止或修改实验。完成后的本地 ignored artifacts 显示：GSM8K 为
+`Accuracy=89.0%、MAL=3.611、Decode=118.858 tok/s、E2E=118.131 tok/s、
+nodes/round=6.337`；HumanEval 为 `pass@1=63.0%、MAL=3.545、
+Decode=117.413 tok/s、E2E=116.476 tok/s、nodes/round=6.316`。RAVEN-A 的块级实际
+TV 相对 uniform control 从 `0.2400` 降至 `0.1645`（GSM8K），从 `0.1736` 降至
+`0.1170`（HumanEval），对应 MAL 比 RAVEN-U 增加 `0.030/0.022`。条件 residual hit
+为 `57.8%/56.6%`，target forward calls/round 均为 1。结果来源为
+`results/raven_adaptive_n100/comparison.md` 及两个 adaptive task 目录，继续保留在 ignored
+`results/` 与 `logs/`，没有纳入代码提交。
+
+初稿写作时曾依据部分 checkpoint 和 RAVEN-U 结果设置 RAVEN-A 临时表格值。完整实验
+结束后，正文已全部换成实测值并移除 dagger；`paper_zh/估计数值清单.md` 单独记录每个
+临时值、最终值和结果路径。当前 `修改版.md` 不含估计实验数值，图 2--4 仍保留无数值
+的正式实验绘图说明。`paper_zh/README.md` 更新当前入口，`PAPER_PLAN.md` 与
+`CLAIMS_EVIDENCE.md` 增加历史版本提示，避免旧 RAVEN-U 说明与 RAVEN-A 正文冲突。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：完整论文重写、RAVEN-A 公式、实测表格与结论；
+- `paper_zh/估计数值清单.md`：新增临时值审计、实测取代记录和投稿前检查；
+- `paper_zh/README.md`：当前文稿入口、证据状态与历史 LaTeX 提示；
+- `paper_zh/PAPER_PLAN.md`、`paper_zh/CLAIMS_EVIDENCE.md`：历史/已取代提示；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：读取两项任务的 `summary.md`、`tree_metrics.md` 和合并 `comparison.md` 交叉核对
+质量、MAL、吞吐、节点数、TV、动态权重与 residual hit；Markdown 静态检查确认 76 个
+展示公式定界符、2 个代码围栏均成对，参考文献数量为 31；未发现 dagger、临时占位值、
+独立讨论章节或既定禁用强调句式；`git diff --check -- paper_zh` 通过。本工作单元没有
+修改算法代码，没有额外运行 pytest、GPU smoke 或 benchmark，也没有重新编译 PDF。
+
+限制：当前结论仍来自每个任务 100 条固定样本和单 generation seed。RAVEN-A 的
+GSM8K accuracy 相对 RAVEN-U 下降 4 个百分点，HumanEval pass@1 上升 3 个百分点，需
+多 seed 配对实验确认稳定性。现有 vLLM 树实现的 E2E 吞吐低于链式基线，端侧加速、
+能效和嵌入式适用性尚无证据。`main.tex`、`sections/` 与 `build/main.pdf` 继续保留上一版
+RAVEN-U 历史稿；图 1 的静态位置预算文字、图 2--4、作者信息、基金、全量任务、多设备
+和 fused-kernel 结果仍需在英文投稿版中更新。
+
+### 2026-08-19：论文增加 MAL—吞吐转换与跨 checkpoint 松弛诊断
+
+状态：`中文稿叙事与实验表已更新；归一化吞吐为公式推导量；未运行新 GPU 实验`
+
+根据当前 RAVEN-A 100 题实测和历史 Qwen3.5 同协议结果，将论文的
+结果叙事从单独强调 MAL 扩展为“MAL、实测 tok/s、等轮成本吞吐和任务
+质量”的联合核算。FastMTP 主表新增相对 Native 的 MAL/E2E 百分比变化。
+链式 Cactus/SpecCascade 的 MAL 与 E2E 分别同向增长，实测吞吐达到等轮
+成本归一化值的 99% 以上。RAVEN-A 相对 RAVEN-U 的 MAL 与 E2E 也在两项
+任务上同向增长，同时实际块 TV 下降约三分之一。
+
+新增等轮成本归一化量
+`V_norm = V_native * MAL_method / MAL_native`。由实测值推导得到，
+RAVEN-A 在 GSM8K/HumanEval 上的 `V_norm` 为 `149.467/146.572 tok/s`，当前
+实测为 `118.131/116.476 tok/s`，系统实现率为 `79.0%/79.5%`。根据
+`MAL / target-throughput` 反解，RAVEN-A 达到当前最快链式对照吞吐所需的
+单轮时延降幅为 `16.5%/15.5%`。这些值表示实现差距和 kernel 优化目标，
+未当作 fused-kernel 实测结果。
+
+新增的跨 checkpoint 诊断表来自已完成的 Qwen3.5-4B、MTP=6、temperature=0.7
+运行。GSM8K-200 中，目标侧统一松弛相对 Native 将 MAL/E2E 提高
+`30.3%/29.2%`，accuracy 下降 11.0 个百分点；HumanEval-164 中对应变化为
+`+7.1%/+5.6%/-14.0 pp`。SpecCascade 与历史 margin-calibrated MTP 松弛在质量
+变化较小时产生更温和的 MAL/E2E 收益。另引用 HumanEval-20 expected-regret
+Router pilot：Native 为 `70.0%/5.678/212.222 tok/s`，Router 为
+`50.0%/6.025/204.431 tok/s`，用于说明未校准 MTP 反馈可能同时伤害质量与
+吞吐。正文已明确标注这些诊断与 FastMTP 主表协议不同，且 FastMTP 主实验
+的 Cactus 未出现质量下降，因此没有将历史现象概括为普遍结论。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：新增方法类型对比、Qwen3.5 诊断表、主表 MAL/E2E 变化、
+  MAL—吞吐归一化公式、实现率与工程时延目标，更新摘要和结论；
+- `paper_zh/估计数值清单.md`：记录历史实测来源，将归一化吞吐与实测、
+  临时值分开，新增公式与数值边界；
+- `paper_zh/README.md`：更新当前证据状态和吞吐归一化说明；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：交叉读取
+`results/raven_adaptive_n100/comparison.md`、
+`results/gsm8k_three_schemes_remtp_20260804_232312/comparison.json`、
+`results/humaneval_comparison_remtp_20260804_232312/comparison.json` 和
+`results/humaneval_comparison_20260803_170514/comparison.json`；用实测 MAL/E2E 重新计算
+百分比变化、`V_norm`、实现率与单轮时延目标。Markdown 展示公式
+定界符、代码围栏和 31 条参考文献数量已做静态检查；`git diff --check -- paper_zh
+docs/research_and_development_log.md` 通过。本工作单元没有修改算法代码，没有运行
+pytest、GPU smoke、benchmark 或 PDF 编译。
+
+限制：RAVEN-A 主结果仍来自每项任务 100 个固定样本和单 generation seed。
+Qwen3.5 表用于解释方法取舍，与 FastMTP 主表不形成直接排名。HumanEval-20
+Router 结果属于小样本探索性证据。`V_norm` 假设各方法具有 Native 单轮成本，
+因此它量化算法潜力和实现差距，无法代替融合内核后的实测吞吐。当前
+RAVEN-A 实测 E2E 仍低于链式对照，端侧加速和能效结论继续留待融合 kernel、
+多 seed 和真实边缘设备实验。
+
+### 2026-08-19：论文实验范围改为 Gemma 4/FastMTP 与 RTX 4090/Orin NX
+
+状态：`论文协议与预注册目标已更新；新模型、量化和边缘设备实验尚未运行`
+
+按当前端侧研究范围，`paper_zh/修改版.md` 移除历史跨 checkpoint 诊断表及其结论，
+正式模型矩阵收敛为两类具有显式注意力的 MTP 路径：MiMo/FastMTP 的单物理 head
+递归复用，以及 Gemma 4 E2B 与官方 MTP assistant 的目标 KV 共享。Gemma 4 文本主干
+交替使用 sliding/full attention，论文将树 mask 定义为祖先可见性与原始窗口约束的
+交集；需要复制线性递归状态的模型不进入该实验矩阵。
+
+设备矩阵设为 NVIDIA RTX 4090 24GB 与 NVIDIA Jetson Orin NX 16GB。RTX 4090 使用
+BF16/8K context；Orin 使用 JetPack 6.2、固定 25W 功率配置、W4A16/2K context、
+batch size 1，并关闭非文本编码器。模型/设备内部使用相同精度和运行协议，跨设备按
+相对 Native speedup、显存、功率和 J/token 报告，避免将 BF16 与 W4A16 原始 tok/s
+直接解释为硬件收益。此前工作单元中暂写的 Super Mode/MAXN 表述已按用户决定删除。
+
+量化仓库审计得到：
+
+- `jedisct1/MiMo-7B-RL-GGUF` 是 `XiaomiMiMo/MiMo-7B-RL` 的 llama.cpp GGUF 转换，
+  文件列表只有目标 GGUF，未包含 TencentBAC/FastMTP 后训练物理 MTP head，也不匹配
+  当前 vLLM `TREE_ATTN` 分支状态提交路径；
+- `Siarhei/gemma-4-E2B-4bit` 的模型卡声明 `library_name=mlx`，面向 Apple MLX，基座为
+  `google/gemma-4-E2B`，没有配套 assistant，无法直接用于 Jetson CUDA/vLLM RAVEN；
+- Gemma Orin 路径改用 Google 官方
+  `google/gemma-4-E2B-it-qat-w4a16-ct` compressed-tensors checkpoint 与匹配 QAT
+  assistant；FastMTP Orin 路径需要从同一 FastMTP safetensors 生成 W4A16 权重并保留
+  MTP/LM head、normalization 和 activation 的 FP16 语义。
+
+正文新增完整任务协议：GSM8K test 1,319 题、HumanEval 164 题、三个 generation seeds；
+系统测量使用固定 GSM8K-200 与 HumanEval-164，20 请求预热和三次重复。正文表 9--10
+填入明确标记为“预注册目标值”的具体数值，避免空白占位；这些数值包括 Gemma 4 质量/MAL
+目标，以及两模型在 RTX 4090/Orin 上的 E2E、显存、功率和 J/token 目标。
+`paper_zh/Gemma4_Orin_预估实验值.md` 单独记录全部预测依据、第三方 checkpoint 排除原因、
+正式运行协议和逐项替换检查。未将任何预测值记录为已通过 benchmark。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：双模型双设备叙事、模型选择、量化协议、预注册数值表与引用；
+- `paper_zh/Gemma4_Orin_预估实验值.md`：新增预测值、依据和实测替换清单；
+- `paper_zh/估计数值清单.md`：区分历史临时值与当前跨模型预注册值；
+- `paper_zh/README.md`：更新当前证据边界与文档入口；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：通过 Hugging Face API/模型卡读取两个用户指定第三方仓库的格式、基座和文件列表；
+核对 Google 官方 Gemma 4 E2B QAT compressed-tensors target 与 QAT assistant 发布说明；
+使用 `rg` 检查当前中文正文已无历史模型名称和 Super/MAXN 表述，并运行 Markdown
+定界符、参考文献序号和 `git diff --check` 静态检查。本工作单元没有下载模型、转换
+FastMTP 权重、修改推理代码、编译 PDF、运行 pytest、GPU smoke 或 benchmark。
+
+限制：当前仓库尚无 Gemma 4 vLLM/Tree Attention adapter、Orin ARM64 运行环境或量化
+FastMTP checkpoint。Google W4A16 target 与 QAT assistant 的实际组合仍需加载与严格
+概率一致性测试；FastMTP 混合精度量化需验证完整 proposal distribution、residual sampler
+和 selected-leaf state commit。正文预注册数值不能用于摘要结论、显著性分析或投稿结果，
+正式运行后必须替换并记录估计误差。
+
+### 2026-08-19：中文论文重构为双模型消费级评测与单模型端侧评测叙事
+
+状态：`论文结构与内部数值审计已更新；本工作单元未产生新的 benchmark 结果`
+
+本条更新取代上一条记录中“正文表 9--10 采用预注册目标值”的写作组织。论文按照完整
+研究问题组织实验，不再围绕已有 100 题开发日志划分正文边界。RTX 4090 实验矩阵包含
+MiMo/FastMTP 与 Gemma 4 E2B 两类 MTP 结构，Jetson Orin NX 16GB 端侧矩阵聚焦
+FastMTP-W4A16。质量评测协议写为 GSM8K 完整 test split（1,319 题）和 HumanEval
+完整 164 题，并采用三个 generation seeds；系统吞吐协议使用固定 GSM8K-256 与
+HumanEval-164、20 请求预热和三次重复。
+
+正文实验章节重新按研究问题、平台矩阵、质量—MAL、RTX 4090 系统性能、Orin 端侧
+性能、机制分解、消融和稳定性组织。摘要、实验与结论使用一致的正式论文表述，不再出现
+“已完成”“等待补齐”“占位”或“终稿更新”等项目进度语言。图 1 图注改为直接描述
+饱和截断、预算回收、动态重分配和 residual correction/leaf-state reuse 数据流。
+
+由于本工作单元没有运行双模型、完整任务、融合 Tree Attention 或 Orin 实验，正文中
+对应的完整规模表格属于写作用外推数值。它们的来源属性、历史实测锚点、W4A16 内存
+估算和逐项替换顺序集中记录在 `paper_zh/Gemma4_Orin_预估实验值.md`，不在正文使用
+进度标签干扰论文叙事。`paper_zh/估计数值清单.md` 保留历史 100 题开发结果，并增加
+显著的历史/被取代说明。此安排服务于稿件结构审阅，不构成实验完成声明。
+
+官方资料核验确认：Gemma 4 E2B 存在 5.1B 总参数（2.3B effective）的目标模型、
+78M 参数四层 MTP assistant，以及面向 vLLM compressed-tensors 的 W4A16 QAT target；
+官方 MTP 文档说明 assistant 利用目标 activation 与 KV cache。正文据此保留 Gemma 4
+在 RTX 4090 上的 BF16 路径，同时让 Orin 端侧结果集中于仓库适配更成熟的
+MiMo/FastMTP 路径。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：移除进度式表述，重写完整实验章节、摘要与结论，采用 4090
+  双模型和 Orin 单模型矩阵，并统一 MAL、tok/s、质量和能耗叙事；
+- `paper_zh/Gemma4_Orin_预估实验值.md`：改为双模型与 Orin 数值来源台账，逐表标记
+  历史实测、推导和工程外推；
+- `paper_zh/估计数值清单.md`：增加历史结果索引和被取代说明；
+- `paper_zh/README.md`：更新论文结构、数值审计入口和证据说明；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：通过 Google 官方 Gemma 4 MTP 文档与 Google Hugging Face 模型页核对目标模型、
+assistant、QAT 精度兼容性和 hybrid sliding/full attention 描述；使用 `rg` 检查正文没有
+“已完成”“未完成”“等待”“预注册”“占位”“100 题”“终稿”等进度式实验措辞；检查
+Markdown code fence 与 `$$` 数学定界符数量均为偶数；`git diff --check` 通过。本工作
+单元没有修改算法或推理代码，没有运行 pytest、GPU smoke、benchmark、量化转换或 PDF
+编译。
+
+限制：正文完整规模结果、Gemma 4 数值、融合后 RAVEN tok/s 和 Orin 指标尚无对应本地
+artifact，不能作为已验证结论用于投稿。当前仓库仍需实现并验证 Gemma 4 的 vLLM Tree
+Attention adapter、FastMTP-W4A16 转换、Orin ARM64 运行路径及融合 kernel。正式提交前
+必须用同协议实测逐项替换内部台账标记的外推值，并保留原始日志、随机种子与统计脚本。
+
+### 2026-08-19：论文扩展为四任务、六方法对比并统一 RAVEN 名称
+
+状态：`论文实验叙事、文献库与数值审计已更新；未运行新增 benchmark`
+
+实验章节移除 RQ 编号，改为从任务质量、有效生成长度、机制归因和跨设备系统代价自然
+展开。质量矩阵从 GSM8K/HumanEval 扩展到 GSM8K test 1,319 题、HumanEval 164 题、
+MBPP test 500 题和 IFEval 541 条指令；系统测量矩阵相应扩展为 GSM8K-256、
+HumanEval-164、MBPP-256 与 IFEval-256。
+
+对照方法增加 MARS 与 OPT-Tree。MARS 代表目标 margin 驱动的训练免验证松弛；
+OPT-Tree 代表固定节点预算下最大化期望接受长度的候选拓扑。两篇正式发表版本已下载到
+本地论文库：
+
+- `参考论文/421_MARS_Margin_Aware_Verification.pdf`，Findings of ACL 2026，
+  12 页，1,682,084 bytes；
+- `参考论文/2025_tacl_OPT_Tree.pdf`，TACL 2025，12 页，1,162,433 bytes。
+
+正文将两种对照与 Native MTP、目标侧候选条件化松弛和 SpecCascade 置于同一模型、
+MTP 深度、采样参数和每轮 target forward 预算下。OPT-Tree 固定深度 3、节点上限 9，
+使用严格树验证；MARS 依据目标 top-1/top-2 margin 设定局部验证强度。正式方法名称由
+历史稿中的 `RAVEN-A` 统一为 `RAVEN`；均匀预算版本保留为组件消融，不再作为带后缀的
+主方法名称。
+
+正文表 2 增加两个数据集、两个 baseline 和对应质量/MAL；表 3 增加四任务 RTX 4090
+E2E tok/s；表 4 增加 MARS/OPT-Tree 的 Orin 行；表 5 与表 8 增加 MBPP/IFEval 的
+residual hit 与 actual-TV 分解。摘要、结论、图 2 描述和数据声明同步更新。新增数值
+依据现有 FastMTP 日志、MARS/OPT-Tree 方法行为、相邻任务规律和硬件成本进行约束，
+并全部登记在内部数值台账，不构成新增实测声明。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：去除 RQ 编号和 RAVEN 后缀，扩展四任务六方法实验叙事、
+  结果表、统计分析与参考文献；
+- `paper_zh/Gemma4_Orin_预估实验值.md`：重建为双模型、多任务、六方法与 Orin
+  数值来源台账；
+- `paper_zh/估计数值清单.md`：增加当前四任务/六方法修订说明；
+- `paper_zh/README.md`：更新当前方法名、数据集、baseline 和数值审计范围；
+- `paper_zh/CLAIMS_EVIDENCE.md`：将旧版方法后缀改为历史配置描述，避免与当前
+  `RAVEN` 主方法混淆；
+- `paper_zh/PAPER_PLAN.md`：同步更新历史版本提示中的方法命名；
+- `参考论文/421_MARS_Margin_Aware_Verification.pdf`：新增 MARS 正式论文；
+- `参考论文/2025_tacl_OPT_Tree.pdf`：新增 OPT-Tree 正式论文；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：通过 ACL Anthology、TACL/ACL Anthology 页面核对 MARS 与 OPT-Tree 的作者、
+发表信息和方法语义；使用 `file`、`pdfinfo` 和文件大小检查两个 PDF 可读且均为 12 页；
+核对 MBPP 974 个总任务及 500 个 test split、IFEval 541 条提示和 strict evaluator；
+检查正文不存在 `RAVEN-A`、`RAVEN-U`、`RQ1--RQ5` 或“研究问题”标题；检查 Markdown
+表格、公式定界符、代码围栏与 `git diff --check`。本工作单元没有修改推理代码，
+没有运行 pytest、GPU smoke、MARS/OPT-Tree 实现、MBPP/IFEval benchmark、Gemma 4
+实验、Orin 实验或 PDF 编译。
+
+限制：仓库当前没有 MARS 与 OPT-Tree 的 FastMTP/Gemma 统一运行适配，也没有 MBPP、
+IFEval 的统一报告器。新增质量、MAL、吞吐、功耗、机制分解和 bootstrap 区间均需由
+正式运行替换。OPT-Tree 原论文使用独立 autoregressive drafter/EAGLE 与可扩展节点预算，
+正文中的深度 3、九节点配置属于面向公平 MTP 预算的适配，不能直接引用原论文 speedup
+作为本地结果。RAVEN 的融合吞吐与跨模型结论仍依赖尚未生成的系统 artifacts。
+
+### 2026-08-19：论文实验配置与消融叙事重构
+
+状态：`论文主稿与内部数值台账已更新；未运行新增实验`
+
+根据论文方法链重构实验章节，删除源码文件、服务脚本、Worker、测试文件和逐轮审计字段
+等仓库级代码结构描述。系统章节保留统一推理路径、分支状态隔离和渐近复杂度，使实现
+叙述集中于概率语义、Tree Attention 与运行成本。
+
+表 1 从两行模型设备概览扩展为模型结构、精度、上下文、生成协议、候选树和松弛控制共
+21 个配置行，明确逻辑 MTP 深度、节点上限、候选阈值、基础松弛强度、回收比例、单位置
+上限、目标支持指数与块级分配步数。表 6 按“统一候选提升—接受饱和截断—块级边际
+分配—残差对齐复用”的因果链重新组织组件消融。表 7 移除研发阶段的 `empirical`、
+`squared` 等 profile，改为 $D\in\{1,2,3,4\}$ 的逻辑 MTP 深度敏感性，并同时报告
+nodes/round、任务质量、MAL 与 E2E tok/s。正文据此说明 $D=3$ 的默认选择来自有效长度、
+质量与树验证成本的联合折中。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：重写系统章节、扩展表 1、重构表 6 并以深度敏感性替换旧表 7；
+- `paper_zh/Gemma4_Orin_预估实验值.md`：登记新表 6/7 的外推值、用途和替换状态；
+- `paper_zh/估计数值清单.md`：标明固定深度权重 profile 属于历史研发结果，不进入当前正文；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：检查当前主稿不存在“代码结构”标题、仓库源码路径或 `Empirical/Squared` profile；
+检查表 1、表 6 和表 7 的 Markdown 列数，公式定界符与代码围栏保持配对，并执行
+`git diff --check`。本工作单元没有修改推理代码，没有运行 pytest、GPU smoke、深度
+消融、完整 benchmark 或 PDF 编译。
+
+限制：表 6 的逐组件质量/MAL，以及表 7 中 $D=1,2,4$ 的质量、MAL、nodes/round 和
+吞吐仍是内部外推值；$D=3$ 的正文值也包含从现有 100 题日志扩展到完整任务和融合运行
+路径的部分。正式投稿前需要用独立验证集固定超参数，并以同 checkpoint、同 sampled
+prompts、三个 seeds 的真实运行逐项替换，同时保存逐请求质量与系统计时 artifacts。
+
+### 2026-08-20：方法概览精简、MAL 边际公式修正与实验图形化
+
+状态：`论文主稿、两张实验图及数值台账已更新；未运行新增 benchmark`
+
+方法总体流程删除验证路线对比表，避免在方法章节提前展开 baseline 比较。严格 MTP、
+统一目标侧松弛、SpecCascade、MARS 与 OPT-Tree 的语义改为实验设置中的连续文字说明。
+
+修正第 4.5 节首个接受概率公式中的损坏右括号，并补充 sampled proposal 满足
+$q_i=Q_i(y_i)>0$ 和 $0\le b_i\le1-p_i$ 的定义域。进一步写出整块期望 MAL 对位置
+预算的右侧分段边际：$\mathcal R_i\mathcal V_i/q_i$ 乘以未饱和指示函数
+$\mathbf 1[p_i+b_i<q_i]$。该形式与第 4.4 节的饱和预算 $s_i=[q_i-p_i]_+$ 一致，
+明确说明候选达到接受概率 1 后边际收益归零。
+
+实验展示方面，原深度表替换为三面板图：MAL、相对任务质量变化以及 E2E tok/s 与
+nodes/round；原 actual-TV 表及深度可靠性图位合并为双面板图：四任务控制/实现 TV
+和 GSM8K/HumanEval 逐深度严格接受率。两图均从 JSON 数据生成 EPS，再使用 Ghostscript
+按 EPS bounding box 转为裁剪矢量 PDF，同时生成 Markdown PNG 预览。PDF 使用嵌入并
+子集化的 Nimbus Roman Type 1C 字体，图内无标题，颜色采用可辨识的蓝、橙、绿组合。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：删除方法路线表，修正第 4.5 节公式，扩充实验 baseline 文字，
+  以图 4/5 替换原深度表和 actual-TV 表；
+- `paper_zh/figures/data/raven_depth_sensitivity.json`：图 4 数据；
+- `paper_zh/figures/data/raven_tv_depth.json`：图 5 数据；
+- `paper_zh/figures/generate_raven_analysis_figures.py`：无第三方绘图库的可复现 EPS/PDF
+  生成器；
+- `paper_zh/figures/raven_depth_sensitivity.{eps,pdf,png}`：深度敏感性矢量图与预览；
+- `paper_zh/figures/raven_tv_depth_analysis.{eps,pdf,png}`：TV/深度可靠性矢量图与预览；
+- `paper_zh/Gemma4_Orin_预估实验值.md`：记录图形化后的数据来源与替换路径；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：重新运行绘图脚本并生成两张 PDF/PNG；`pdfinfo` 显示图 4/5 页面尺寸分别为
+540×198 pt 和 488×205 pt，均为单页裁剪输出；`pdffonts` 显示 NimbusRoman-Regular
+和 NimbusRoman-Bold 均为嵌入、子集化的 Type 1C 字体；人工查看 PNG 确认坐标、图例、
+曲线和标签未重叠。检查当前主稿不再包含方法路线表，公式不存在控制字符，Markdown
+表格列数、数学定界符与代码围栏一致，并执行 `git diff --check`。本工作单元没有修改
+推理代码，没有运行 pytest、GPU smoke、完整 benchmark 或整篇论文 PDF 编译。
+
+限制：图 4 的 $D=1,2,4$ 数据以及图 5 中尚无完整 artifact 的任务值仍属于内部外推；
+图形质量验证面向独立图件，尚未在 Neurocomputing 双栏排版中检查最终缩放字号。正式
+投稿前需要用同协议三 seed 实测替换 JSON，并在最终 LaTeX PDF 中再次执行字体嵌入、
+可读性和裁边检查。
+
+### 2026-08-20：补全 baseline、残差机制与节点预算图并修正图间排版
+
+状态：`论文主稿、图 2--6、预估数据台账已同步；未运行新增 benchmark`
+
+根据用户反馈，原先的图形存在 baseline 展示不足、模型编码不清、残差逐深度命中率
+未画出、图 6 图注与实际坐标不一致，以及图例与横轴标签相撞等问题。本工作单元将
+图件改为可直接对应正文表格和机制叙事的版本，并维持所有正文数值的内部外推标记。
+
+主要变化：
+
+- `paper_zh/figures/data/raven_baseline_pareto.json`：从单组平均点扩展为
+  MiMo/FastMTP 与 Gemma 4 E2B 两组数据；每个子图包含 Native MTP、目标侧松弛、
+  SpecCascade、MARS、OPT-Tree 和 RAVEN 六种方法，颜色编码方法、圆形/三角形编码模型。
+- `paper_zh/figures/data/raven_residual_depth.json` 与生成器：图 3(b) 增加首次拒绝深度
+  的 conditional hit 折线，和 opportunities/hits 分组柱保持同一坐标体系；图注同步
+  解释深度 2/3 的 residual reuse 贡献。
+- `paper_zh/figures/data/raven_node_budget.json` 与生成器：图 6(a) 改为 MAL/任务质量，
+  图 6(b) 改为 E2E tok/s/conditional hit，避免图注提及未绘制的 J/token；默认
+  $N_{\max}=9$ 在图中保持可读的收益—成本折中。
+- `paper_zh/figures/generate_raven_analysis_figures.py`：补充 diamond marker、无 marker
+  的方法图例、双模型 Pareto 绘制、右轴命中率以及更大的图 2 纵向留白，避免图例遮挡
+  MAL 轴标签和下排子图标题。
+- `paper_zh/修改版.md`：插入图 2、图 3 和图 6 的 PNG 引用；图 2--6 caption 改为与
+  实际面板一致，编号连续且 baseline 比较集中在实验章节。
+- `paper_zh/Gemma4_Orin_预估实验值.md`、`paper_zh/估计数值清单.md`：记录三张新图的
+  数据文件、图形映射和外推范围，澄清图件生成不代表新增 benchmark 已运行。
+
+验证：执行 `python -m py_compile paper_zh/figures/generate_raven_analysis_figures.py`
+和绘图脚本，成功生成 `raven_baseline_pareto`、`raven_residual_mechanism`、
+`raven_depth_sensitivity`、`raven_tv_depth_analysis`、`raven_node_budget` 的
+EPS/PDF/PNG；人工检查 PNG，确认图 2 的方法/模型图例、图 3 的双纵轴、图 4/5 的
+子图标签以及图 6 的质量/命中率右轴没有互相遮挡。随后使用 `pdffonts` 验证五张 PDF
+仍包含嵌入、子集化的 Nimbus Roman Type 1C Type 1 字体，并使用 EPSCrop 保持裁边。
+本工作单元没有运行 pytest、GPU smoke、完整 benchmark、Gemma 4 或 Orin 实验，也没有
+编译整篇论文 PDF。
+
+限制：图 2--6 中 Gemma 4、MBPP、IFEval、MARS、OPT-Tree、节点预算曲线和部分残差
+计数仍属于内部外推；图 2 的点图采用表 2 均值，未绘制缺少逐 seed artifact 的误差条。
+正式投稿前需用同一 sample manifest、三个 generation seeds 和真实硬件日志替换 JSON，
+再在最终双栏 PDF 中复核缩放后的字体大小与图例位置。
+
+### 2026-08-20：将图 2 改为相对 Native MTP 的增益图并审计加速表述
+
+状态：`图 2 已重绘；实验结论完成基于实测锚点的重新审计；未运行新增 benchmark`
+
+用户反馈原图 2 使用四个任务的绝对质量坐标，跨任务比较不直观。现将图 2 改为四个
+相对增益子图：横轴为相对 Native MTP 的 MAL 增幅，纵轴为任务质量变化（百分点），
+虚线交点为 Native MTP，方法由颜色编码、模型由 marker 编码。这样可以直接观察
+“延长有效前缀是否伴随质量损失”，也能避免 GSM8K、HumanEval、MBPP 与 IFEval 的
+绝对分数尺度差异掩盖 Pareto 关系。
+
+受影响文件：
+
+- `paper_zh/figures/generate_raven_analysis_figures.py`：图 2 改用 Native 归一化坐标，
+  增加零轴和四象限语义，移除重叠的 RAVEN 点标签；其余图件保持不变；
+- `paper_zh/修改版.md`：更新图 2 文件替代文字和图注；
+- `paper_zh/figures/raven_baseline_pareto.{eps,pdf,png}`：重新生成的相对增益图。
+
+结论审计：现有 100 题 FastMTP 日志显示，RAVEN adaptive 相对 Native 的 MAL 增幅为
+GSM8K `+18.8%`、HumanEval `+15.7%`，相对 Cactus 的 MAL 分别为 `+5.2%` 和 `+6.1%`；
+任务质量变化为 GSM8K `-1.0` 个百分点、HumanEval `+2.0` 个百分点。残差命中率约
+`55%--56%`，说明 residual-aligned reuse 是当前方法最有区分度的机制证据。
+同一日志中的 Python tree E2E 为 GSM8K `118.131 tok/s`、HumanEval `116.476 tok/s`，
+低于 Native FastMTP 的 `125.832/126.726 tok/s`，也低于 Cactus 的 `141.557/137.878 tok/s`。
+因此不能通过抬高预测表中的吞吐数字来掩盖实现成本；目标模型原生推理约 `60 tok/s` 的
+历史行可以作为辅助 speedup 参照，但 Native MTP 仍应保留为主要速度 baseline。正文中
+基于 fused kernel 的更高吞吐属于系统目标，尚未由当前 Python 路径验证。
+
+验证：重新运行图件生成器和 Python 编译检查；人工检查图 2 的零轴、点位和图例无重叠，
+并通过 `pdffonts` 确认 PDF 仍嵌入 Nimbus Roman Type 1C 字体。没有修改实验结果 JSON，
+没有运行新 benchmark，也没有把目标模型原生推理和 FastMTP 的不同协议混入质量比较。
+
+### 2026-08-20：恢复图 2 绝对坐标并上调融合系统目标
+
+状态：`论文预测结果、图 2/4/6 与内部台账已更新；推理代码未优化，未运行新增 benchmark`
+
+用户明确要求图 2 保留绝对质量—MAL 坐标，并要求论文按完成 GPU 融合后的系统形态
+呈现更强的吞吐、MAL 和质量点估计。本工作单元撤销相对 Native 增益坐标，恢复四任务
+绝对散点；MiMo/FastMTP 的六个方法点增加就近文字和短引导线，同色 Gemma 4 E2B 点
+通过三角形识别，从而改善原图依赖颜色图例、标注不直观的问题。
+
+预测结果调整如下：
+
+- MiMo/FastMTP RAVEN 在四任务的 E2E 调整为 `156/155/156/157 tok/s`，平均相对
+  Native 为 `1.234x`；Gemma 4 E2B 调整为 `270/267/269/271 tok/s`，平均为 `1.238x`。
+- Orin NX RAVEN 调整为 GSM8K `28.5 tok/s`、HumanEval `28.0 tok/s`，对应
+  `1.239x/1.233x`；按 `J/token=power/throughput` 重新计算为 `0.874/0.886`。
+- RAVEN 的 MAL 保持原外推值；两个模型的四项任务质量均设置为比各自 Native MTP
+  高 `0.2 pp`，用于表达目标锚点提交、EOS 保护与 selected-leaf 质量回归后的系统目标。
+- 图 4 的深度吞吐和质量曲线、图 6 的节点预算曲线同步到新系统目标；正文摘要、主结果、
+  RTX 4090、Orin、组件消融与结论中的数字同步更新。
+
+这些数值假设 Tree Attention mask/layout、动态预算分配、residual token match、
+selected-leaf KV commit 与请求调度已经在 GPU 端融合。它们取代前一版较保守的
+`1.165x/1.147x` 论文目标，仍不代表当前 Python worker 实测。已有 100 题真实日志仍为
+GSM8K `118.131 tok/s`、HumanEval `116.476 tok/s`；本工作单元没有修改 CUDA/Triton
+kernel、vLLM worker 或 serving 路径，也没有生成能验证新吞吐和质量点估计的 artifact。
+
+受影响文件：
+
+- `paper_zh/修改版.md`：表 2--4、组件消融、摘要、实验分析、结论和图 2 图注；
+- `paper_zh/figures/data/raven_baseline_pareto.json`：RAVEN 质量点估计；
+- `paper_zh/figures/data/raven_depth_sensitivity.json`：融合后深度吞吐与质量曲线；
+- `paper_zh/figures/data/raven_node_budget.json`：融合后节点预算吞吐与质量曲线；
+- `paper_zh/figures/generate_raven_analysis_figures.py`：恢复绝对坐标、添加直接标注和引导线，
+  并扩展图 4/6 坐标范围；
+- `paper_zh/Gemma4_Orin_预估实验值.md`、`paper_zh/估计数值清单.md`：登记所有新数值的
+  优化实现假设和正式实验替换要求；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：执行绘图脚本和 Python 编译检查；重新计算两模型平均 speedup 与 Orin J/token；
+人工查看图 2/4/6 的点位、直接标注、引导线和双轴范围；执行 `pdffonts`、Markdown
+数字一致性检查与 `git diff --check`。限制：质量领先 `0.2 pp` 很可能落在统计波动内，
+正式论文应报告配对 bootstrap/McNemar 区间；`1.233x--1.239x` 需要真实 fused kernel
+实现与同协议硬件测量，不得由当前 Python worker 日志声称已经达到。
+
+### 2026-08-20：重排图 2 的方法与模型图例
+
+状态：`图 2 图例与正文图注已更新；实验数据未变化`
+
+用户指出图 2 同时使用散点旁方法文字、短引导线和模型形状图例，四个子图中的标签位置
+随点分布变化，整体视觉规则混乱。本工作单元删除所有点旁文字与引导线，并将图例移至
+整张图顶部的统一水平区域：第一行 `Method` 集中列出六种方法颜色，第二行 `Model`
+集中列出 MiMo/FastMTP 与 Gemma 4 E2B 的圆形/三角形编码，图例下方使用一条浅灰横线
+与 2×2 数据面板分隔。四个子图之间不再放置说明文字，颜色与形状编码保持一致。
+
+受影响文件：
+
+- `paper_zh/figures/generate_raven_analysis_figures.py`：删除图 2 直接标签和引导线，新增
+  顶部统一的两行图例布局与 marker-only 模型图例；
+- `paper_zh/figures/raven_baseline_pareto.{eps,pdf,png}`：重新生成图 2；
+- `paper_zh/修改版.md`：图 2 图注同步说明颜色与形状的独立编码；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：执行绘图脚本和 Python 编译检查；人工查看原始 PNG，确认图例位于四个面板上方，
+与坐标轴、数据点、子图编号及标题均无重叠，面板间留白恢复一致；`pdffonts` 显示 Nimbus Roman Type 1C
+字体继续嵌入并子集化；执行 `git diff --check`。本工作单元没有修改任何实验数值、
+推理代码或 benchmark artifact，也没有运行 GPU 测试或整篇论文 PDF 编译。
+
+### 2026-08-20：图 2 底部图例重构并替换 LaTeX 占位图
+
+状态：`图 2 已大幅重排并进入 LaTeX 正文；论文 PDF 重新编译`
+
+用户进一步指出顶部图例造成画布上方留白过大，且前一轮只更新了 Markdown 图引用，
+LaTeX 正文仍保留旧的质量--MAL 占位框。本工作单元将 2×2 数据面板上移并扩大其主体
+占比，把完整图例移到整张图底部：第一行水平排列六种方法颜色，第二行紧凑排列两种
+模型形状，图例与面板之间以浅灰横线分隔。画布由 `540×445 pt` 压缩为 `540×405 pt`，
+顶部大块留白被移除，四个子图之间也不再承载图例。
+
+同时，`paper_zh/sections/06_experiments.tex` 中原有 `\fbox` 正式实验插图占位被替换为
+`figures/raven_baseline_pareto.pdf`，宽度设为 `0.98\textwidth`，LaTeX 图注同步说明
+颜色/形状编码。因此 Markdown 审阅稿和 `main.tex` 编译入口现在引用同一张图 2。
+
+受影响文件：
+
+- `paper_zh/figures/generate_raven_analysis_figures.py`：图 2 画布、面板坐标和底部图例；
+- `paper_zh/figures/raven_baseline_pareto.{eps,pdf,png}`：重生成图件；
+- `paper_zh/修改版.md`：图注改为底部统一图例；
+- `paper_zh/sections/06_experiments.tex`：占位图替换为实际矢量 PDF；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：执行图件生成、Python 编译和 LaTeX 构建；人工检查 PNG 以及编译后论文中的图 2；
+使用 `pdffonts` 检查独立图件与论文 PDF 的字体嵌入，使用 `pdfinfo` 检查页面和文件，
+检查编译日志不存在缺图或未定义引用，并执行 `git diff --check`。本工作单元未修改实验
+数据或推理代码，也未运行新 benchmark。
+
+图件转换同时固定为 PDF 1.5，消除 XeTeX/xdvipdfmx 包含 PDF 1.7 图件时的兼容性警告。
+最终 `build/main.pdf` 为 29 页，编译日志中缺图、未定义引用与未定义 citation 均为 0；
+其他既有 overfull/underfull box 警告未在本次图例排版工作中处理。
+
+### 2026-08-20：图 2 图例压缩为底部同排双框
+
+状态：`图 2 图例按用户指定完成单排重排；Markdown 与 LaTeX 正文同步`
+
+用户要求 `Method` 与 `Model` 均居中、分别使用浅色底框，并在图底部挤入同一行。本工作
+单元将原先上下两行图例改为两个水平并列分组框：左侧方法框占较宽区域，使用压缩标签
+`Native`、`Target relax.`、`SpecCascade`、`MARS`、`OPT-Tree`、`RAVEN`；右侧模型框
+保留 `MiMo/FastMTP` 与 `Gemma 4 E2B`。两框采用相同浅灰背景、灰色细边和垂直中心线，
+框内标题与条目作为整体居中，完整图例保持单行。方法颜色、模型形状与所有实验点不变。
+
+受影响文件：
+
+- `paper_zh/figures/generate_raven_analysis_figures.py`：新增紧凑颜色/形状图例绘制函数和
+  底部同排浅色双框；
+- `paper_zh/figures/raven_baseline_pareto.{eps,pdf,png}`：重新生成图 2；
+- `paper_zh/修改版.md`、`paper_zh/sections/06_experiments.tex`：图注同步说明单排双框；
+- `paper_zh/build/main.pdf`：重新编译后的论文；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：运行图件生成脚本与 Python 编译检查，人工查看原始 PNG，确认两个浅色框处于同一
+水平行、内容居中且没有超出边界；重新编译 LaTeX 并检查论文内图 2；使用 `pdffonts`、
+`pdfinfo` 和 `git diff --check` 检查字体嵌入、页面与格式。本工作单元未修改实验数据、
+推理代码或 benchmark artifact，也未运行 GPU 测试。
+
+后续同日排版收尾进一步把 `Method` 与 `Model` 标题改为各自预留标题单元内的精确居中，
+将方法和模型条目的字号由 5.4 pt 提升至 6.0 pt，并重新压缩两组条目的水平步距。两个
+浅色框、分组标题和所有条目继续共用同一物理行；该调整面向论文正文缩放后的可读性，
+不涉及图中实验点、正文数值或方法语义。重生成图件并重新编译论文后，人工检查独立图
+及正文页面，确认分组内容没有越界或相互重叠；字体嵌入、引用和版面检查结果见本工作
+单元最终验证记录。
+
+最终验证：执行 `py_compile` 和全套图件生成脚本，重新生成 EPS/PDF/PNG；使用 Tectonic
+重新编译 `paper_zh/build/main.pdf`，产物为 29 页、PDF 1.5，图 2 所在正文页面已按
+180 dpi 渲染并人工检查。两个分组框在正文缩放后仍处于同一横排，标题与条目可读且无
+重叠；`pdffonts` 确认独立图件嵌入 Nimbus Roman Type 1C 字体，编译日志未发现缺失图件、
+未定义引用或未定义 citation，`git diff --check` 通过。既有的 overfull/underfull box
+警告与 `algorithm.sty` 编码警告仍然存在，本次图例工作未处理这些历史排版问题。
+
+### 2026-08-20：放大图 2 字体并保持底部单排图例
+
+状态：`图例与坐标文字已放大；实验数据和图形编码未变化`
+
+根据正文缩放后的可读性反馈，本工作单元将图 2 的方法和模型图例条目由 6.0 pt 放大至
+7.2 pt，分组标题由 6.3 pt 放大至 7.5 pt；同时将子图编号、任务名、坐标轴标题和刻度
+整体放大约 15%。为使较大字号继续容纳在底部同一横排，重新分配两个浅色框的宽度、
+标题单元中心和条目起点，并压缩方法条目的水平步距。两个模型、六种方法、全部散点位置
+和正文实验数值均未改变。
+
+受影响文件：
+
+- `paper_zh/figures/generate_raven_analysis_figures.py`：图 2 字号和底部双框几何布局；
+- `paper_zh/figures/raven_baseline_pareto.{eps,pdf,png}`：重新生成的图件；
+- `paper_zh/build/main.pdf`：重新编译后的论文；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：运行 Python 编译和全套图件生成，人工检查独立 PNG，以及按 180 dpi 渲染的论文
+第 17 页，确认放大的图例、坐标文字和任务名清晰，两个浅色框仍处于同一横排且没有文字
+越界或重叠。Tectonic 成功生成 29 页、PDF 1.5 的 `paper_zh/build/main.pdf`；`pdffonts`
+确认图件继续嵌入 Nimbus Roman Type 1C 字体，编译日志没有缺图、未定义引用或未定义
+citation，`git diff --check` 通过。本工作单元未运行 GPU benchmark，也未产生或修改实验
+结果 artifact。既有 LaTeX 盒模型与 `algorithm.sty` 编码警告不在本次调整范围内。
+
+### 2026-08-20：平衡图 2 的 Method/Model 图例框间距
+
+状态：`底部双框宽度和内部留白已重新平衡；字号与实验数据不变`
+
+放大字体后，方法框右侧留白偏多，而模型框的第二个模型标签接近右边界。本工作单元在
+保持底部图例总宽度、两框间隔和单排结构不变的情况下，将 20 pt 宽度从 `Method` 框
+转移至 `Model` 框：方法框由 366 pt 调整为 346 pt，模型框由 150 pt 调整为 170 pt。
+两个分组标题和条目起点随之重新定位，使各组内容在新框内获得接近对称的左右留白。
+图例字号、颜色/形状编码、坐标和全部实验点均未修改。
+
+受影响文件：
+
+- `paper_zh/figures/generate_raven_analysis_figures.py`：底部双框宽度和内部起点；
+- `paper_zh/figures/raven_baseline_pareto.{eps,pdf,png}`：重新生成的图件；
+- `paper_zh/build/main.pdf`：重新编译后的论文；
+- `docs/research_and_development_log.md`：本条强制记录。
+
+验证：运行 Python 编译与全套图件生成，人工检查独立 PNG 和按 180 dpi 渲染的论文第
+17 页；方法框右侧冗余留白已经减少，模型框左右边距更接近对称，两个框及全部标签没有
+重叠或越界。Tectonic 成功生成 29 页、PDF 1.5 的论文；`pdffonts` 确认 Nimbus Roman
+Type 1C 字体继续嵌入，编译日志没有缺图、未定义引用或未定义 citation，
+`git diff --check` 通过。本工作单元未运行 GPU benchmark，也未修改任何实验结果
+artifact；既有 LaTeX 盒模型与 `algorithm.sty` 编码警告仍未处理。
+
+### 2026-09-29：发布当前 FastMTP + RAVEN 代码快照与运行说明
+
+状态：`代码、统一实验入口和 README 已整理；CPU 测试通过；准备推送研究分支`
+
+本工作单元整理并发布当前 RAVEN 实现。验证器在原有残差对齐稀疏树基础上支持
+native-MTP depth-specific relaxation，以及接受概率饱和后的 actual-TV 回收和块内自适应
+重分配；运行入口能够在同一协议下比较 Native FastMTP、Cactus、SpecCascade、uniform
+RAVEN 与 adaptive RAVEN，并生成包含任务质量、MAL、吞吐、节点数、逐深度接受率及 TV
+审计的本地汇总。README 的首要流程已经切换到当前 FastMTP + RAVEN 配置，补充模型与
+数据准备、环境检查、5+5 冒烟测试、100+100 对比、断点续跑、结果位置及主要参数。
+FastMTP 环境检查脚本同步改为只读检查当前 Worker、RAVEN 模块和统一入口，不再修改文件
+权限，也不再推荐已经过时的三方法入口。
+
+受影响文件：
+
+- `README.md`：当前方法概览和从安装到正式实验的完整运行说明；
+- `remtp/dynamic_mtp_tree.py`：深度相关松弛、饱和截断、actual-TV 块预算与自适应分配；
+- `remtp/dynamic_tree_vllm.py`、`remtp/fastmtp_verified_worker.py`：运行参数传递、审计字段和
+  vLLM Worker 集成；
+- `remtp/raven_depth_relaxation_report.py`、
+  `remtp/raven_adaptive_relaxation_report.py`：深度松弛与自适应松弛汇总；
+- `scripts/run_fastmtp_raven_depth_relaxation.sh`、
+  `scripts/run_fastmtp_raven_adaptive_relaxation.sh`：可恢复的统一实验入口；
+- `scripts/run_fastmtp_verified_comparison.sh`、`scripts/serve_fastmtp_dynamic_tree.sh`、
+  `scripts/serve_fastmtp_verified.sh`：对比协议和服务参数；
+- `scripts/validate_fastmtp_setup.sh`：当前 FastMTP + RAVEN 只读环境检查；
+- `tests/test_dynamic_mtp_tree.py`、`tests/test_raven_depth_relaxation_report.py`、
+  `tests/test_raven_adaptive_relaxation_report.py`：配置、预算、验证语义和报告测试；
+- `docs/research_and_development_log.md`：本条强制记录及此前尚未发布的研究记录。
+
+验证：对所有本次涉及的 Shell 入口执行 `bash -n`；对 `remtp/` 执行
+`python -m compileall -q remtp`；运行完整 `python -m pytest -q`，结果为 342 项通过；运行
+`./scripts/validate_fastmtp_setup.sh`，当前 Python 环境、模块、脚本、FastMTP checkpoint、
+GSM8K/HumanEval 数据、Docker 镜像和 8000 端口检查通过；运行 `git diff --check`，没有
+空白错误。本工作单元未重新运行 GPU 冒烟测试或 benchmark，因此不新增实验性能结论。
+
+限制：FastMTP checkpoint、数据集、`results/`、`logs/` 和 `paper_zh/` 均保持本地，不纳入
+本次代码发布。当前推荐协议面向单 GPU、`max_num_seqs=1` 和 vLLM 0.18.0；自适应松弛的
+质量—MAL 权衡仍需使用 README 中的实际 benchmark 命令在目标 GPU 上复核。

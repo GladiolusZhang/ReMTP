@@ -123,6 +123,12 @@ DYNAMIC_SUPPORT_MODE="${DYNAMIC_SUPPORT_MODE:-relative}"
 DYNAMIC_PROPOSAL_SUPPORT_RATIO="${DYNAMIC_PROPOSAL_SUPPORT_RATIO:-1.0}"
 DYNAMIC_CONFIRMATION_MIN_RELATIVE="${DYNAMIC_CONFIRMATION_MIN_RELATIVE:-0.05}"
 DYNAMIC_CACTUS_DELTA="${DYNAMIC_CACTUS_DELTA:-$CACTUS_DELTA}"
+DYNAMIC_RELAX_DEPTH_WEIGHTS="${DYNAMIC_RELAX_DEPTH_WEIGHTS:-}"
+DYNAMIC_ADAPTIVE_RELAXATION="${DYNAMIC_ADAPTIVE_RELAXATION:-0}"
+DYNAMIC_ADAPTIVE_RELAX_MIX="${DYNAMIC_ADAPTIVE_RELAX_MIX:-0.5}"
+DYNAMIC_ADAPTIVE_RELAX_MAX_RATIO="${DYNAMIC_ADAPTIVE_RELAX_MAX_RATIO:-1.5}"
+DYNAMIC_ADAPTIVE_RELAX_TARGET_POWER="${DYNAMIC_ADAPTIVE_RELAX_TARGET_POWER:-0.25}"
+DYNAMIC_ADAPTIVE_RELAX_STEPS="${DYNAMIC_ADAPTIVE_RELAX_STEPS:-16}"
 DYNAMIC_CACTUS_TARGET_WEIGHT="${DYNAMIC_CACTUS_TARGET_WEIGHT:-0.25}"
 DYNAMIC_MAX_GUIDED_RESCUES="${DYNAMIC_MAX_GUIDED_RESCUES:-1}"
 DYNAMIC_RESCUE_SCORE_THRESHOLD="${DYNAMIC_RESCUE_SCORE_THRESHOLD:-0.35}"
@@ -149,8 +155,28 @@ for path in "$MODEL_PATH/config.json" "$GSM8K_DATA" "$HUMANEVAL_DATA"; do
   [[ -f "$path" ]] || { echo "Missing required file: $path" >&2; exit 2; }
 done
 python -m remtp.fastmtp_checkpoint check "$MODEL_PATH"
-if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
-  echo "A server is already responding at $BASE_URL; stop it first." >&2
+
+port_is_open() {
+  python - "$BASE_URL" <<'PY'
+import socket
+import sys
+from urllib.parse import urlparse
+
+parsed = urlparse(sys.argv[1])
+host = parsed.hostname or "127.0.0.1"
+port = parsed.port or (443 if parsed.scheme == "https" else 80)
+try:
+    with socket.create_connection((host, port), timeout=0.25):
+        pass
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+if port_is_open; then
+  echo "Port for $BASE_URL is already occupied; stop that process first." >&2
+  echo "Inspect it with: ss -ltnp 'sport = :$PORT'" >&2
   exit 2
 fi
 if ! docker info >/dev/null 2>&1; then
@@ -188,13 +214,22 @@ trap cleanup_server EXIT
 trap 'exit 130' INT TERM
 
 wait_for_server() {
-  local log_file="$1" deadline=$((SECONDS + SERVER_START_TIMEOUT))
+  local method="$1" log_file="$2" deadline=$((SECONDS + SERVER_START_TIMEOUT))
+  local worker_marker
+  worker_marker="$(expected_marker "$method")"
   while (( SECONDS < deadline )); do
-    if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then return; fi
     if ! kill -0 "$server_pid" 2>/dev/null; then
       echo "Server exited before becoming healthy:" >&2
       tail -n 180 "$log_file" >&2
       return 1
+    fi
+    # A different or stale vLLM process may answer /health on the same port.
+    # Accept health only after this launch reached both Worker initialization
+    # and Uvicorn application startup in its own log.
+    if grep -Fq "$worker_marker" "$log_file" \
+      && grep -Fq "Application startup complete." "$log_file" \
+      && curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+      return
     fi
     sleep 2
   done
@@ -316,6 +351,11 @@ PY
 
 start_server() {
   local method="$1" log_file="$2" audit_file="$3"
+  if port_is_open; then
+    echo "Cannot start $method: port for $BASE_URL became occupied." >&2
+    echo "Inspect it with: ss -ltnp 'sport = :$PORT'" >&2
+    exit 2
+  fi
   if [[ "$RESUME_PARTIAL" == "1" && -s "$log_file" ]]; then
     mv "$log_file" "${log_file%.log}.interrupted_$(date +%Y%m%d_%H%M%S).log"
   fi
@@ -349,6 +389,12 @@ start_server() {
     REMTP_DYNAMIC_TREE_PROPOSAL_SUPPORT_RATIO="$DYNAMIC_PROPOSAL_SUPPORT_RATIO"
     REMTP_DYNAMIC_TREE_CONFIRMATION_MIN_RELATIVE="$DYNAMIC_CONFIRMATION_MIN_RELATIVE"
     REMTP_DYNAMIC_TREE_CACTUS_DELTA="$DYNAMIC_CACTUS_DELTA"
+    REMTP_DYNAMIC_TREE_RELAX_DEPTH_WEIGHTS="$DYNAMIC_RELAX_DEPTH_WEIGHTS"
+    REMTP_DYNAMIC_TREE_ADAPTIVE_RELAXATION="$DYNAMIC_ADAPTIVE_RELAXATION"
+    REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MIX="$DYNAMIC_ADAPTIVE_RELAX_MIX"
+    REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MAX_RATIO="$DYNAMIC_ADAPTIVE_RELAX_MAX_RATIO"
+    REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_TARGET_POWER="$DYNAMIC_ADAPTIVE_RELAX_TARGET_POWER"
+    REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_STEPS="$DYNAMIC_ADAPTIVE_RELAX_STEPS"
     REMTP_DYNAMIC_TREE_CACTUS_TARGET_WEIGHT="$DYNAMIC_CACTUS_TARGET_WEIGHT"
     REMTP_DYNAMIC_TREE_MAX_GUIDED_RESCUES="$DYNAMIC_MAX_GUIDED_RESCUES"
     REMTP_DYNAMIC_TREE_RESCUE_SCORE_THRESHOLD="$DYNAMIC_RESCUE_SCORE_THRESHOLD"
@@ -369,7 +415,7 @@ start_server() {
   setsid env "${environment[@]}" \
     "$PROJECT_DIR/scripts/serve_fastmtp_verified.sh" >"$log_file" 2>&1 &
   server_pid=$!
-  wait_for_server "$log_file"
+  wait_for_server "$method" "$log_file"
   echo "[$method] server is healthy"
   local marker
   marker="$(expected_marker "$method")"
@@ -486,6 +532,7 @@ Verified FastMTP comparison
   tree          : D=$DYNAMIC_MAX_DEPTH N_max=$DYNAMIC_MAX_NODES adaptive_base=$DYNAMIC_ADAPTIVE_BASE_NODES entropy_threshold=$DYNAMIC_ADAPTIVE_ENTROPY_THRESHOLD children_max=$DYNAMIC_MAX_CHILDREN sibling_ratio=$DYNAMIC_MIN_SIBLING_RATIO coverage=$DYNAMIC_COVERAGE_MODE
   allocation    : $DYNAMIC_ALLOCATION rank_penalty=$DYNAMIC_RANK_PENALTY
   support       : $DYNAMIC_SUPPORT_MODE relative_tau=$DYNAMIC_TAU_RELAX proposal_ratio=$DYNAMIC_PROPOSAL_SUPPORT_RATIO confirmation_min=$DYNAMIC_CONFIRMATION_MIN_RELATIVE max_guided_rescues=$DYNAMIC_MAX_GUIDED_RESCUES rescue_score_tau=$DYNAMIC_RESCUE_SCORE_THRESHOLD rescue_depth_penalty=$DYNAMIC_RESCUE_DEPTH_PENALTY continuation_discount=$DYNAMIC_RESCUE_CONTINUATION_DISCOUNT continuation_min_depth=$DYNAMIC_RESCUE_CONTINUATION_MIN_DEPTH rescue_margin_ref=$DYNAMIC_RESCUE_MARGIN_REFERENCE rescue_margin_penalty=$DYNAMIC_RESCUE_MARGIN_PENALTY
+  relaxation    : base_delta=$DYNAMIC_CACTUS_DELTA depth_weights=${DYNAMIC_RELAX_DEPTH_WEIGHTS:-uniform} adaptive=$DYNAMIC_ADAPTIVE_RELAXATION mix=$DYNAMIC_ADAPTIVE_RELAX_MIX max_ratio=$DYNAMIC_ADAPTIVE_RELAX_MAX_RATIO target_power=$DYNAMIC_ADAPTIVE_RELAX_TARGET_POWER steps=$DYNAMIC_ADAPTIVE_RELAX_STEPS
   path selector : $DYNAMIC_PATH_SELECTION beta=$DYNAMIC_BETA temperature=$DYNAMIC_PATH_TEMPERATURE
   output        : $RUN_ROOT
   live logs     : $LOG_ROOT

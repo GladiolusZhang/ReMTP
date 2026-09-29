@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from remtp.dynamic_mtp_tree import (
+    adaptive_trunk_relaxation_plan,
     adaptive_node_limit,
     cactus_trunk_rescue_verify,
     DynamicTreeConfig,
@@ -644,6 +645,197 @@ def test_exact_residual_hit_continuation_uses_branch_local_q(
     assert by_node[3]["verification_rule"] == (
         "cactus" if mode == "residual_hit_cactus" else "strict"
     )
+
+
+def test_depth_calibrated_relaxation_changes_each_native_mtp_position() -> None:
+    topology = DynamicTreeTopology.from_paths(
+        ((0,), (0, 0), (0, 0, 0)),
+        name="depth-calibrated-chain",
+    )
+    draft_ids = torch.tensor([0, 0, 0])
+    draft = torch.tensor([[0.25, 0.75]]).repeat(3, 1)
+    target = torch.tensor([[0.25, 0.75]]).repeat(4, 1)
+    weights = (1.0, 0.5, 0.25)
+    config = _residual_hit_config(
+        "residual_hit_anchor",
+        cactus_delta=1.0,
+        relaxation_depth_weights=weights,
+    )
+
+    result = residual_hit_tree_verify(
+        topology,
+        draft_ids,
+        draft,
+        target,
+        torch.Generator().manual_seed(3),
+        config=config,
+    )
+
+    rows = {int(row["trunk_position"]): row for row in result.node_diagnostics}
+    assert result.accepted_drafts == 3
+    for depth, weight in enumerate(weights, start=1):
+        row = rows[depth]
+        expected = min(
+            1.0,
+            0.25 + math.sqrt(2.0 * weight * 0.25 * 0.75),
+        )
+        assert row["relaxation_depth_weight"] == pytest.approx(weight)
+        assert row["effective_relaxation_delta"] == pytest.approx(weight)
+        assert row["verification_probability"] == pytest.approx(expected)
+        assert row["relaxation_tv"] == pytest.approx(expected - 0.25)
+
+
+def test_relaxation_depth_schedule_is_non_increasing() -> None:
+    with pytest.raises(ValueError, match="non-increasing"):
+        DynamicTreeConfig(
+            relaxation_depth_weights=(1.0, 0.8, 0.9)
+        ).validate()
+
+    config = DynamicTreeConfig(
+        relaxation_depth_weights=(1.0, 0.75, 0.5)
+    )
+    config.validate()
+    assert config.relaxation_delta(1) == pytest.approx(1.0)
+    assert config.relaxation_delta(2) == pytest.approx(0.75)
+    assert config.relaxation_delta(4) == pytest.approx(0.5)
+
+
+def test_adaptive_relaxation_recycles_only_saturation_waste() -> None:
+    topology = DynamicTreeTopology.from_paths(
+        ((0,), (0, 0), (0, 0, 0)),
+        name="adaptive-relaxation-chain",
+    )
+    draft_ids = torch.tensor([0, 0, 0])
+    draft = torch.tensor(
+        [
+            [0.35, 0.65],
+            [0.90, 0.10],
+            [0.90, 0.10],
+        ]
+    )
+    target = torch.tensor(
+        [
+            [0.30, 0.70],
+            [0.05, 0.95],
+            [0.10, 0.90],
+            [0.50, 0.50],
+        ]
+    )
+    config = _residual_hit_config(
+        "residual_hit_anchor",
+        cactus_delta=1.0,
+        adaptive_relaxation=True,
+        adaptive_relaxation_mix=0.5,
+        adaptive_relaxation_max_ratio=1.5,
+        adaptive_relaxation_target_power=0.25,
+        adaptive_relaxation_steps=16,
+    )
+
+    plan = adaptive_trunk_relaxation_plan(
+        topology,
+        draft_ids,
+        draft,
+        target,
+        config=config,
+    )
+
+    rows = [plan[index] for index in range(3)]
+    assert rows[0]["adaptive_relaxation_tv"] == pytest.approx(0.05)
+    assert rows[0]["baseline_relaxation_tv"] > 0.05
+    assert sum(row["adaptive_relaxation_tv"] for row in rows) <= (
+        rows[0]["adaptive_block_baseline_tv"] + 1e-7
+    )
+    assert any(
+        row["adaptive_relaxation_tv"] > row["baseline_relaxation_tv"]
+        for row in rows[1:]
+    )
+    for row in rows:
+        assert row["adaptive_relaxation_tv"] <= (
+            row["saturation_relaxation_tv"] + 1e-7
+        )
+
+
+def test_adaptive_relaxation_is_audited_on_residual_hit_trunk() -> None:
+    topology = DynamicTreeTopology.from_paths(
+        ((0,), (0, 0), (0, 0, 0)),
+        name="adaptive-relaxation-audit",
+    )
+    draft_ids = torch.tensor([0, 0, 0])
+    draft = torch.tensor([[0.30, 0.70]]).repeat(3, 1)
+    target = torch.tensor([[0.25, 0.75]]).repeat(4, 1)
+    result = residual_hit_tree_verify(
+        topology,
+        draft_ids,
+        draft,
+        target,
+        torch.Generator().manual_seed(4),
+        config=_residual_hit_config(
+            "residual_hit_anchor",
+            cactus_delta=1.0,
+            adaptive_relaxation=True,
+        ),
+    )
+
+    rows = tuple(result.node_diagnostics)
+    assert rows
+    assert all(bool(row["adaptive_relaxation_enabled"]) for row in rows)
+    assert all("adaptive_block_baseline_tv" in row for row in rows)
+    assert all(
+        float(row["adaptive_block_tv"])
+        <= float(row["adaptive_block_baseline_tv"]) + 1e-7
+        for row in rows
+    )
+
+
+def test_adaptive_relaxation_never_reduces_uniform_acceptance() -> None:
+    topology = DynamicTreeTopology.from_paths(
+        ((0,), (0, 0), (0, 0, 0)),
+        name="adaptive-relaxation-property",
+    )
+    generator = torch.Generator().manual_seed(20260819)
+    config = _residual_hit_config(
+        "residual_hit_anchor",
+        cactus_delta=1.0,
+        adaptive_relaxation=True,
+    )
+    for _ in range(32):
+        draft = torch.rand((3, 7), generator=generator)
+        draft /= draft.sum(dim=-1, keepdim=True)
+        target = torch.rand((4, 7), generator=generator)
+        target /= target.sum(dim=-1, keepdim=True)
+        draft_ids = draft.argmax(dim=-1)
+        plan = adaptive_trunk_relaxation_plan(
+            topology,
+            draft_ids,
+            draft,
+            target,
+            config=config,
+        )
+        adaptive_total = 0.0
+        baseline_total = 0.0
+        for node in topology.nodes:
+            row = plan[node.index]
+            parent_row = 0 if node.parent is None else node.parent + 1
+            token_id = int(draft_ids[node.index])
+            p_y = float(target[parent_row, token_id])
+            q_y = float(draft[node.index, token_id])
+            baseline_acceptance = min(
+                1.0,
+                (p_y + row["baseline_relaxation_tv"])
+                / max(q_y, 1e-30),
+            )
+            adaptive_acceptance = min(
+                1.0,
+                (p_y + row["adaptive_relaxation_tv"])
+                / max(q_y, 1e-30),
+            )
+            assert adaptive_acceptance + 1e-7 >= baseline_acceptance
+            assert row["adaptive_relaxation_tv"] <= (
+                row["saturation_relaxation_tv"] + 1e-7
+            )
+            adaptive_total += row["adaptive_relaxation_tv"]
+            baseline_total += row["baseline_relaxation_tv"]
+        assert adaptive_total <= baseline_total + 1e-7
 
 
 def test_cactus_trunk_rescue_falls_back_to_cactus_residual() -> None:

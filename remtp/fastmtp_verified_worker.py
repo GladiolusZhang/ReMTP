@@ -20,8 +20,9 @@ class FastMTPVerifiedNativeWorker(Worker):
 
         _install_fastmtp_runtime()
         install_probabilistic_mtp()
+        result = super().init_device(*args, **kwargs)
         print("[ReMTP][FastMTPVerified] method=native worker=active", flush=True)
-        return super().init_device(*args, **kwargs)
+        return result
 
 
 class FastMTPVerifiedCactusWorker(Worker):
@@ -32,8 +33,9 @@ class FastMTPVerifiedCactusWorker(Worker):
         _install_fastmtp_runtime()
         install_probabilistic_mtp()
         install_cactus_mtp()
+        result = super().init_device(*args, **kwargs)
         print("[ReMTP][FastMTPVerified] method=cactus worker=active", flush=True)
-        return super().init_device(*args, **kwargs)
+        return result
 
 
 class FastMTPVerifiedSpecCascadeWorker(Worker):
@@ -44,8 +46,9 @@ class FastMTPVerifiedSpecCascadeWorker(Worker):
         _install_fastmtp_runtime()
         install_probabilistic_mtp()
         install_speculative_cascade()
+        result = super().init_device(*args, **kwargs)
         print("[ReMTP][FastMTPVerified] method=spec_cascade worker=active", flush=True)
-        return super().init_device(*args, **kwargs)
+        return result
 
 
 class FastMTPVerifiedDynamicTreeWorker(Worker):
@@ -54,9 +57,10 @@ class FastMTPVerifiedDynamicTreeWorker(Worker):
 
         _install_fastmtp_runtime()
         install_mimo_dynamic_tree()
+        result = super().init_device(*args, **kwargs)
         print(
             "[ReMTP][FastMTPVerified] method=dynamic_tree worker=active "
             "physical_mtp_route=repeat_0",
             flush=True,
         )
-        return super().init_device(*args, **kwargs)
+        return result

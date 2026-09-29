@@ -1,9 +1,150 @@
-# ReMTP：最小可观察 Qwen3.5 MTP
+# RAVEN / ReMTP
 
-> 当前仓库已经从最小 Qwen MTP trace 扩展到概率 MTP、Cactus、
-> SpecCascade、ReMTP、GSM8K/HumanEval、MiMo/FastMTP 与树验证研究。
-> 所有阶段、负结果、有效入口和后续修改统一记录在
-> [研究与开发总日志](docs/research_and_development_log.md)。
+本分支的当前方法是面向 native MTP 的 RAVEN：以 FastMTP 的完整 proposal
+distribution 构造三步主路径和稀疏备选树，在一次目标模型 Tree Attention
+验证后进行候选条件化概率接受；主路径拒绝时先从残差分布采样 correction，随后通过
+token-ID 精确匹配复用已验证 sibling 状态。当前推荐配置进一步加入接受饱和截断和
+块内 actual-TV 自适应分配。
+
+研究过程、失效路线、协议变化和验证状态统一记录在
+[研究与开发总日志](docs/research_and_development_log.md)。模型、数据、实验结果与运行日志
+保存在本地忽略目录，不随代码上传。
+
+## 当前推荐流程：FastMTP + RAVEN
+
+### 1. 获取代码与安装环境
+
+```bash
+git clone --branch research/residual-aligned-tree-mtp \
+  https://github.com/GladiolusZhang/ReMTP.git
+cd ReMTP
+./scripts/install.sh
+source .venv/bin/activate
+```
+
+当前适配使用 vLLM 0.18.0、单请求执行和 NVIDIA GPU。实验脚本会检查端口、服务
+Worker 标记和输出完整性，端口 8000 被其他服务占用时会停止运行。
+
+### 2. 下载 FastMTP checkpoint
+
+默认从 Hugging Face 官方端点下载到 `models/FastMTP`：
+
+```bash
+source .venv/bin/activate
+HF_ENDPOINT=https://huggingface.co ./scripts/download_fastmtp.sh
+```
+
+如果 checkpoint 已经位于其他目录，运行实验时设置：
+
+```bash
+MODEL_PATH=/absolute/path/to/FastMTP
+```
+
+FastMTP checkpoint 约 15.7GB，包含一个训练后的物理 MTP layer。实验中的三个逻辑
+proposal 位置递归复用该层。
+
+### 3. 准备 GSM8K 与 HumanEval
+
+```bash
+mkdir -p data/gsm8k
+curl -L \
+  https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl \
+  -o data/gsm8k/test.jsonl
+
+./scripts/setup_humaneval.sh
+./scripts/download_humaneval.sh
+docker pull python:3-slim
+```
+
+HumanEval 生成和执行相互分离；候选代码在受限 Docker 容器中运行，判题时间不计入
+模型生成吞吐。
+
+### 4. 环境检查与 CPU 测试
+
+```bash
+./scripts/validate_fastmtp_setup.sh
+
+python -m pytest -q \
+  tests/test_dynamic_mtp_tree.py \
+  tests/test_raven_adaptive_relaxation_report.py \
+  tests/test_raven_depth_relaxation_report.py
+```
+
+### 5. 快速冒烟测试
+
+运行 GSM8K 5 条和 HumanEval 5 条：
+
+```bash
+SAMPLES=5 \
+PROGRESS_EVERY=1 \
+RUN_TAG=raven_adaptive_smoke \
+./scripts/run_fastmtp_raven_adaptive_relaxation.sh
+```
+
+脚本依次比较：
+
+- Native FastMTP；
+- Cactus + FastMTP；
+- SpecCascade TokenV3 + FastMTP；
+- uniform RAVEN；
+- saturation-aware adaptive RAVEN。
+
+Target-only 不在默认对比中。所有方法使用同一 FastMTP checkpoint、相同抽样题目、
+temperature 0.6、generation seed 42、空 system prompt 和 no-thinking 模板。
+
+### 6. 运行 100+100 正式对比
+
+```bash
+SAMPLES=100 \
+PROGRESS_EVERY=1 \
+RUN_TAG=raven_adaptive_n100 \
+./scripts/run_fastmtp_raven_adaptive_relaxation.sh
+```
+
+运行中断后，重复完全相同的命令即可从请求级 checkpoint 继续；完成的方法和数据集会
+自动跳过。若端口 8000 已被其他服务占用，先停止该服务再重新运行。
+
+结果写入本地：
+
+```text
+results/raven_adaptive_n100/comparison.md
+results/raven_adaptive_n100/{uniform,adaptive}/gsm8k/
+results/raven_adaptive_n100/{uniform,adaptive}/humaneval/
+logs/raven_adaptive_n100/{uniform,adaptive}/
+```
+
+其中汇总表报告任务质量、MAL、decode/E2E tok/s、草稿接受率、nodes/round、逐深度
+acceptance 和块级 actual-TV。`results/` 与 `logs/` 已被 `.gitignore` 排除。
+
+### 7. 关键参数
+
+推荐默认值由统一入口固定：
+
+```text
+MTP depth                 3
+maximum tree nodes        9
+maximum children          3
+base relaxation delta     1.0
+adaptive mix              0.5
+per-position TV cap       1.5 x baseline
+target-support exponent   0.25
+allocation steps          16
+```
+
+可以在命令行覆盖自适应松弛参数：
+
+```bash
+SAMPLES=20 \
+RAVEN_BASE_DELTA=1.0 \
+ADAPTIVE_MIX=0.5 \
+ADAPTIVE_MAX_RATIO=1.5 \
+ADAPTIVE_TARGET_POWER=0.25 \
+ADAPTIVE_STEPS=16 \
+RUN_TAG=raven_custom \
+./scripts/run_fastmtp_raven_adaptive_relaxation.sh
+```
+
+## 历史功能：可观察 Qwen3.5 MTP
 
 这个仓库最初用于用 vLLM 启动 `Qwen/Qwen3.5-4B` 的 MTP，并在服务端终端逐轮打印：
 

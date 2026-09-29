@@ -51,6 +51,12 @@ class DynamicTreeConfig:
     proposal_support_ratio: float = 1.0
     confirmation_min_relative: float = 0.05
     cactus_delta: float = 1.0
+    relaxation_depth_weights: tuple[float, ...] = ()
+    adaptive_relaxation: bool = False
+    adaptive_relaxation_mix: float = 0.5
+    adaptive_relaxation_max_ratio: float = 1.5
+    adaptive_relaxation_target_power: float = 0.25
+    adaptive_relaxation_steps: int = 16
     cactus_target_weight: float = 0.25
     max_guided_rescues_per_path: int = 1
     rescue_score_threshold: float = 0.35
@@ -143,6 +149,39 @@ class DynamicTreeConfig:
             raise ValueError("confirmation_min_relative must be in [0,1]")
         if self.cactus_delta < 0.0:
             raise ValueError("cactus_delta must be non-negative")
+        if any(
+            not math.isfinite(weight) or weight < 0.0
+            for weight in self.relaxation_depth_weights
+        ):
+            raise ValueError(
+                "relaxation_depth_weights must be finite and non-negative"
+            )
+        if any(
+            later > earlier
+            for earlier, later in zip(
+                self.relaxation_depth_weights,
+                self.relaxation_depth_weights[1:],
+            )
+        ):
+            raise ValueError(
+                "relaxation_depth_weights must be non-increasing"
+            )
+        if not 0.0 <= self.adaptive_relaxation_mix <= 1.0:
+            raise ValueError(
+                "adaptive_relaxation_mix must be in [0,1]"
+            )
+        if self.adaptive_relaxation_max_ratio < 1.0:
+            raise ValueError(
+                "adaptive_relaxation_max_ratio must be at least 1"
+            )
+        if self.adaptive_relaxation_target_power < 0.0:
+            raise ValueError(
+                "adaptive_relaxation_target_power must be non-negative"
+            )
+        if self.adaptive_relaxation_steps <= 0:
+            raise ValueError(
+                "adaptive_relaxation_steps must be positive"
+            )
         if not 0.0 <= self.cactus_target_weight <= 1.0:
             raise ValueError("cactus_target_weight must be in [0,1]")
         if self.max_guided_rescues_per_path < 0:
@@ -192,6 +231,25 @@ class DynamicTreeConfig:
             raise ValueError("eos_token_ids must be unique")
         if not 0.0 <= self.eos_protection_threshold <= 1.0:
             raise ValueError("eos_protection_threshold must be in [0,1]")
+
+    def relaxation_weight(self, depth: int) -> float:
+        """Return the native-MTP reliability weight for a 1-based depth.
+
+        An empty schedule preserves the historical uniform relaxation.  When
+        a run explores more logical depths than the calibrated schedule, the
+        final calibrated weight is extended to those depths rather than
+        silently restoring the more permissive weight at depth one.
+        """
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        if not self.relaxation_depth_weights:
+            return 1.0
+        index = min(depth, len(self.relaxation_depth_weights)) - 1
+        return float(self.relaxation_depth_weights[index])
+
+    def relaxation_delta(self, depth: int) -> float:
+        """Return ``delta_i = delta * w_i`` for a native-MTP depth."""
+        return self.cactus_delta * self.relaxation_weight(depth)
 
 
 @dataclass(frozen=True)
@@ -640,10 +698,12 @@ def cactus_trunk_rescue_verify(
         p_row = target[parent_row]
         q_row = draft[trunk_node]
         token_id = int(ids[trunk_node])
+        relaxation_weight = config.relaxation_weight(node.depth)
+        effective_delta = config.relaxation_delta(node.depth)
         h_row = cactus_target_distribution(
             p_row.unsqueeze(0),
             ids[trunk_node : trunk_node + 1],
-            config.cactus_delta,
+            effective_delta,
         )[0]
         p_y = float(p_row[token_id])
         q_y = float(q_row[token_id])
@@ -660,6 +720,9 @@ def cactus_trunk_rescue_verify(
             "trunk_position": position,
             "target_probability": p_y,
             "draft_probability": q_y,
+            "relaxation_depth_weight": relaxation_weight,
+            "effective_relaxation_delta": effective_delta,
+            "relaxation_tv": max(0.0, h_y - p_y),
             "cactus_boosted_probability": h_y,
             "cactus_acceptance_probability": accept_probability,
             "cactus_random": random_value,
@@ -915,6 +978,183 @@ def cactus_trunk_rescue_verify(
     )
 
 
+def _candidate_boost_distribution(
+    target_probs: torch.Tensor,
+    token_id: int,
+    boosted_probability: float,
+) -> torch.Tensor:
+    """Move probability mass to one token while preserving all other ratios."""
+    original = float(target_probs[token_id])
+    boosted = min(max(float(boosted_probability), original), 1.0)
+    if boosted <= original or original >= 1.0:
+        return target_probs
+    scale = (1.0 - boosted) / max(1.0 - original, 1e-30)
+    result = target_probs * scale
+    result = result.clone()
+    result[token_id] = boosted
+    return result / result.sum().clamp_min(1e-30)
+
+
+def adaptive_trunk_relaxation_plan(
+    topology: DynamicTreeTopology,
+    draft_token_ids: torch.Tensor,
+    draft_probs: torch.Tensor,
+    target_probs_by_input: torch.Tensor,
+    *,
+    config: DynamicTreeConfig,
+) -> dict[int, dict[str, float]]:
+    """Allocate a uniform control's actual TV to useful trunk positions.
+
+    The historical candidate-conditioned transform may keep increasing a
+    candidate after ``h(y) >= q(y)`` even though its acceptance probability is
+    already one.  This planner caps every trunk position at that saturation
+    point, retains the uniform transform at unsaturated positions, and spends
+    a configurable fraction of the recovered TV on remaining bottlenecks.
+
+    Allocation utility is the exact local slope of chain expected MAL,
+    ``reach * suffix_value / q(y)``, multiplied by a mild target-relative
+    support term.  The planner therefore adapts to the current verified block
+    instead of assigning a fixed reliability multiplier to every request.
+    Its total realized local TV never exceeds the static control's total.
+    """
+    config.validate()
+    path_to_index = {node.path: node.index for node in topology.nodes}
+    trunk = []
+    for depth in range(1, topology.max_depth + 1):
+        path = (0,) * depth
+        if path not in path_to_index:
+            raise ValueError(
+                "adaptive relaxation requires a sampled primary trunk at "
+                f"depth {depth}"
+            )
+        trunk.append(path_to_index[path])
+
+    device = target_probs_by_input.device
+    ids = draft_token_ids.to(device=device, dtype=torch.int64)
+    draft = draft_probs.to(device=device, dtype=torch.float32).clamp_min(0.0)
+    target = target_probs_by_input.to(torch.float32).clamp_min(0.0)
+    trunk_tensor = torch.tensor(trunk, dtype=torch.int64, device=device)
+    parent_rows = torch.tensor(
+        [
+            0 if topology.nodes[index].parent is None
+            else int(topology.nodes[index].parent) + 1
+            for index in trunk
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    trunk_ids = ids.index_select(0, trunk_tensor)
+    p = target[parent_rows, trunk_ids]
+    q = draft[trunk_tensor, trunk_ids]
+    p_max = target.index_select(0, parent_rows).max(dim=-1).values
+    base_delta = torch.tensor(
+        [config.relaxation_delta(topology.nodes[index].depth) for index in trunk],
+        dtype=p.dtype,
+        device=device,
+    )
+    baseline_tv = torch.minimum(
+        torch.sqrt((2.0 * base_delta * p * (1.0 - p)).clamp_min(0.0)),
+        1.0 - p,
+    )
+    saturation_tv = (q - p).clamp(min=0.0)
+    floor_tv = torch.minimum(baseline_tv, saturation_tv)
+    max_tv = torch.minimum(
+        saturation_tv,
+        baseline_tv * config.adaptive_relaxation_max_ratio,
+    )
+
+    values = torch.stack(
+        (p, q, p_max, base_delta, baseline_tv, saturation_tv, floor_tv, max_tv),
+        dim=-1,
+    ).detach().cpu().tolist()
+    p_values = [float(row[0]) for row in values]
+    q_values = [float(row[1]) for row in values]
+    relative_values = [
+        float(row[0]) / max(float(row[2]), 1e-30) for row in values
+    ]
+    baseline_values = [float(row[4]) for row in values]
+    saturation_values = [float(row[5]) for row in values]
+    allocated = [float(row[6]) for row in values]
+    maximum = [float(row[7]) for row in values]
+    recovered = sum(
+        max(0.0, baseline - current)
+        for baseline, current in zip(baseline_values, allocated)
+    )
+    pool = config.adaptive_relaxation_mix * recovered
+    initial_pool = pool
+    initial_utility = [0.0] * len(trunk)
+
+    for iteration in range(config.adaptive_relaxation_steps):
+        if pool <= 1e-15:
+            break
+        acceptance = [
+            min(1.0, (p_value + tv) / max(q_value, 1e-30))
+            for p_value, q_value, tv in zip(p_values, q_values, allocated)
+        ]
+        reach = []
+        prefix = 1.0
+        for probability in acceptance:
+            reach.append(prefix)
+            prefix *= probability
+        suffix = [1.0] * len(trunk)
+        for index in range(len(trunk) - 2, -1, -1):
+            suffix[index] = 1.0 + acceptance[index + 1] * suffix[index + 1]
+        utility = [
+            (
+                reach[index]
+                * suffix[index]
+                / max(q_values[index], 1e-30)
+                * max(relative_values[index], 1e-30)
+                ** config.adaptive_relaxation_target_power
+            )
+            if maximum[index] - allocated[index] > 1e-15
+            else -1.0
+            for index in range(len(trunk))
+        ]
+        if iteration == 0:
+            initial_utility = [max(value, 0.0) for value in utility]
+        chosen = max(range(len(trunk)), key=utility.__getitem__)
+        if utility[chosen] < 0.0:
+            break
+        increment = min(
+            pool,
+            maximum[chosen] - allocated[chosen],
+            pool / (config.adaptive_relaxation_steps - iteration),
+        )
+        if increment <= 1e-15:
+            break
+        allocated[chosen] += increment
+        pool -= increment
+
+    spent = initial_pool - pool
+    total_baseline = sum(baseline_values)
+    total_adaptive = sum(allocated)
+    plan: dict[int, dict[str, float]] = {}
+    for position, node_index in enumerate(trunk):
+        p_value = p_values[position]
+        tv = allocated[position]
+        denominator = 2.0 * p_value * (1.0 - p_value)
+        effective_delta = tv * tv / denominator if denominator > 1e-30 else 0.0
+        actual_weight = (
+            effective_delta / config.cactus_delta
+            if config.cactus_delta > 0.0
+            else 0.0
+        )
+        plan[node_index] = {
+            "baseline_relaxation_tv": baseline_values[position],
+            "saturation_relaxation_tv": saturation_values[position],
+            "adaptive_relaxation_tv": tv,
+            "adaptive_effective_delta": effective_delta,
+            "adaptive_depth_weight": actual_weight,
+            "adaptive_initial_utility": initial_utility[position],
+            "adaptive_block_baseline_tv": total_baseline,
+            "adaptive_block_tv": total_adaptive,
+            "adaptive_block_recovered_tv": recovered,
+            "adaptive_block_spent_tv": spent,
+        }
+    return plan
+
+
 def residual_hit_tree_verify(
     topology: DynamicTreeTopology,
     draft_token_ids: torch.Tensor,
@@ -935,10 +1175,13 @@ def residual_hit_tree_verify(
     * ``residual_hit_strict`` verifies sampled-Q descendants with ``p/q``;
     * ``residual_hit_cactus`` verifies them with the same Cactus rule.
 
-    Anchor and strict modes preserve the Cactus-primary output distribution
-    provided that every local-rank-0 descendant was independently sampled
-    from its recorded Q.  The Cactus continuation deliberately follows the
-    relaxed Cactus distribution at subsequent positions.
+    With adaptive relaxation disabled, anchor and strict modes preserve the
+    Cactus-primary output distribution provided that every local-rank-0
+    descendant was independently sampled from its recorded Q.  Adaptive
+    relaxation uses already computed signals from the complete verified block
+    to redistribute actual TV, so it defines an approximate block-relaxed
+    target.  The Cactus continuation deliberately follows the relaxed Cactus
+    distribution at subsequent positions.
     """
     config.validate()
     modes = {
@@ -980,6 +1223,18 @@ def residual_hit_tree_verify(
             )
         trunk.append(path_to_index[path])
 
+    adaptive_plan = (
+        adaptive_trunk_relaxation_plan(
+            topology,
+            ids,
+            draft,
+            target,
+            config=config,
+        )
+        if config.adaptive_relaxation
+        else {}
+    )
+
     statuses = {node.index: "NOT_VISITED" for node in topology.nodes}
     diagnostics: dict[int, dict[str, Any]] = {}
     accepted: list[int] = []
@@ -994,17 +1249,31 @@ def residual_hit_tree_verify(
         p_row = target[parent_row]
         q_row = draft[node_index]
         token_id = int(ids[node_index])
-        verify_row = (
-            cactus_target_distribution(
-                p_row.unsqueeze(0),
-                ids[node_index : node_index + 1],
-                config.cactus_delta,
-            )[0]
-            if use_cactus
-            else p_row
-        )
         p_y = float(p_row[token_id])
         q_y = float(q_row[token_id])
+        base_relaxation_weight = config.relaxation_weight(node.depth)
+        base_effective_delta = config.relaxation_delta(node.depth)
+        node_plan = adaptive_plan.get(node_index) if use_cactus else None
+        if node_plan is not None:
+            relaxation_weight = float(node_plan["adaptive_depth_weight"])
+            effective_delta = float(node_plan["adaptive_effective_delta"])
+            verify_row = _candidate_boost_distribution(
+                p_row,
+                token_id,
+                p_y + float(node_plan["adaptive_relaxation_tv"]),
+            )
+        else:
+            relaxation_weight = base_relaxation_weight
+            effective_delta = base_effective_delta
+            verify_row = (
+                cactus_target_distribution(
+                    p_row.unsqueeze(0),
+                    ids[node_index : node_index + 1],
+                    effective_delta,
+                )[0]
+                if use_cactus
+                else p_row
+            )
         verify_y = float(verify_row[token_id])
         accept_probability = min(1.0, verify_y / max(q_y, 1e-30))
         random_value = float(
@@ -1020,6 +1289,19 @@ def residual_hit_tree_verify(
             "trunk_position": node.depth,
             "target_probability": p_y,
             "draft_probability": q_y,
+            "relaxation_depth_weight": (
+                relaxation_weight if use_cactus else 0.0
+            ),
+            "base_relaxation_depth_weight": (
+                base_relaxation_weight if use_cactus else 0.0
+            ),
+            "effective_relaxation_delta": (
+                effective_delta if use_cactus else 0.0
+            ),
+            "base_effective_relaxation_delta": (
+                base_effective_delta if use_cactus else 0.0
+            ),
+            "relaxation_tv": max(0.0, verify_y - p_y),
             "verification_probability": verify_y,
             "verification_rule": "cactus" if use_cactus else "strict",
             "accept_probability": accept_probability,
@@ -1028,6 +1310,11 @@ def residual_hit_tree_verify(
             "rescue_eligible": False,
             "rescued": False,
         }
+        if node_plan is not None:
+            row.update(node_plan)
+            row["adaptive_relaxation_enabled"] = True
+        else:
+            row["adaptive_relaxation_enabled"] = False
         return keep, residual_distribution(verify_row, q_row), row
 
     for position, trunk_node in enumerate(trunk, start=1):
@@ -1358,16 +1645,25 @@ def target_dominant_relaxed_verify(
         eos_mass = torch.zeros_like(confidence)
         eos_protected = torch.zeros_like(confidence, dtype=torch.bool)
 
-    # Match the local relaxation strength used by the chain Cactus baseline.
+    # Calibrate the candidate-conditioned relaxation by native-MTP prediction
+    # depth.  An empty schedule produces the historical uniform-delta control.
     # Direct ``cactus`` uses this as its complete node-survival rule. The
     # proposed ``cactus_guided`` mode uses it only as a risk-calibration prior
     # after the target-relative tree verifier reaches a dead frontier.
+    relaxation_depth_weight = torch.tensor(
+        [config.relaxation_weight(node.depth) for node in topology.nodes],
+        dtype=child_target_prob.dtype,
+        device=child_target_prob.device,
+    )
+    effective_relaxation_delta = (
+        relaxation_depth_weight * config.cactus_delta
+    )
     cactus_boosted = (
         child_target_prob
         + torch.sqrt(
             (
                 2.0
-                * config.cactus_delta
+                * effective_relaxation_delta
                 * child_target_prob
                 * (1.0 - child_target_prob)
             ).clamp_min(0.0)
@@ -1377,6 +1673,7 @@ def target_dominant_relaxed_verify(
         torch.ones_like(cactus_boosted),
         cactus_boosted / child_draft_prob.clamp_min(1e-30),
     )
+    relaxation_tv = (cactus_boosted - child_target_prob).clamp_min(0.0)
     cactus_path_confidence = (
         relative.clamp_min(1e-30).pow(config.cactus_target_weight)
         * cactus_acceptance.clamp_min(1e-30).pow(
@@ -1408,6 +1705,9 @@ def target_dominant_relaxed_verify(
             cactus_random,
             cactus_path_confidence,
             row_log_margin[parent_rows],
+            relaxation_depth_weight,
+            effective_relaxation_delta,
+            relaxation_tv,
         ),
         dim=-1,
     )
@@ -1446,6 +1746,9 @@ def target_dominant_relaxed_verify(
                     node_cactus_random,
                     node_cactus_path_confidence,
                     node_target_log_margin,
+                    node_relaxation_depth_weight,
+                    node_effective_relaxation_delta,
+                    node_relaxation_tv,
                 ) = local_signal_rows[child]
                 eos_veto = bool(node_eos_protected)
                 # target_path_rescue deliberately judges the concrete token
@@ -1507,6 +1810,13 @@ def target_dominant_relaxed_verify(
                         "target_confirmed": target_confirmed,
                         "cactus_boosted_probability": node_cactus_boosted,
                         "cactus_acceptance_probability": node_cactus_acceptance,
+                        "relaxation_depth_weight": (
+                            node_relaxation_depth_weight
+                        ),
+                        "effective_relaxation_delta": (
+                            node_effective_relaxation_delta
+                        ),
+                        "relaxation_tv": node_relaxation_tv,
                         "cactus_random": (
                             node_cactus_random
                             if config.support_mode == "cactus"

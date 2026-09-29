@@ -31,6 +31,20 @@ _ORIGINAL_TREE_RUN: Any | None = None
 _BRANCH_PROPOSAL_ROUND = 0
 
 
+def _parse_relaxation_depth_weights(raw: str) -> tuple[float, ...]:
+    """Parse a comma-separated, 1-based native-MTP depth schedule."""
+    value = raw.strip()
+    if not value:
+        return ()
+    try:
+        return tuple(float(part.strip()) for part in value.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            "REMTP_DYNAMIC_TREE_RELAX_DEPTH_WEIGHTS must be a "
+            "comma-separated float list"
+        ) from exc
+
+
 def _copy_variable_drafts_to_cpu(
     self: Any,
     scheduler_output: Any,
@@ -128,6 +142,24 @@ def dynamic_tree_config_from_env() -> DynamicTreeConfig:
         ),
         cactus_delta=float(
             os.getenv("REMTP_DYNAMIC_TREE_CACTUS_DELTA", "1.0")
+        ),
+        relaxation_depth_weights=_parse_relaxation_depth_weights(
+            os.getenv("REMTP_DYNAMIC_TREE_RELAX_DEPTH_WEIGHTS", "")
+        ),
+        adaptive_relaxation=os.getenv(
+            "REMTP_DYNAMIC_TREE_ADAPTIVE_RELAXATION", "0"
+        ) == "1",
+        adaptive_relaxation_mix=float(
+            os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MIX", "0.5")
+        ),
+        adaptive_relaxation_max_ratio=float(
+            os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MAX_RATIO", "1.5")
+        ),
+        adaptive_relaxation_target_power=float(
+            os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_TARGET_POWER", "0.25")
+        ),
+        adaptive_relaxation_steps=int(
+            os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_STEPS", "16")
         ),
         cactus_target_weight=float(
             os.getenv("REMTP_DYNAMIC_TREE_CACTUS_TARGET_WEIGHT", "0.25")
@@ -887,6 +919,13 @@ def install_mimo_dynamic_tree() -> None:
         f"support_mode={config.support_mode} "
         f"proposal={proposal_name} "
         f"cactus_delta={config.cactus_delta:g} "
+        "relax_depth_weights="
+        f"{list(config.relaxation_depth_weights) or ['uniform']} "
+        f"adaptive_relaxation={int(config.adaptive_relaxation)} "
+        f"adaptive_mix={config.adaptive_relaxation_mix:g} "
+        f"adaptive_max_ratio={config.adaptive_relaxation_max_ratio:g} "
+        f"adaptive_target_power={config.adaptive_relaxation_target_power:g} "
+        f"adaptive_steps={config.adaptive_relaxation_steps} "
         f"cactus_target_weight={config.cactus_target_weight:g} "
         f"max_guided_rescues={config.max_guided_rescues_per_path} "
         f"rescue_score_threshold={config.rescue_score_threshold:g} "
