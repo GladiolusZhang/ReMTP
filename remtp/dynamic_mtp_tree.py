@@ -55,8 +55,15 @@ class DynamicTreeConfig:
     adaptive_relaxation: bool = False
     adaptive_relaxation_mix: float = 0.5
     adaptive_relaxation_max_ratio: float = 1.5
+    # 0 preserves the historical transform. Otherwise bound sampled H(y)/P(y).
+    relaxation_max_probability_ratio: float = 0.0
     adaptive_relaxation_target_power: float = 0.25
     adaptive_relaxation_steps: int = 16
+    # Opt-in, fixed target-odds guard; no task IDs, gold or forced stops.
+    relaxation_risk_policy: str = "none"
+    prune_anchor_descendants: bool = False
+    exact_topk_candidates: bool = False
+    anchor_only_proposal: bool = False
     cactus_target_weight: float = 0.25
     max_guided_rescues_per_path: int = 1
     rescue_score_threshold: float = 0.35
@@ -75,8 +82,17 @@ class DynamicTreeConfig:
     append_target_anchor: bool = True
     eos_token_ids: tuple[int, ...] = ()
     eos_protection_threshold: float = 0.5
+    protect_eos_relaxation: bool = False
 
     def validate(self) -> None:
+        if self.protect_eos_relaxation and not self.eos_token_ids:
+            raise ValueError("EOS relaxation protection requires eos_token_ids")
+        if self.prune_anchor_descendants and self.support_mode != "residual_hit_anchor":
+            raise ValueError("anchor pruning requires residual_hit_anchor mode")
+        if self.anchor_only_proposal and (
+            self.support_mode != "residual_hit_anchor" or self.adaptive_base_nodes != 0
+        ):
+            raise ValueError("anchor-only proposal requires anchor mode and a fixed node budget")
         if self.max_depth <= 0:
             raise ValueError("max_depth must be positive")
         if self.max_nodes <= 0:
@@ -174,6 +190,10 @@ class DynamicTreeConfig:
             raise ValueError(
                 "adaptive_relaxation_max_ratio must be at least 1"
             )
+        if (not math.isfinite(self.relaxation_max_probability_ratio)
+                or (self.relaxation_max_probability_ratio != 0.0
+                    and self.relaxation_max_probability_ratio < 1.0)):
+            raise ValueError("relaxation_max_probability_ratio must be 0 or finite >= 1")
         if self.adaptive_relaxation_target_power < 0.0:
             raise ValueError(
                 "adaptive_relaxation_target_power must be non-negative"
@@ -182,6 +202,12 @@ class DynamicTreeConfig:
             raise ValueError(
                 "adaptive_relaxation_steps must be positive"
             )
+        if self.relaxation_risk_policy not in ("none", "target_odds"):
+            raise ValueError("Unknown relaxation_risk_policy")
+        if self.relaxation_risk_policy != "none" and (
+            not self.adaptive_relaxation or self.support_mode != "residual_hit_anchor"
+        ):
+            raise ValueError("target_odds requires adaptive residual_hit_anchor")
         if not 0.0 <= self.cactus_target_weight <= 1.0:
             raise ValueError("cactus_target_weight must be in [0,1]")
         if self.max_guided_rescues_per_path < 0:
@@ -374,12 +400,52 @@ class DynamicTreeTopology:
         return mask
 
 
+def anchor_reusable_topology(
+    topology: DynamicTreeTopology,
+) -> tuple[DynamicTreeTopology, tuple[int, ...]]:
+    """Keep primary nodes and direct siblings after original budget decisions.
+
+    Anchor verification stops after a sibling hit and one target token. The
+    returned indices map retained rows to the original tree. Never apply this
+    rule to strict/cactus continuation, which can read sibling descendants.
+    """
+    indices = tuple(node.index for node in topology.nodes
+                    if all(rank == 0 for rank in node.path[:-1]))
+    return DynamicTreeTopology.from_paths(
+        [topology.nodes[index].path for index in indices], name=topology.name,
+    ), indices
+
+
 def normalized_entropy(probs: torch.Tensor) -> float:
     q = normalize_distribution(probs)
     if q.numel() <= 1:
         return 0.0
     entropy = -(q * q.clamp_min(1e-30).log()).sum()
     return float(entropy / math.log(q.numel()))
+
+
+def stable_topk_indices(probs: torch.Tensor, count: int) -> torch.Tensor:
+    """Exact prefix of stable descending argsort without a vocabulary sort.
+
+    torch.topk alone has unspecified tie order. Include the lowest token IDs
+    at its cutoff, deduplicate and stably sort this small set to preserve the
+    reference's ascending-token-ID tie rule, including uniform distributions.
+    """
+    count = min(max(count, 0), probs.numel())
+    if count == 0:
+        return torch.empty(0, dtype=torch.int64, device=probs.device)
+    if count == probs.numel():
+        return torch.argsort(probs, descending=True, stable=True)
+    # One extra value proves both the prefix order and the cutoff have no ties.
+    # This is the common case; avoid nonzero/unique and the small-set sort.
+    values, indices = torch.topk(probs, count + 1, sorted=True)
+    if not bool((values[:-1] == values[1:]).any()):
+        return indices[:count]
+    values, indices = values[:count], indices[:count]
+    ties = torch.nonzero(probs == values[-1], as_tuple=False).flatten()[:count]
+    candidates = torch.unique(torch.cat((indices, ties)), sorted=True)
+    order = torch.argsort(probs[candidates], descending=True, stable=True)
+    return candidates[order[:count]]
 
 
 def select_dynamic_candidates(
@@ -424,9 +490,13 @@ def select_dynamic_candidates(
             sibling_added=False,
         )
 
-    global_order = torch.argsort(q, descending=True, stable=True)
-    sibling_added = False
     guarded_limit = min(config.max_children_per_parent, q.numel())
+    global_order = (
+        stable_topk_indices(q, guarded_limit)
+        if config.exact_topk_candidates
+        else torch.argsort(q, descending=True, stable=True)
+    )
+    sibling_added = False
     for guarded in global_order[1:guarded_limit]:
         guarded_prob = float(q[guarded])
         guarded_is_eligible = bool((eligible == guarded).any())
@@ -1002,7 +1072,8 @@ def adaptive_trunk_relaxation_plan(
     target_probs_by_input: torch.Tensor,
     *,
     config: DynamicTreeConfig,
-) -> dict[int, dict[str, float]]:
+    protected_node_indices: frozenset[int] = frozenset(),
+) -> dict[int, dict[str, Any]]:
     """Allocate a uniform control's actual TV to useful trunk positions.
 
     The historical candidate-conditioned transform may keep increasing a
@@ -1056,12 +1127,24 @@ def adaptive_trunk_relaxation_plan(
         torch.sqrt((2.0 * base_delta * p * (1.0 - p)).clamp_min(0.0)),
         1.0 - p,
     )
+    if protected_node_indices:
+        # Remove protected positions before computing the recovered pool:
+        # their allowance must never be redistributed to other positions.
+        protected = torch.tensor(
+            [index in protected_node_indices for index in trunk],
+            dtype=torch.bool, device=device,
+        )
+        baseline_tv = baseline_tv.masked_fill(protected, 0.0)
     saturation_tv = (q - p).clamp(min=0.0)
     floor_tv = torch.minimum(baseline_tv, saturation_tv)
     max_tv = torch.minimum(
         saturation_tv,
         baseline_tv * config.adaptive_relaxation_max_ratio,
     )
+    if config.relaxation_max_probability_ratio:
+        probability_cap_tv = (config.relaxation_max_probability_ratio - 1.0) * p
+        floor_tv = torch.minimum(floor_tv, probability_cap_tv)
+        max_tv = torch.minimum(max_tv, probability_cap_tv)
 
     values = torch.stack(
         (p, q, p_max, base_delta, baseline_tv, saturation_tv, floor_tv, max_tv),
@@ -1076,6 +1159,23 @@ def adaptive_trunk_relaxation_plan(
     saturation_values = [float(row[5]) for row in values]
     allocated = [float(row[6]) for row in values]
     maximum = [float(row[7]) for row in values]
+    # The support term in utility only changes ranking. A sole eligible,
+    # strongly opposed token could still receive all recoverable allowance.
+    # Extreme opposition uses P exactly; moderate opposition retains the
+    # original unsaturated allowance but receives no additional allocation.
+    # Remove the extreme positions' allowance before making the pool, so it
+    # cannot be transferred to other nodes.
+    risk_modes = ["none"] * len(trunk)
+    if config.relaxation_risk_policy == "target_odds":
+        for position, relative in enumerate(relative_values):
+            if relative < 1e-3:
+                baseline_values[position] = 0.0
+                allocated[position] = 0.0
+                maximum[position] = 0.0
+                risk_modes[position] = "strict"
+            elif relative < 0.1:
+                maximum[position] = min(maximum[position], baseline_values[position])
+                risk_modes[position] = "no_reallocation"
     recovered = sum(
         max(0.0, baseline - current)
         for baseline, current in zip(baseline_values, allocated)
@@ -1129,7 +1229,7 @@ def adaptive_trunk_relaxation_plan(
     spent = initial_pool - pool
     total_baseline = sum(baseline_values)
     total_adaptive = sum(allocated)
-    plan: dict[int, dict[str, float]] = {}
+    plan: dict[int, dict[str, Any]] = {}
     for position, node_index in enumerate(trunk):
         p_value = p_values[position]
         tv = allocated[position]
@@ -1152,6 +1252,12 @@ def adaptive_trunk_relaxation_plan(
             "adaptive_block_recovered_tv": recovered,
             "adaptive_block_spent_tv": spent,
         }
+        if config.relaxation_risk_policy != "none":
+            plan[node_index].update(
+                adaptive_risk_policy=config.relaxation_risk_policy,
+                adaptive_risk_mode=risk_modes[position],
+                adaptive_target_support_ratio=relative_values[position],
+            )
     return plan
 
 
@@ -1163,6 +1269,9 @@ def residual_hit_tree_verify(
     generator: torch.Generator | None = None,
     *,
     config: DynamicTreeConfig,
+    protected_node_indices: frozenset[int] = frozenset(),
+    lazy_residual: bool = False,
+    decision_trace: Any = None,
 ) -> TreeVerifyResult:
     """Keep a sampled Cactus trunk and let its exact correction hit the tree.
 
@@ -1223,6 +1332,24 @@ def residual_hit_tree_verify(
             )
         trunk.append(path_to_index[path])
 
+    protected = set(protected_node_indices)
+    eos_by_node: dict[int, float] = {}
+    if config.protect_eos_relaxation:
+        if any(token < 0 or token >= target.shape[-1] for token in config.eos_token_ids):
+            raise ValueError("an eos_token_id is outside the target vocabulary")
+        parents = [0 if topology.nodes[i].parent is None
+                   else int(topology.nodes[i].parent) + 1 for i in trunk]
+        eos_index = torch.tensor(config.eos_token_ids, device=device)
+        eos_mass = target[parents].index_select(1, eos_index).sum(-1).tolist()
+        top1 = target[parents].argmax(-1).tolist()
+        for i, mass, top in zip(trunk, eos_mass, top1):
+            eos_by_node[i] = float(mass)
+            if mass >= config.eos_protection_threshold or top in config.eos_token_ids:
+                protected.add(i)
+            # Do not boost a sampled EOS token either; let strict verification
+            # decide from P/Q rather than forcing an early end.
+            if int(ids[i]) in config.eos_token_ids:
+                protected.add(i)
     adaptive_plan = (
         adaptive_trunk_relaxation_plan(
             topology,
@@ -1230,6 +1357,7 @@ def residual_hit_tree_verify(
             draft,
             target,
             config=config,
+            protected_node_indices=frozenset(protected),
         )
         if config.adaptive_relaxation
         else {}
@@ -1239,11 +1367,27 @@ def residual_hit_tree_verify(
     diagnostics: dict[int, dict[str, Any]] = {}
     accepted: list[int] = []
 
+    if decision_trace is not None:
+        decision_trace["config"] = config
+        decision_trace["protected_node_indices"] = protected_node_indices
+        decision_trace["events"] = []
+
+    def draw(probs, rng, role):
+        event = None
+        if decision_trace is not None:
+            event = {"kind": role, "probs": probs.detach().cpu().clone(),
+                     "rng_before": rng.get_state().clone() if rng is not None else None}
+        token = sample_categorical(probs, rng)
+        if event is not None:
+            event.update(token=token, rng_after=rng.get_state().clone() if rng is not None else None)
+            decision_trace["events"].append(event)
+        return token
+
     def verify_q_candidate(
         node_index: int,
         *,
         use_cactus: bool,
-    ) -> tuple[bool, torch.Tensor, dict[str, Any]]:
+    ) -> tuple[bool, torch.Tensor | None, dict[str, Any]]:
         node = topology.nodes[node_index]
         parent_row = 0 if node.parent is None else node.parent + 1
         p_row = target[parent_row]
@@ -1253,7 +1397,10 @@ def residual_hit_tree_verify(
         q_y = float(q_row[token_id])
         base_relaxation_weight = config.relaxation_weight(node.depth)
         base_effective_delta = config.relaxation_delta(node.depth)
+        is_protected = node_index in protected
         node_plan = adaptive_plan.get(node_index) if use_cactus else None
+        if node_plan is not None and node_plan.get("adaptive_risk_mode") == "strict":
+            is_protected = True
         if node_plan is not None:
             relaxation_weight = float(node_plan["adaptive_depth_weight"])
             effective_delta = float(node_plan["adaptive_effective_delta"])
@@ -1264,7 +1411,7 @@ def residual_hit_tree_verify(
             )
         else:
             relaxation_weight = base_relaxation_weight
-            effective_delta = base_effective_delta
+            effective_delta = 0.0 if is_protected else base_effective_delta
             verify_row = (
                 cactus_target_distribution(
                     p_row.unsqueeze(0),
@@ -1274,12 +1421,29 @@ def residual_hit_tree_verify(
                 if use_cactus
                 else p_row
             )
+        if use_cactus and config.relaxation_max_probability_ratio:
+            # Change the complete H, so acceptance and the correction below
+            # share the same distribution. Clamping only alpha is invalid.
+            capped_y = min(float(verify_row[token_id]),
+                           config.relaxation_max_probability_ratio * p_y)
+            verify_row = _candidate_boost_distribution(p_row, token_id, capped_y)
         verify_y = float(verify_row[token_id])
         accept_probability = min(1.0, verify_y / max(q_y, 1e-30))
+        event = None
+        if decision_trace is not None:
+            event = {"kind": "accept_uniform", "node": node_index,
+                     "parent_row": parent_row, "token_id": token_id,
+                     "p": p_row.detach().cpu().clone(), "q": q_row.detach().cpu().clone(),
+                     "h": verify_row.detach().cpu().clone(),
+                     "rng_before": generator.get_state().clone() if generator is not None else None}
         random_value = float(
             torch.rand((), device=device, generator=generator).item()
         )
         keep = random_value <= accept_probability
+        if event is not None:
+            event.update(uniform=random_value, keep=keep,
+                         rng_after=generator.get_state().clone() if generator is not None else None)
+            decision_trace["events"].append(event)
         row = {
             "node": node_index,
             "proposal_role": (
@@ -1310,12 +1474,23 @@ def residual_hit_tree_verify(
             "rescue_eligible": False,
             "rescued": False,
         }
+        if config.relaxation_risk_policy != "none":
+            row["eos_or_prefix_protected"] = node_index in protected
         if node_plan is not None:
             row.update(node_plan)
             row["adaptive_relaxation_enabled"] = True
         else:
             row["adaptive_relaxation_enabled"] = False
-        return keep, residual_distribution(verify_row, q_row), row
+        if config.relaxation_max_probability_ratio:
+            row["relaxation_max_probability_ratio"] = config.relaxation_max_probability_ratio
+        if (config.protect_eos_relaxation or protected_node_indices
+                or config.relaxation_risk_policy != "none"):
+            row["relaxation_protected"] = is_protected
+            row["target_eos_probability"] = eos_by_node.get(node_index, 0.0)
+        # Accepted candidates never consume the correction distribution.
+        # This pure computation draws no RNG; rejection keeps the old path.
+        correction = None if lazy_residual and keep else residual_distribution(verify_row, q_row)
+        return keep, correction, row
 
     for position, trunk_node in enumerate(trunk, start=1):
         keep, correction_probs, row = verify_q_candidate(
@@ -1336,7 +1511,7 @@ def residual_hit_tree_verify(
 
         # This draw is exactly the correction Chain Cactus would make.  Tree
         # coverage is consulted only after the token has already been chosen.
-        correction = sample_categorical(correction_probs, generator)
+        correction = draw(correction_probs, generator, "residual_correction")
         siblings = tuple(
             sibling
             for sibling in topology.children_of(topology.nodes[trunk_node].parent)
@@ -1398,7 +1573,7 @@ def residual_hit_tree_verify(
         hit_row["rescue_decision_mode"] = "exact-residual-token-hit"
 
         if config.support_mode == "residual_hit_anchor":
-            bonus = sample_categorical(target[hit_node + 1], generator)
+            bonus = draw(target[hit_node + 1], generator, "target_bonus")
             return TreeVerifyResult(
                 output_token_ids=tuple(int(ids[index]) for index in accepted)
                 + (bonus,),
@@ -1428,9 +1603,10 @@ def residual_hit_tree_verify(
             diagnostics[child] = child_row
             statuses[child] = "SELECTED" if keep_child else "REJECT"
             if not keep_child:
-                child_correction = sample_categorical(
+                child_correction = draw(
                     child_correction_probs,
                     generator,
+                    "continuation_correction",
                 )
                 hit_row["rescue_unlocked_tokens"] = len(accepted) - position + 1
                 return TreeVerifyResult(
@@ -1455,7 +1631,7 @@ def residual_hit_tree_verify(
             current = child
 
         hit_row["rescue_unlocked_tokens"] = len(accepted) - position + 1
-        bonus = sample_categorical(target[current + 1], generator)
+        bonus = draw(target[current + 1], generator, "target_bonus")
         return TreeVerifyResult(
             output_token_ids=tuple(int(ids[index]) for index in accepted) + (bonus,),
             accepted_node_indices=tuple(accepted),
@@ -1475,7 +1651,7 @@ def residual_hit_tree_verify(
         )
 
     leaf = accepted[-1]
-    bonus = sample_categorical(target[leaf + 1], generator)
+    bonus = draw(target[leaf + 1], generator, "target_bonus")
     return TreeVerifyResult(
         output_token_ids=tuple(int(ids[index]) for index in accepted) + (bonus,),
         accepted_node_indices=tuple(accepted),

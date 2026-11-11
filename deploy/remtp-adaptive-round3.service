@@ -1,0 +1,19 @@
+[Unit]
+Description=Adaptive RAVEN round 3 after Target probability consistency repair
+StartLimitIntervalSec=infinity
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=/home/apex/ReMTP-residual
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/home/apex/ReMTP-residual/.venv/bin/python -c "import json; from pathlib import Path; d=Path('/home/apex/ReMTP-residual/results/target_probability_consistency_20261004/canonical_tree'); g=json.loads((d/'target_consistency_gate.json').read_text()); p=json.loads((d/'protocol.json').read_text()); assert g['passed'] and g['cache_modes']==[0] and len(g['root_checks'])==24 and len(g['branch_checks'])==16; assert p['canonical_tree_attention']; assert (p['target_uniform_gemm'],p['target_full_bf16_accum'],p['target_bnb_row_block'],p['target_reference_backend'],p['target_triton_2d'],p['target_attention_fp32'],p['prefix_caching'])==(True,True,64,'TRITON_ATTN',True,True,0)"
+ExecStart=/home/apex/ReMTP-residual/.venv/bin/python /home/apex/ReMTP-residual/results/adaptive_optimization_20261004_target_canonical/frozen_code/scripts/run_adaptive_round2.py --run-dir /home/apex/ReMTP-residual/results/adaptive_optimization_20261004_target_canonical --prefix-cache 0 --uniform-gemm --full-bf16-accum --bnb-row-block 64 --target-backend TRITON_ATTN --triton-2d --attention-fp32 --canonical-tree
+Restart=on-failure
+RestartPreventExitStatus=2 3
+RestartSec=45
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

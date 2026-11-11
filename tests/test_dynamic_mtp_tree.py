@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from remtp.dynamic_mtp_tree import (
+    anchor_reusable_topology,
     adaptive_trunk_relaxation_plan,
     adaptive_node_limit,
     cactus_trunk_rescue_verify,
@@ -19,8 +20,163 @@ from remtp.dynamic_mtp_tree import (
     path_expansion_value,
     residual_hit_tree_verify,
     select_dynamic_candidates,
+    stable_topk_indices,
     target_dominant_relaxed_verify,
 )
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("delta", [0.0, 1.0])
+def test_anchor_pruning_preserves_outputs_decisions_and_rng(adaptive, delta):
+    """Unused row removal must preserve every reachable verification outcome."""
+    topology = DynamicTreeTopology.from_paths([
+        (0,), (1,), (2,), (0, 0), (0, 1), (1, 0),
+        (0, 0, 0), (0, 0, 1), (0, 1, 0), (1, 0, 0),
+    ])
+    reduced, indices = anchor_reusable_topology(topology)
+    assert reduced.choices == (
+        (0,), (1,), (2,), (0, 0), (0, 1), (0, 0, 0), (0, 0, 1),
+    )
+    config = DynamicTreeConfig(
+        max_nodes=10, support_mode="residual_hit_anchor",
+        adaptive_relaxation=adaptive, cactus_delta=delta,
+    )
+    terminals = set()
+    for seed in range(80):
+        data_rng = torch.Generator().manual_seed(seed)
+        draft = torch.rand(10, 8, generator=data_rng).pow(4)
+        target = torch.rand(11, 8, generator=data_rng).pow(4)
+        ids = torch.tensor([node.path[-1] for node in topology.nodes])
+        old_rng = torch.Generator().manual_seed(seed + 200)
+        new_rng = torch.Generator().manual_seed(seed + 200)
+        old = residual_hit_tree_verify(topology, ids, draft, target, old_rng, config=config)
+        new = residual_hit_tree_verify(
+            reduced, ids[list(indices)], draft[list(indices)],
+            target[[0] + [index + 1 for index in indices]], new_rng,
+            config=replace(config, prune_anchor_descendants=True),
+        )
+        assert old.output_token_ids == new.output_token_ids
+        assert old.terminal == new.terminal
+        assert [topology.nodes[i].path for i in old.accepted_node_indices] == [
+            reduced.nodes[i].path for i in new.accepted_node_indices]
+        assert torch.equal(old_rng.get_state(), new_rng.get_state())
+        old_diagnostics = {topology.nodes[row["node"]].path: row for row in old.node_diagnostics}
+        for row in new.node_diagnostics:
+            previous = old_diagnostics[reduced.nodes[row["node"]].path]
+            assert {k: v for k, v in row.items() if k != "node"} == {
+                k: v for k, v in previous.items() if k != "node"}
+        terminals.add(old.terminal)
+    assert "residual-hit-target-anchor" in terminals
+    assert "residual-correction-tree-miss" in terminals
+    assert len(terminals) >= 3
+
+
+def test_anchor_pruning_disallows_modes_that_follow_backup_descendants():
+    with pytest.raises(ValueError, match="anchor pruning"):
+        DynamicTreeConfig(
+            support_mode="residual_hit_strict", prune_anchor_descendants=True,
+        ).validate()
+
+
+@pytest.mark.parametrize("count", [0, 1, 3, 9, 100])
+def test_stable_topk_matches_reference_including_cutoff_ties(count):
+    for probs in (torch.ones(12), torch.zeros(12),
+                  torch.tensor([1., 3., 3., 2., 2., 2., 3., 0., 2., 3., 0., 2.]),
+                  torch.rand(127, generator=torch.Generator().manual_seed(42))):
+        assert torch.equal(stable_topk_indices(probs, count),
+                           torch.argsort(probs, descending=True, stable=True)[:count])
+
+
+def test_topk_candidate_selection_preserves_diagnostics_and_budget():
+    rng = torch.Generator().manual_seed(42)
+    for seed in range(80):
+        # Quantized masses deliberately exercise ties, invalid totals and
+        # thresholds on either side of the sibling guards.
+        probs = (torch.rand(151, generator=rng) * (seed % 10)).floor()
+        config = DynamicTreeConfig(
+            max_children_per_parent=1 + seed % 5,
+            min_draft_prob=(seed % 3) * 0.01,
+            min_sibling_ratio=(seed % 7) / 7,
+        )
+        old = select_dynamic_candidates(probs, depth=1 + seed % 3, config=config, budget=seed % 4)
+        new = select_dynamic_candidates(probs, depth=1 + seed % 3,
+                                        config=replace(config, exact_topk_candidates=True), budget=seed % 4)
+        assert torch.equal(old.token_ids, new.token_ids)
+        assert {k: v for k, v in old.__dict__.items() if k != "token_ids"} == {
+            k: v for k, v in new.__dict__.items() if k != "token_ids"}
+
+
+@pytest.mark.parametrize("depth,budget", [(3, 3), (3, 6), (3, 9), (4, 12)])
+def test_anchor_only_builder_preserves_primary_q_rng_and_reserves_trunk(monkeypatch, depth, budget):
+    """Real proposal orchestration with a deterministic prefix-conditioned model.
+
+    This isolates candidate allocation from numerical GPU row-count effects;
+    GPU cache and final quality still need separate validation.
+    """
+    from types import SimpleNamespace
+    from remtp import dynamic_tree_vllm as adapter, fixed6_vllm as fixed
+
+    config = DynamicTreeConfig(
+        max_depth=depth, max_nodes=budget, max_children_per_parent=3,
+        min_draft_prob=0.001, min_sibling_ratio=0.01,
+        support_mode="residual_hit_anchor", allocation_mode="residual_coverage",
+        exact_topk_candidates=True,
+    )
+    active = config
+    monkeypatch.setattr(adapter, "dynamic_tree_config_from_env", lambda: active)
+    monkeypatch.setattr(fixed, "_RUNTIME", fixed._Runtime(fixed._RUNTIME.topology))
+
+    def run_nodes(self, *, node_ids, node_tokens, node_hidden_inputs, **kwargs):
+        inputs = torch.stack([node_hidden_inputs[i] for i in node_ids])
+        tokens = torch.stack([node_tokens[i] for i in node_ids]).float()[:, None]
+        hidden = torch.tanh(inputs + tokens * 0.01)
+        return hidden, hidden, torch.arange(len(node_ids))
+
+    monkeypatch.setattr(adapter, "_run_dynamic_tree_nodes", run_nodes)
+
+    def logits(hidden):
+        return torch.cos(hidden[:, :1] + torch.arange(12)[None, :])
+
+    for seed in range(20):
+        traces = []
+        for anchor_only in (False, True):
+            active = replace(config, anchor_only_proposal=anchor_only)
+            rng = torch.Generator().manual_seed(seed)
+            proposer = SimpleNamespace(
+                model=SimpleNamespace(compute_logits=logits),
+                _fixed6_sampling_metadata=SimpleNamespace(
+                    temperature=torch.tensor([0.6]), top_k=torch.tensor([0]),
+                    top_p=torch.tensor([1.0]), generators={0: rng},
+                ),
+            )
+            adapter._dynamic_propose_tree(proposer, 1, logits(torch.ones(1, 4)),
+                                          torch.tensor([3]), torch.ones(1, 4), None)
+            topology = fixed._RUNTIME.topology
+            primary = [next(n.index for n in topology.nodes if n.path == (0,) * depth)
+                       for depth in range(1, depth + 1)]
+            traces.append((fixed._RUNTIME.draft_token_ids[primary].clone(),
+                           fixed._RUNTIME.draft_probs[primary].clone(), rng.get_state()))
+            if anchor_only:
+                assert topology.node_count <= budget
+                assert all(all(rank == 0 for rank in n.path[:-1]) for n in topology.nodes)
+        for before, after in zip(*traces):
+            assert torch.equal(before, after)
+
+
+def test_anchor_head_padding_preserves_rows_and_values(monkeypatch):
+    from remtp.dynamic_tree_vllm import _anchor_batched_logits
+    observed = []
+
+    def original(self, hidden):
+        observed.append(hidden.shape[0])
+        return hidden * 2
+
+    monkeypatch.setattr(_anchor_batched_logits, "_dynamic_original", original, raising=False)
+    for count in (1, 3, 5):
+        hidden = torch.arange(count * 8).reshape(count, 8).float()
+        result = _anchor_batched_logits(None, hidden)
+        assert torch.equal(result, hidden * 2)
+    assert observed == [3, 3, 5]
 
 
 def test_adaptive_node_limit_uses_entropy_without_target_signal() -> None:

@@ -1,0 +1,22 @@
+[Unit]
+Description=ReMTP Jetson RAVEN GSM8K five-method comparison
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=/home/apex/ReMTP-residual
+Environment=RUN_TAG=raven_jetson_gsm8k_n100_fp4_2048
+Environment=SAMPLES=100
+Environment=MAX_TOKENS=2048
+Environment=MAX_MODEL_LEN=4096
+Environment=KV_CACHE_MEMORY_BYTES=1024M
+ExecStart=/home/apex/ReMTP-residual/scripts/run_jetson_raven_gsm8k.sh
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=45
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

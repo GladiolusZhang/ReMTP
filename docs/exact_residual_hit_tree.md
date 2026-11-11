@@ -1,5 +1,13 @@
 # Exact-residual-hit tree exploration
 
+> **Proof-scope review (2026-10-07):** strict continuation also requires the
+> recorded Q to remain the conditional proposal law after node retention.
+> The current allocation order can depend on a sampled child's probability;
+> an independent draw before that selection alone does not establish this
+> condition. This is an unresolved proof obligation for strict descendant
+> reuse, not a reproduced failure of the active anchor route, which does not
+> consume those descendants. See the [project review](../doc/REVIEW-ADAPTIVE-RAVEN-PROJECT-2026-10-07.md).
+
 > **Superseded diagnostic notice (2026-08-12):** the earlier failed `shadow`
 > control was traced to the next MTP round reading the chain-derived target
 > hidden row instead of the actually selected BFS tree leaf. Results produced

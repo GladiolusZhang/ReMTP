@@ -18,6 +18,9 @@ PORT="${PORT:-8000}"
 MTP_TOKENS="${MTP_TOKENS:-3}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+QUANTIZATION="${QUANTIZATION:-}"
+LOAD_FORMAT="${LOAD_FORMAT:-}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 NO_ASYNC_SCHEDULING="${NO_ASYNC_SCHEDULING:-1}"
 FAST_MTP_NO_THINK="${FAST_MTP_NO_THINK:-0}"
@@ -40,8 +43,22 @@ common=(
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --port "$PORT"
 )
+[[ -n "$QUANTIZATION" ]] && common+=(--quantization "$QUANTIZATION")
+[[ -n "$LOAD_FORMAT" ]] && common+=(--load-format "$LOAD_FORMAT")
+[[ -n "$KV_CACHE_MEMORY_BYTES" ]] && common+=(--kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES")
 [[ "$ENFORCE_EAGER" == "1" ]] && common+=(--enforce-eager)
 [[ "$NO_ASYNC_SCHEDULING" == "1" ]] && common+=(--no-async-scheduling)
+case "${ENABLE_PREFIX_CACHING:-}" in
+  0) common+=(--no-enable-prefix-caching) ;;
+  1) common+=(--enable-prefix-caching) ;;
+  "") ;;
+  *) echo "ENABLE_PREFIX_CACHING must be 0 or 1" >&2; exit 2 ;;
+esac
+draft_load_json=""
+if [[ "$LOAD_FORMAT" == "bitsandbytes" ]]; then
+  # The target is 4-bit, while the single trained MTP layer remains BF16.
+  draft_load_json=',"draft_load_config":{"load_format":"auto"}'
+fi
 if [[ "$FAST_MTP_NO_THINK" == "1" ]]; then
   common+=(
     --chat-template "$PROJECT_DIR/configs/fastmtp_no_think_chat_template.jinja"
@@ -55,9 +72,19 @@ fi
 
 export REMTP_MIMO_MTP_LAYER_MODE=layer0
 
+# Chain baselines can use the same unified attention kernels as TREE_ATTN
+# through TRITON_ATTN, retaining their original chain proposal/sampler.
+if [[ ( "$METHOD" == "native" || "$METHOD" == "cactus" || "$METHOD" == "spec_cascade" ) && "${TARGET_ATTENTION_BACKEND:-}" == "TRITON_ATTN" ]]; then
+  common+=(--attention-backend TRITON_ATTN)
+fi
+
 case "$METHOD" in
   target)
     echo "[ReMTP][FastMTPVerified] method=target speculative_decoding=off"
+    [[ -n "${TARGET_ATTENTION_BACKEND:-}" ]] && common+=(--attention-backend "$TARGET_ATTENTION_BACKEND")
+    if [[ -n "${REMTP_TARGET_DIAGNOSTIC_DIR:-}" || "${REMTP_TARGET_BNB_UNIFORM_GEMM:-0}" == "1" || "${REMTP_TARGET_BF16_FULL_ACCUM:-0}" == "1" || "${REMTP_TARGET_TRITON_2D:-0}" == "1" ]]; then
+      common+=(--worker-cls remtp.fastmtp_verified_worker.FastMTPVerifiedTargetWorker)
+    fi
     exec "${common[@]}"
     ;;
   native)
@@ -152,11 +179,13 @@ PY
 )"
     fi
     export REMTP_DYNAMIC_TREE_EOS_TOKEN_IDS
-    export REMTP_TREE_AUDIT_JSONL="${REMTP_TREE_AUDIT_JSONL:-$PROJECT_DIR/results/fastmtp_dynamic_tree_rounds.jsonl}"
+    export REMTP_TREE_AUDIT_JSONL="${REMTP_TREE_AUDIT_JSONL-$PROJECT_DIR/results/fastmtp_dynamic_tree_rounds.jsonl}"
     export REMTP_TREE_TRACE="${REMTP_TREE_TRACE:-0}"
     export REMTP_TREE_AUDIT_DETAIL="${REMTP_TREE_AUDIT_DETAIL:-0}"
-    mkdir -p "$(dirname "$REMTP_TREE_AUDIT_JSONL")"
-    : > "$REMTP_TREE_AUDIT_JSONL"
+    if [[ -n "$REMTP_TREE_AUDIT_JSONL" ]]; then
+      mkdir -p "$(dirname "$REMTP_TREE_AUDIT_JSONL")"
+      : > "$REMTP_TREE_AUDIT_JSONL"
+    fi
 
     node_budget="$REMTP_DYNAMIC_TREE_MAX_NODES"
     DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-${MODEL_PATH}-Tree${node_budget}}"
@@ -168,7 +197,7 @@ n = int(sys.argv[1])
 print(str([(0,) * depth for depth in range(1, n + 1)]))
 PY
 )"
-    speculative_config="{\"method\":\"mtp\",\"model\":\"${DRAFT_MODEL_PATH}\",\"num_speculative_tokens\":${node_budget},\"speculative_token_tree\":\"$tree_choices\"}"
+    speculative_config="{\"method\":\"mtp\",\"model\":\"${DRAFT_MODEL_PATH}\",\"num_speculative_tokens\":${node_budget},\"speculative_token_tree\":\"$tree_choices\"${draft_load_json}}"
     echo "[ReMTP][FastMTPVerified] method=dynamic_tree physical_heads=1 route=repeat_0 logical_nodes=$node_budget children_max=$REMTP_DYNAMIC_TREE_MAX_CHILDREN sibling_ratio=$REMTP_DYNAMIC_TREE_MIN_SIBLING_RATIO"
     echo "[ReMTP][FastMTPVerified] verifier=$verifier_description support_mode=$REMTP_DYNAMIC_TREE_SUPPORT_MODE coverage_mode=$REMTP_DYNAMIC_TREE_COVERAGE_MODE path_selection=$REMTP_DYNAMIC_TREE_PATH_SELECTION beta=$REMTP_DYNAMIC_TREE_BETA frontier_rescue=$REMTP_DYNAMIC_TREE_FRONTIER_RESCUE rescue_delta=$REMTP_DYNAMIC_TREE_RESCUE_DELTA relax_depth_weights=${REMTP_DYNAMIC_TREE_RELAX_DEPTH_WEIGHTS:-uniform} adaptive_relaxation=$REMTP_DYNAMIC_TREE_ADAPTIVE_RELAXATION adaptive_mix=$REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MIX adaptive_max_ratio=$REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MAX_RATIO adaptive_target_power=$REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_TARGET_POWER adaptive_steps=$REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_STEPS"
     exec "${common[@]}" \
@@ -182,7 +211,7 @@ PY
     ;;
 esac
 
-speculative_config="{\"method\":\"mtp\",\"model\":\"${MODEL_PATH}\",\"num_speculative_tokens\":${MTP_TOKENS}}"
+speculative_config="{\"method\":\"mtp\",\"model\":\"${MODEL_PATH}\",\"num_speculative_tokens\":${MTP_TOKENS}${draft_load_json}}"
 echo "[ReMTP][FastMTPVerified] method=$METHOD worker=$worker physical_heads=1 route=repeat_0 draft_tokens=$MTP_TOKENS"
 exec "${common[@]}" \
   --worker-cls "$worker" \

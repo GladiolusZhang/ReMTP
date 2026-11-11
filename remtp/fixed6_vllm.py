@@ -213,6 +213,35 @@ def _tree_positions(
     return root + offsets.unsqueeze(0)
 
 
+def _draft_tree_metadata(base: Any, query_start_loc: torch.Tensor,
+                         root_position: int, count: int) -> Any:
+    """Expose the committed prefix and current BFS nodes, excluding old branches.
+
+    The incoming target metadata still counts all previous speculative nodes.
+    After selection/compaction the valid draft prefix ends at root_position.
+    Using the incoming seq_lens would expose unaccepted or stale KV slots.
+    """
+    length = root_position + 1 + count
+    return replace(
+        base, query_start_loc=query_start_loc,
+        query_start_loc_cpu=torch.tensor([0, count], dtype=torch.int32),
+        seq_lens=torch.full_like(base.seq_lens, length),
+        max_seq_len=length, num_actual_tokens=count, max_query_len=count,
+        _seq_lens_cpu=None, _num_computed_tokens_cpu=None,
+    )
+
+
+def _compact_draft_tree_bias(bias: torch.Tensor) -> torch.Tensor:
+    """The kernel uses row stride as logical width; singleton slices lie.
+
+    Tensor.contiguous() preserves the parent's row stride for a 1x1 view.
+    A compact clone makes width equal row stride and excludes adjacent bytes.
+    """
+    if bias.numel() and (bias.stride(0) != bias.shape[1] or bias.stride(1) != 1):
+        return bias.clone(memory_format=torch.contiguous_format)
+    return bias
+
+
 def _run_draft_tree_nodes(
     self: Any,
     *,
@@ -240,20 +269,17 @@ def _run_draft_tree_nodes(
 
     # The physical cache slots are unique BFS offsets. Logical RoPE positions
     # are branch depths; these two notions must not be conflated.
-    common = replace(
-        base_common_metadata,
-        query_start_loc=count * self.arange[:2],
-        seq_lens=base_common_metadata.seq_lens + count,
-        num_actual_tokens=count,
-        max_query_len=count,
+    flat_root = int(root_positions.reshape(-1)[0].item())
+    common = _draft_tree_metadata(
+        base_common_metadata, count * self.arange[:2], flat_root, count,
     )
     attn_metadata = builder.build_for_drafting(
         common_attn_metadata=common,
         draft_index=max(_RUNTIME.topology.nodes[index].depth for index in node_ids),
     )
+    attn_metadata.tree_attn_bias = _compact_draft_tree_bias(attn_metadata.tree_attn_bias)
     attn_metadata.max_seq_len = min(attn_metadata.max_seq_len, self.max_model_len)
 
-    flat_root = int(root_positions.reshape(-1)[0].item())
     physical_positions = torch.arange(
         flat_root + 1,
         flat_root + count + 1,

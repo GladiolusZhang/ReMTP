@@ -1,0 +1,18 @@
+[Unit]
+Description=Adaptive RAVEN optimization performance and quality gates
+StartLimitIntervalSec=infinity
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=/home/apex/ReMTP-residual
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/apex/ReMTP-residual/.venv/bin/python /home/apex/ReMTP-residual/results/adaptive_optimization_20261001/candidate_code_v4/scripts/run_adaptive_optimization.py --run-dir /home/apex/ReMTP-residual/results/adaptive_optimization_20261001/anchor_d4_v4 --phase all --candidate anchor --depth 4 --nodes 12
+Restart=on-failure
+RestartPreventExitStatus=2 3
+RestartSec=45
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

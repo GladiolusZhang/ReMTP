@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from remtp.dynamic_mtp_tree import (
+    anchor_reusable_topology,
     adaptive_node_limit,
     cactus_trunk_rescue_verify,
     DynamicTreeConfig,
@@ -155,12 +156,25 @@ def dynamic_tree_config_from_env() -> DynamicTreeConfig:
         adaptive_relaxation_max_ratio=float(
             os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MAX_RATIO", "1.5")
         ),
+        relaxation_max_probability_ratio=float(
+            os.getenv("REMTP_DYNAMIC_TREE_RELAX_MAX_PROBABILITY_RATIO", "0")
+        ),
         adaptive_relaxation_target_power=float(
             os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_TARGET_POWER", "0.25")
         ),
         adaptive_relaxation_steps=int(
             os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_STEPS", "16")
         ),
+        relaxation_risk_policy=os.getenv("REMTP_DYNAMIC_TREE_RELAX_RISK_POLICY", "none"),
+        prune_anchor_descendants=os.getenv(
+            "REMTP_DYNAMIC_TREE_PRUNE_ANCHOR_DESCENDANTS", "0"
+        ) == "1",
+        exact_topk_candidates=os.getenv(
+            "REMTP_DYNAMIC_TREE_EXACT_TOPK", "0"
+        ) == "1",
+        anchor_only_proposal=os.getenv(
+            "REMTP_DYNAMIC_TREE_ANCHOR_ONLY_PROPOSAL", "0"
+        ) == "1",
         cactus_target_weight=float(
             os.getenv("REMTP_DYNAMIC_TREE_CACTUS_TARGET_WEIGHT", "0.25")
         ),
@@ -213,6 +227,7 @@ def dynamic_tree_config_from_env() -> DynamicTreeConfig:
         eos_protection_threshold=float(
             os.getenv("REMTP_DYNAMIC_TREE_EOS_THRESHOLD", "0.5")
         ),
+        protect_eos_relaxation=os.getenv("REMTP_DYNAMIC_TREE_PROTECT_EOS", "0") == "1",
     )
     config.validate()
     return config
@@ -274,7 +289,15 @@ def _run_dynamic_tree_nodes(self: Any, **kwargs: Any) -> Any:
 def _fallback_root(
     probs: torch.Tensor,
 ) -> torch.Tensor:
+    _validate_proposal_probs(probs)
     return probs.argmax().reshape(1)
+
+
+def _validate_proposal_probs(probs: torch.Tensor) -> None:
+    """Reject invalid Q before any draw; do not silently invent a proposal."""
+    valid = torch.isfinite(probs).all() & (probs >= 0).all() & (probs.sum() > 0)
+    if not bool(valid):
+        raise ValueError('Invalid MTP proposal Q: nonfinite, negative, or zero mass; sampling aborted before RNG')
 
 
 def _sample_q_token(
@@ -282,6 +305,7 @@ def _sample_q_token(
     sampling_metadata: Any,
 ) -> torch.Tensor:
     """Use the same exponential-race categorical primitive as chain MTP."""
+    _validate_proposal_probs(probs)
     temperatures = getattr(sampling_metadata, "temperature", None)
     if temperatures is None or float(temperatures[0]) < 1e-5:
         return probs.argmax().reshape(1)
@@ -309,6 +333,7 @@ def _sample_branch_q_token(
     draws. A deterministic branch-local generator derived from request seed,
     round and path keeps those two random streams independent and reproducible.
     """
+    _validate_proposal_probs(probs)
     temperatures = getattr(sampling_metadata, "temperature", None)
     if temperatures is None or float(temperatures[0]) < 1e-5:
         return probs.argmax().reshape(1)
@@ -425,7 +450,8 @@ def _propose_cactus_trunk_rescue(
             }
         )
         topology = DynamicTreeTopology.from_paths(
-            tuple(token_by_path), name="cactus-trunk-rescue"
+            tuple(token_by_path), name=("anchor-primary-siblings"
+                                       if config.anchor_only_proposal else "cactus-trunk-rescue")
         )
         fixed._RUNTIME.topology = topology
 
@@ -451,8 +477,13 @@ def _propose_cactus_trunk_rescue(
         trunk_path = (0,) * depth
         path_to_row = {path: index for index, path in enumerate(current_paths)}
         trunk_row = path_to_row[trunk_path]
+        logit_hidden = last_hidden[trunk_row : trunk_row + 1]
+        if config.anchor_only_proposal and "REMTP_HEAD_BATCH_ROWS" not in os.environ:
+            # On Orin the BF16 head's 3-row GEMM is faster than its 1-row
+            # path. Duplicate only head inputs; no extra MTP/KV nodes or RNG.
+            logit_hidden = logit_hidden.expand(3, -1).contiguous()
         parent_q = fixed._temperature_probs(
-            self.model.compute_logits(last_hidden[trunk_row : trunk_row + 1]),
+            self.model.compute_logits(logit_hidden)[:1],
             sampling_metadata,
         )[0]
         parent_hidden = hidden[trunk_row]
@@ -482,7 +513,8 @@ def _propose_cactus_trunk_rescue(
     fixed._RUNTIME.draft_probs = probs
     fixed._RUNTIME.dynamic_construction = {
         "config": config.__dict__,
-        "proposal": "sampled-q-cactus-trunk-rejection-only-rescue",
+        "proposal": ("sampled-q-anchor-primary-siblings"
+                     if config.anchor_only_proposal else "sampled-q-cactus-trunk-rejection-only-rescue"),
         "mtp_route": os.getenv(
             "REMTP_DYNAMIC_TREE_MTP_ROUTE", "physical_012"
         ),
@@ -515,7 +547,7 @@ def _dynamic_propose_tree(
     if sampling_metadata is None:
         raise RuntimeError("dynamic MTP tree lost sampling metadata")
     config = dynamic_tree_config_from_env()
-    if config.support_mode == "cactus_trunk_rescue":
+    if config.support_mode == "cactus_trunk_rescue" or config.anchor_only_proposal:
         return _propose_cactus_trunk_rescue(
             self,
             logits=logits,
@@ -746,6 +778,12 @@ def _dynamic_propose_tree(
         topology = DynamicTreeTopology.from_paths(tuple(token_by_path))
         fixed._RUNTIME.topology = topology
 
+    # Keep original proposal/budget decisions; rematerialize KV with new indices.
+    unpruned_node_count = topology.node_count
+    if config.prune_anchor_descendants:
+        topology, _ = anchor_reusable_topology(topology)
+        fixed._RUNTIME.topology = topology
+
     # Materialize the final dynamic topology and all branch-local draft KV.
     current_paths = list(topology.choices)
     node_tokens = {
@@ -773,6 +811,8 @@ def _dynamic_propose_tree(
             "REMTP_DYNAMIC_TREE_MTP_ROUTE", "physical_012"
         ),
         "node_count": topology.node_count,
+        "unpruned_node_count": unpruned_node_count,
+        "pruned_descendants": unpruned_node_count - topology.node_count,
         "max_depth": topology.max_depth,
         "branching": construction,
     }
@@ -805,10 +845,19 @@ def _dynamic_verify_dispatch(*args: Any, **kwargs: Any) -> Any:
         "residual_hit_strict",
         "residual_hit_cactus",
     }:
+        from remtp.generation_guard import repeated_suffix
+        history = getattr(fixed._RUNTIME, "generated_history", ())
+        repetition = os.getenv("REMTP_DYNAMIC_TREE_REPEAT_GUARD", "0") == "1" and repeated_suffix(history)
+        protected = frozenset(n.index for n in args[0].nodes
+                              if n.path == (0,) * n.depth) if repetition else frozenset()
+        from remtp.decision_trace import active_trace
         return residual_hit_tree_verify(
             *args,
             **kwargs,
             config=config,
+            protected_node_indices=protected,
+            lazy_residual=os.getenv("REMTP_DYNAMIC_TREE_LAZY_RESIDUAL", "0") == "1",
+            decision_trace=active_trace(),
         )
     branching = construction.get("branching", [])
     if branching and bool(branching[0].get("forced_top1")):
@@ -832,6 +881,14 @@ def _dynamic_verify_dispatch(*args: Any, **kwargs: Any) -> Any:
     )
 
 
+def _anchor_batched_logits(self: Any, hidden_states: torch.Tensor) -> Any:
+    original = getattr(_anchor_batched_logits, "_dynamic_original")
+    if hidden_states.shape[0] != 1:
+        return original(self, hidden_states)
+    logits = original(self, hidden_states.expand(3, -1).contiguous())
+    return None if logits is None else logits[:1]
+
+
 def install_mimo_dynamic_tree() -> None:
     global _INSTALLED, _ORIGINAL_TREE_RUN
     if _INSTALLED:
@@ -850,6 +907,10 @@ def install_mimo_dynamic_tree() -> None:
     runner_module = importlib.import_module("vllm.v1.worker.gpu_model_runner")
     rejection = importlib.import_module("vllm.v1.sample.rejection_sampler")
     mimo = importlib.import_module("vllm.model_executor.models.mimo")
+    if config.anchor_only_proposal and "REMTP_HEAD_BATCH_ROWS" not in os.environ:
+        mtp = importlib.import_module("vllm.model_executor.models.mimo_mtp")
+        _anchor_batched_logits._dynamic_original = mtp.MiMoMTP.compute_logits
+        mtp.MiMoMTP.compute_logits = _anchor_batched_logits
 
     proposer_cls = eagle.EagleProposer
     fixed._propose_with_sampling_metadata._fixed6_original = proposer_cls.propose
@@ -906,6 +967,8 @@ def install_mimo_dynamic_tree() -> None:
             )
         )
     )
+    if config.anchor_only_proposal:
+        proposal_name = "sampled-q-primary+direct-siblings+batched-head"
     print(
         "[ReMTP][DynamicTree] installed target-dominant relaxed tree "
         f"D={config.max_depth} N_max={config.max_nodes} "
@@ -922,10 +985,13 @@ def install_mimo_dynamic_tree() -> None:
         "relax_depth_weights="
         f"{list(config.relaxation_depth_weights) or ['uniform']} "
         f"adaptive_relaxation={int(config.adaptive_relaxation)} "
+        f"lazy_residual={int(os.getenv('REMTP_DYNAMIC_TREE_LAZY_RESIDUAL', '0') == '1')} "
         f"adaptive_mix={config.adaptive_relaxation_mix:g} "
         f"adaptive_max_ratio={config.adaptive_relaxation_max_ratio:g} "
+        f"relax_max_probability_ratio={config.relaxation_max_probability_ratio:g} "
         f"adaptive_target_power={config.adaptive_relaxation_target_power:g} "
         f"adaptive_steps={config.adaptive_relaxation_steps} "
+        f"risk_policy={config.relaxation_risk_policy} "
         f"cactus_target_weight={config.cactus_target_weight:g} "
         f"max_guided_rescues={config.max_guided_rescues_per_path} "
         f"rescue_score_threshold={config.rescue_score_threshold:g} "

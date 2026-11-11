@@ -1,0 +1,18 @@
+[Unit]
+Description=Adaptive RAVEN round 2 diagnosis optimization and fair comparison
+StartLimitIntervalSec=infinity
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=/home/apex/ReMTP-residual
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/apex/ReMTP-residual/.venv/bin/python /home/apex/ReMTP-residual/results/adaptive_optimization_20261002/frozen_code/scripts/run_adaptive_round2.py --run-dir /home/apex/ReMTP-residual/results/adaptive_optimization_20261002
+Restart=on-failure
+RestartPreventExitStatus=2 3
+RestartSec=45
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
