@@ -1,7 +1,1062 @@
 # ReMTP 研究与开发总日志
 
-最后更新：2026-08-17
-当前分支：`research/residual-aligned-tree-mtp`
+最后更新：2026-11-11（UTC+8）
+当前工作分支：`jetson-r39-residual-adapt`；上游研究分支：`research/residual-aligned-tree-mtp`
+
+## 2026-11-11：全天实验重复启动事故修复、代码推送到 GitHub
+
+- 15:01:46 有人用同一条命令又启动了一个 `run_day_20261111.py` 实例。它发现 8000 端口被占，把五个阶段全记为失败，把 `status.json`/`day_report.md` 改成“已结束”，还把正在运行的 `specbench_raven_v3` 输出目录改名为 `_partial_*`。`remtp.benchmark` 只在全部请求结束时才写 `requests.jsonl`/`summary.json`，不改回会丢掉整个阶段。16:07 已手工改回目录并修正状态；原实例（14:33 启动）未受影响，继续运行。
+- `scripts/run_day_20261111.py` 增加两道保护：输出目录下的单实例 `fcntl` 文件锁；启动时 8000 端口已被占用就退出，不改动任何文件。Spec-Bench 阶段改为服务成功启动后才移走旧的未完成目录。已实测第二次启动直接以 1 退出、无副作用。
+- 推送到 `origin/jetson-r39-residual-adapt`，分两个提交：先是 10 月未提交的 Jetson 研究代码（三个钩子文件为 100+100 冻结版本），再是 11-10/11 的三层开销优化、通宵与全天脚本和文档。`data/gsm8k/train.jsonl` 与 `deploy/**/*.tar.gz` 加入 `.gitignore`。提交前重跑相关测试 118 通过、1 跳过。
+
+## 2026-11-11：RAVEN 第三层开销优化（实机逐 token 等价）与全天实验启动
+
+- 读 vLLM `EagleProposer.propose`/`set_inputs_first_pass`/`prepare_inputs_padded` 与 `gpu_model_runner.sample_tokens` 的调用顺序后确认：`_dynamic_propose_tree` 末尾的全节点重物化只写草稿树 KV，而这些槽位在被读到之前就被下一轮首遍 MTP forward 重写；`_compact_selected_path` 的草稿 KV 提交同理。原计划的"推迟重物化"改为直接跳过。
+- 代码（全部默认关闭）：`remtp/dynamic_tree_vllm.py` 新增 `REMTP_DYNAMIC_TREE_SKIP_DEAD_DRAFT_KV`（跳过末次 forward 并置 `draft_slots=None`；开着 anchor 剪枝时启动报错）、`REMTP_DYNAMIC_TREE_FAST_METADATA`（`_cached_tree_attn_bias` 按拓扑缓存 CPU 构造的树掩码）及对应启动标记；`remtp/fixed6_vllm.py` 新增 `_offset_tensor` 缓存、`REMTP_DYNAMIC_TREE_FAST_COMMIT=2` 分派、`path_first_row_order`/`_path_ordered_first_pass`（`REMTP_DYNAMIC_TREE_PATH_ORDERED_FIRST_PASS`，改变提议分布 Q）；`remtp/raven_fast_commit.py` 新增 `copy_cache_slots_inplace`/`inplace_order_is_safe`/`commit_selected_slots_inplace`；`scripts/ab_canonical_tree_attention.py` 支持 `+inplace/+meta/+skip/+pathfirst` 臂。
+- 测试：新增 `tests/test_raven_third_layer.py`（14 通过、1 项因系统 Python 无法导入 vLLM 跳过，另用 venv 在 GPU 上核对缓存掩码与 vLLM 原函数逐位相同）；连同 `test_raven_fast_commit.py`、`test_raven_fast_path.py`、`test_dynamic_mtp_tree.py` 共 118 通过。
+- 实机（GSM8K 17/353/856，`results/third_layer_ab_20261111/`）：臂 E（第一、二层 + 第三层三项）1723 token/513 轮，与臂 D 三条逐 token 相同，每轮 1.2385 → 1.2155 s（−23.0 ms），decode 2.712 → 2.763 tok/s。分段计时（32 轮）：cache_update 17.9 → 2.9 ms，proposal 161.9 → 144.7 ms，MTP forward 4 → 3 次，整轮 1241 → 1209 ms（Native 1139）。微基准：树掩码构造 2.67 ms/次 → 缓存 0.0025 ms；36 层路径提交 7.4 → 3.9 ms。
+- 臂 F（E + 首遍路径重排）1184 token/343 轮，每轮 token 3.452 对 3.359，文本不同、样本小，不作结论。
+- 文档：`doc/RESULT-RAVEN-OVERHEAD-OPTIMIZATION-2026-11-10.md` 第 10、11 节；新增 `doc/PORTING-RAVEN-OVERHEAD-OPTIMIZATIONS-2026-11-11.md`（三层汇总与 4090 移植步骤）和 `deploy/raven_overhead_port_20261111/`（钩子补丁，基线为 10 月冻结代码；对上游 `3afafa1` 试打：`fixed6_vllm.py` 全部成功，`dynamic_tree_vllm.py` 7 个 hunk 中 `_dynamic_verify_dispatch` 一个需手工合并）。4090 上未做任何测试。
+- 新增 `scripts/run_day_20261111.py`（HumanEval-100 冻结协议 + Docker 判分、Spec-Bench 新抽样多方法；24 小时截止，逐阶段写 `day_report.md`），冒烟通过后启动，输出 `results/day_20261111/`。
+- 关于 Cactus 与 Native 准确率接近的核对（只读 100+100 记录）：GSM8K 配对结果为两者都对 80、仅 Native 对 4、仅 Cactus 对 7、都错 9，精确 McNemar p≈0.55；Native 截断 15 题（其中对 2）、Cactus 截断 12 题（其中对 5），未截断题上 Native 82/85、Cactus 82/88。100 题分辨不了 2~3 个百分点的差异。
+
+## 2026-11-11：通宵实验完成（GSM8K-100 + Spec-Bench，优化后 RAVEN 对 Cactus）
+
+- `scripts/run_overnight_20261110.py` 于 2026-11-10 23:04 启动、2026-11-11 10:53 完成全部三个阶段（总 11.82 小时；Native 的 Spec-Bench 因超出 10 小时截止被跳过）。原始数据 `results/overnight_20261110/`（已忽略目录），汇总 `overnight_report.md`。
+- GSM8K 100 题（基准同题/同种子/2048 预算，臂 D 配置实跑）：正确 89/100，E2E 2.7733 tok/s，MAL 3.471，每轮 1.2435 s。对 10 月原 RAVEN（88/100、2.6116、3.468、1.3192）：MAL 保持，每轮 −75.7 ms，E2E +6.2%；对 Cactus（87/100、2.8333）仍 −2.1%。回归：每轮 1.226 s + 25.4 ms/千 token（原 1.265 s + 81.8；链式 1.140 s + 10.6）。17/100 题与 10 月输出逐 token 相同，其余为 1 ulp 数值差后的不同采样轨迹，正确率差 1 题不解释为质量变化。
+- Spec-Bench（6 任务×10 条、512 token、T=0.6，两方法均实跑，70 次请求）：RAVEN-opt overall decode 2.396 tok/s、E2E 2.336、MAL 2.990；Cactus 2.361、2.306、2.701。MAL +10.7%，E2E +1.3%；translation/rag/qa/multi_turn 领先，summarization/math_reasoning 落后。单次运行、文本不同，结论为"持平略高"，不作显著性声明。
+- 每轮仍比 Cactus 多约 91 ms（GSM8K 配对）/约 104 ms（Spec-Bench 折算）；GSM8K 平衡点约 69 ms，第三层（延迟重物化、树元数据缓存、cache_update 归因）未做、未测。
+- 运行环境：03:22 起校园网出网中断（Tailscale 失联至 13:08），机器未宕机，实验为本机回环请求未受影响；13:08 机器硬复位（SYS_RESET_N），其时实验已完成。系统日志核对，无 OOM/过热/内核错误记录。
+- 本条只更新文档：`doc/RESULT-RAVEN-OVERHEAD-OPTIMIZATION-2026-11-10.md` 新增第 9 节；未改代码，未重跑测试。
+
+## 2026-11-10：RAVEN 每轮开销定位与两层等价优化（实机 A/B 完成，第三层待做）
+
+- 问题重述：100+100 基准里 RAVEN 对 Cactus 每轮 token +5.9%、每轮耗时 +15.0%（GSM8K）。逐请求回归（R²≈0.99）：链式方法每轮 1.139 s + 10.4 ms/千 token 上下文；RAVEN 1.255 s + 82 ms/千 token。目标 forward 约 1.01 s 且几乎不随行数变化，多出的约 172 ms/轮分为固定约 115 ms（主机/设备同步、重复 MTP forward、KV 提交）与随上下文增长的约 57–66 ms（canonical 树注意力逐节点扫前缀）。
+- 新增 `remtp/tree_attention_probe.py`（`REMTP_TREE_ATTENTION_PROBE_JSONL` 开启，`remtp/target_numerics.py` 挂载，默认关闭、只读）。实机 552 次目标树注意力调用：原生 `qq_bias` 掩码全部等于拓扑祖先掩码；537 次输出与 canonical 逐位相同，15 次有 1–2 行差 1 个 bf16 ulp（最大 0.0039）。注意力核微基准（36 层）：ctx 256/512/1024/2048 下 canonical 63/78/124/228 ms，原生 qq_bias 31/48/43/81 ms，链式 17/21/31/38 ms；合成输入上两种树布局逐位相同。结论：10-04 加入 canonical 的动机（数值一致）与第四轮定位的两个真实根因无关，原生路径可用，但不能逐 token 复现 10 月记录。
+- 新增 `remtp/raven_fast_path.py`：`REMTP_DYNAMIC_TREE_FAST_SELECT=1` 把 `select_dynamic_candidates`/`_cactus_trunk_children`/`_sample_q_token`/`_sample_branch_q_token`/`_temperature_probs` 换成每个父节点两次设备传输的实现（top-k 截点有并列时退回参考全排序；有效性检查改在指数竞争抽样之后，仅影响本就会报错的请求）；`REMTP_DYNAMIC_TREE_FAST_VERIFY=1` 把 `residual_hit_tree_verify` 换成批量归一化（逐行求和以保持逐位一致）、全节点 p/q 一次 gather、每个被验证节点一次传输、残差仅在拒绝时计算的实现（EOS 保护/风险策略/概率上限/决策 trace 时自动退回参考）。`remtp/dynamic_tree_vllm.py`：分派与安装、两处 `float(q[int(token)])` 循环改为一次 gather（无开关、等价）。
+- 新增 `tests/test_raven_fast_path.py`（30 项）：随机输入下与参考实现逐位对照 token、接受集合、终止原因、诊断字典、RNG 状态；连同 `test_dynamic_mtp_tree.py`、`test_canonical_tree_attention.py` 共 101 项，用系统 pytest 7.4.4 + 项目 .venv 依赖 PYTHONPATH 实际通过。`py_compile` 通过。
+- 新增 `scripts/ab_canonical_tree_attention.py`：用 100+100 冻结的 `effective_env.json` 起服务，重放 GSM8K 17/353/856（与基准相同 prompt/seed/2048 预算），逐臂记录 `/metrics` 差分并与 10 月记录逐 token 比对。实测：臂 A（canonical=1）3 条输出与 10 月记录逐 token 相同、每轮耗时相同（1.3057 s）；臂 B（canonical=0）1.2620 s/轮但输出在第 254/152/41 个 token 分叉、更短（上下文 414 对 643），按斜率折算同上下文约省 25–27 ms/轮；臂 C（canonical=0 + 两个 fast 开关）与臂 B 513 轮输出逐 token 相同，1.2414 s/轮（−20.6 ms）、decode 2.661→2.706 tok/s。对同上下文 Cactus（约 1.143 s）仍多约 98 ms，未到收支平衡。
+- 新增 `remtp/raven_fast_commit.py`（`REMTP_DYNAMIC_TREE_FAST_COMMIT=1`，`fixed6_vllm._compact_selected_path` 分派）：路径提交改为先把所有层/槽位源复制到临时缓冲再写目的槽位的两次 `torch._foreach_copy_`，语义与逐层参考一致；`tests/test_raven_fast_commit.py` 6 项（含重叠槽位、空缓存、坏形状）通过。臂 D（C + 融合提交）与 B/C 输出逐 token 相同，1.2385 s/轮，仅再省 2.9 ms；fast 配置的 32 轮分段计时（`AB_PROFILE=1`）：整轮 1241 ms 对 Native 1139，剩余差距为 proposal +59（含第 4 次 MTP forward 约 12、树元数据约 14）、verification +17、cache_update +18、树注意力 +5（短上下文）。
+- 结果与第三层候选见 `doc/RESULT-RAVEN-OVERHEAD-OPTIMIZATION-2026-11-10.md`；原始数据 `results/canonical_attention_ab_20261110*/`（已忽略目录）。新开关默认全部关闭，不改变任何接受规则、树预算或输出分布；三题四臂不是正式基准，未宣称质量或正式速度结论。
+- 新增 `scripts/run_overnight_20261110.py` 并于 23:04（UTC+8）以 `setsid nohup` 启动（`results/overnight_20261110/`，10 小时截止）：① 臂 D 配置的 RAVEN 在 100+100 基准的 100 道 GSM8K 题上按原协议重跑并判分，与记录中其他方法同题并列；② Spec-Bench（`~/ReMTP/data/spec_bench/question.jsonl`）6 任务各 10 条、512 token、temperature 0.6：优化后 RAVEN、Cactus，时间允许时 Native。三个阶段已各用 1 条冒烟通过（`results/overnight_smoke/`）。结果未出，不作任何结论。
+
+## 2026-10-14：Deep因树预算不公平而不采用（文档更正，待验收）
+
+- 用户明确组长认为Deep的更大预测树对原Adaptive不公平、不予采用。冻结protocol核对原Adaptive D3/N9、Deep D4/N12；旧点门槛未检查相同树预算，MAL及其他收益无法单独归因于方法机制。采用状态更正为不采用，保留实测数字、原冻结结果和历史gate。
+- 修改正式精简/完整结果、README/优化入口、目标文档、100+100旧计划与优势搜索旧计划、112结果/历史最佳入口，增加可见采用更新；新增 `plan/adaptive-raven-equal-budget-2026-10-14.md` 和 `doc/upstream-changes/equal-budget/2026-10-14.md`。
+- 新计划固定候选/原Adaptive D3/N9及三链式基线D3，先利用历史D3失败证据，再做EOS/δ/mix消融与每轮计算优化。当前原100+100刻度GS质量≥88%/TPS>2.8333/平均秒<198.02，HE≥65%/>2.7573/<290.11，实判使用完整精度与同一比较单元；这些不是已取得的新收益。
+- 实际验证到此仅只读protocol/CSV及历史报告；5份原始汇总/协议/状态/分析hash已记录。待验收正式两表数字、5个hash、当前链接和格式。仅文档/计划更正，没有新算法实现、GPU/HTTP/判题或后台任务；新固定预算方法尚未测试，也不保证缩树后胜出。
+
+## 2026-10-14：新增100+100精简结果汇报（文档完成）
+
+- 用户要求额外生成只保留结果的精简汇报。新增 `doc/RESULT-RAVEN-100X100-BRIEF-2026-10-14.md`，只列实验完成情况与GSM8K/HumanEval各五方法结果，指标为正确数/正确率或pass@1、E2E吞吐、平均整题秒及MAL。
+- 新增专门改动记录 `doc/upstream-changes/full-benchmark/brief-2026-10-14.md`，同步本日志。数据来自已完成的 `results/raven_full_100x100_20261010/summary.csv`；原详细报告及原始实验文件保留，没有新生成、判题或方法优化。
+- 实际验证：两组表10行全部显示数值与最终CSV逐项一致，数据链接有效；最终COMPLETED/exit0、1000次生成/500次HumanEval判题完成情况核对通过，`git diff --check`通过。本次仅整理已有结果，不产生新的实验结论。
+
+## 2026-10-13：100+100五方法完整实验结束核对（完成，三基线目标未达）
+
+- 用户询问结果是否出来；实际20:59:11 UTC+8结束，COMPLETED、exit0、1000/1000生成、500/500判题，systemd inactive/dead、Result=success、NRestarts=0，8000无监听。failure.json为10月12日历史判题中断，已归档，并非新的最终失败。
+- 新本地忽略results/raven_full_100x100_20261010/offline_audit_20261013.py，对1000payload/response/IDs/prompt/seed/原评分、500判题及270恢复期容器证据、10汇总、8配对及原2000bootstrap、318冻结文件/恢复适配/原600与230资产前缀进行CPU复核。该脚本仅读原结果，独立写新分析，不重放GPU或官方判题；实际运行待确认。
+- 汇总初见GSM8K Native84/Cactus87/Spec85/原Adaptive88/deep86%，HumanEval62/65/57/59/63%；deep对Native两数据集点门槛通过，但对Cactus质量/吞吐未过，对Spec整题耗时未过，三基线目标未达。原方法在GSM8K正确率最高，deep在HumanEval改善原方法；最终中文结果/改动记录待核验后形成，不启动新优化。
+- CPU独立审计实际一次通过：1000/500、270容器证据、318冻结文件、609恢复前资产/前缀、10汇总与8×2000配对bootstrap全部匹配；attempt1=600/attempt2=400，确认候选OOM仅Spec44一条，正确计错。新offline_analysis_20261013.json写入，原结果/analysis/gate/冻结数据不覆盖，没有新GPU/判题。
+- 新doc/RESULT-RAVEN-100X100-2026-10-13.md与doc/upstream-changes/full-benchmark/results-2026-10-13.md完成，README/优化入口/启动/恢复/预测文档加入可见完结notice。deep GS86%/2.6800/263.01秒/MAL3.8111，HE63%/2.5745/293.95秒/3.6692；对原方法GS−2pp、吞吐+2.62%、整题+7.47%，HE+4pp/+1.01%/−15.05%。
+- 成本分解：deep对Cactus MAL+16.41%/+15.20%，每轮decode成本+23.14%/+23.29%，E2E−5.41%/−6.63%；GS输出相对原方法+10.28%导致整题更长，HE输出−14.19%对应整题改善。所有正确率差95%区间跨0，对Spec微小吞吐优势区间跨1，不宣称普遍质量非劣。单seed、已观察GS100题及跨重启/固定顺序限制保留。文档链接/git diff --check待最终实查。
+- 最终文档验收：31条当前本地链接存在，独立CPU审计脚本py_compile及git diff --check通过；原五份server日志未发现CUDA error/EngineDead/OOM/Traceback，最终端口空闲、服务成功退出。完整数据与中文结果文档已形成，没有新GPU、判题、环境/算法修改或后续后台优化任务。
+
+## 2026-10-12：断电重启续跑与Docker OOM误分类修复（实施中）
+
+- 用户授权续跑，实际600/1000生成及230/500判题完整保留：Native/Cactus各200生成+100判题，Spec200生成+30判题。逐条题号/seed/IDs/raw response/record匹配、没有损坏尾行，318冻结源码及冻结数据hash通过。恢复无需重跑已完成生成。
+- 08:08:43 UTC+8控制器实际先因SpecCascade HumanEval/44代码无限增长循环触发Docker512MiB内存上限停止，内核CONSTRAINT_MEMCG/OOMKilled与exit137明确；关机日志11:34:46，不能仅归因断电。重启丢失socket ACL，用户已执行永久docker组加入和当前socket ACL，docker info29.1.3及原ARM64image ID核对成功。
+- 新scripts/humaneval_container_recovery.py、resume_raven_full_benchmark.py、tests/test_humaneval_container_recovery.py及doc/upstream-changes/full-benchmark/recovery-2026-10-12.md。适配只在原受限容器退出后先inspect可信State，确认OOMKilled/137才计候选runtime_error；其他137/基础设施故障保持原停止语义。原冻结控制器和generation源码/protocol不改，8秒/512MiB/1CPU/镜像/官方tests不变，恢复适配独立登记和冻结。
+- 验证尚待CPU分类、实容器参考解/失败现场/非OOM kill、冻结预检与后台恢复，不能预先声称恢复或完整实验成功。重启时的历史状态/失败与已保存资产将先归档，余400生成与270判题续跑。
+- 实际19项CPU检查和编译/git diff --check通过，重启后nvpmodel仍15W/mode2，与前三方法原device_before一致；609已保存生成/判题/raw文件核验通过。真实容器参考解passed，原Spec44确证OOMKilled=true/137并归类runtime_error。首次非OOM kill控制使用容器内PID1自行SIGKILL，被namespace初始化进程保护而返回passed，诊断断言失败；改用host对本测试自有容器docker kill，其他容器不操作。该问题在测试控制样例，生产adapter未需修改；负控制成功后才允许启动。
+- 修正控制样例后真实负控制通过：exit137/OOMKilled=false保持container_error；参考解passed与已保存Spec44 OOM/runtime_error两正向分支同时核对。恢复launcher要求匹配adapter SHA的真实Docker preflight，单独冻结补丁与登记addendum，不替换原318冻结文件或protocol。后台恢复启动待本次实际命令结果。
+- 实际恢复：12:57:46 UTC+8同名systemd用户单元active/running、0自动重试，冻结check-only成功读取600生成/230判题。恢复适配/状态快照/609资产hash登记于recovery_20261012_125735；Spec31开始续判，70条补齐，总300/500；12:59进入原Adaptive模型加载。原600生成/230判题前缀仍hash一致，318原冻结文件及protocol hash不变，Spec44正式判为runtime_error/correct=false、OOM证据保留。
+- 新doc/RESUME-RAVEN-100X100-2026-10-12.md及README/优化入口/旧启动记录notice已接入，旧失败/退出已快照保留。完整实验未结束，恢复后首条新RAVEN生成尚待落盘；文档链接/git diff --check待最终校验，未进行方法优化或重跑已完整的600次模型请求。
+- 最终恢复验收：13:00:25原Adaptive health/8token预热/Worker与冻结配置标记检查通过，题5/seed92实际生成中；13:03系统可用约2.6GiB/swap0、服务active/running。6文档链接及git diff --check通过；已完成数据前缀600生成+230判题仍保留，Spec判题已到100共300/500。完整实验继续后台执行，尚无两RAVEN完整质量/速度结果。
+
+## 2026-10-10：用户核对最终表格样式与数值预测（文档完成，实验继续）
+
+- 用户“预计表”进一步明确同时要表格样式和性能预估；只读核对五方法和实际指标，读取Native43/100、38判对、2.5428TPS、234.96秒、MAL2.9351的14:12:55 UTC+8快照。
+- 新doc/FORECAST-RAVEN-100X100-2026-10-10.md及doc/upstream-changes/full-benchmark/forecast-2026-10-10.md，给GSM8K五方法经验预测范围，HumanEval根据原4090 Native61/Cactus69/Spec66/RAVEN-A63%记录提供低可信参考；deep HumanEval质量与所有HumanEval平均耗时因缺本设备记录保留待测。
+- 预测范围无已计算统计覆盖概率，不标成实测或论文结果；不同旧100题、训练筛选和当前部分数据分开作为外推锚，原方法与EOS0.01的B区分。最终表按100题实际正确数/指标与配对区间判断三基线目标，MAL为辅助。
+- 没有更改冻结代码、原始实验数据、protocol或正在运行的控制器，没有新GPU/HTTP/判题/优化任务。文档链接与git diff --check待实际验证；完整100+100仍待后台完成。
+- 实际文档验收：6条本地链接存在、git diff --check通过，systemd正式实验服务仍active；未触发新推理或优化，预测与正式实验汇总分开保存。
+
+## 2026-10-10：用户确认原协议100+100五方法完整复现（实现中）
+
+- 用户确认GSM8K test100题/sample_seed20260730、HumanEval100题/sample_seed20260802，基础生成种子42，允许启动；本轮先收集完整结果，不再进行开发集候选优化。
+- 新增scripts/run_raven_full_benchmark.py、launch_raven_full_benchmark.py、status_raven_full_benchmark.sh及plan/raven-full-100x100-2026-10-10.md、doc/upstream-changes/full-benchmark/2026-10-10.md。复用原prompt/评分/代码清理/隔离判题及已测服务启动，源码/数据/五配置冻结，1000新生成/500官方判题，逐题持久化、显式断点恢复、自动中文结果/CSV/JSON/配对比较。
+- 配置原Adaptive D3/N9/δ1/mix0.5、后加EOS保护关闭；deep4_conservative D4/N12/δ0.5/mix0.25、保留EOS0.01，三基线D3。五者共用当前FP4/BF16及Target数值修复，无算法/Worker修改。14天后台上限，单请求5400秒、Restart=no；截断只诊断，没有质量提前停止。
+- 实际预检发现apex无Docker权限且sudo需密码，已请用户设置socket ACL；用户反馈执行后docker info成功（29.1.3）。已拉取官方python:3-slim ARM64镜像，镜像pin及100参考解核验待后续实际检查。
+- 验证状态：代码刚实现，CPU/断点恢复、参考答案判题、冻结预检与GPU启动均未完成，不能声称完整实验通过。旧100题已观察，本次原协议复现不是新独立留出；与4090 BF16/ctx8192的设备差异单独记录。
+- 实现审查补充：修复resume序号扫描排除`*_exit.json`，建立独立server日志目录，恢复时固定原image ID而非重解析可变镜像tag，并校验已完成记录的实时IDs和方法/数据集身份。新增tests/test_raven_full_benchmark.py，检查断电尾记录保存、变更seed/顺序/重复/完成行损坏拒绝、容器故障不误计答错，以及候选配置原样保留。测试尚待实际运行。
+- 实际CPU验证：项目.venv没有pytest，改用系统现成pytest7.4.4（未更改模型环境），9项新测试通过；Python编译、bash -n和git diff --check通过。公共组件hash与112请求冻结源码一致；四份原benchmark/evaluator/runner AST与上游3afafa1一致。Docker官方ARM64镜像已拉取并固定ID，原受限runner的passed/failed控制实际均符合预期。100参考解、冻结预检与正式GPU启动仍待完成。
+- 实际启动：HumanEval100参考解全通过、故意错误控制failed；冻结预检与10份100题manifest同题/seed通过，GSM8K题文hash/gold与原正式100题一致；tokenizer最大prompt209/383均满足4096上下文。11:22:57 UTC+8systemd用户后台remtp-raven-full-100x100-20261010.service启动，Linger=yes、active/running、0重试；11:24:28Native health/8token预热/有效Worker与公共数值标记通过，开始题5/seed92。新run目录raven_full_100x100_20261010、源码hash51499bd076956518c87f97e89ac86e48478829bbacbb961a2a260356ac1fb1ed，旧结果未覆盖。
+- 新doc/RESULT-RAVEN-100X100-2026-10-10.md、实时报告链接及README/优化入口当前notice已接入；本条区分真实启动与未完成1000请求，不声称已全面超基线或无后续故障。首完整记录仍待落盘核验。首份文档patch因旧标题匹配失败未写入，改用实际“优化报告入口”标题后完成，不涉及运行代码或冻结内容。
+- 启动后11:28 UTC+8核验：Native/GSM8K5与17两请求完成并持久化，总进度2/1000、判题0/500，正在70/seed742。两record与保存raw response内record一致、output token IDs数与usage一致；active/running、0重试，系统可用约2.1GiB/swap0。318冻结源码hash未变，新文档本地链接及git diff --check通过，CSV已自动生成。任务继续在后台运行，不需要对话持续监控；完整实验结果尚未产生。
+
+## 2026-10-10：112请求优势搜索完结与独立结果核验（完成，目标未达）
+
+- 用户要求检查后台是否跑完。实际单元10月9日11:21:13开始、10月10日00:32:59结束，13小时11分46秒；COMPLETED_DOMINANCE_SCREEN/exit0/112主生成、7启动、7预热全部完成、0额外数值、0重试。当前服务inactive/dead、8000无监听，journal记11.7G内存峰值/swap0，七份server日志无OOM/CUDA/EngineDead/Traceback；不是运行崩溃。
+- 当前修复后同批8题×2seed：B12/16、2.6249TPS、460.26秒、MAL3.5122；balanced3 11/16、2.5856、417.98；deep4_balanced16/16、2.6868、437.31、MAL3.8883；deep4_conservative14/16、2.6440、384.06、MAL3.7986。Native13/16、2.5274、458.31；Cactus14/16、2.8932、403.21；SpecCascade14/16、2.6083、367.98。
+- 两个D4对原B/Native通过质量和两种速度开发点门槛；balanced对B吞吐+2.36%/整题−4.99%，conservative+0.73%/−16.56%。balanced对Cactus吞吐−7.13%/整题+8.46%，对SpecCascade整题+18.84%；conservative对Cactus吞吐−8.61%、对SpecCascade整题+4.37%。原development_result_gate完整false/point_winnerNone，未采用或自动启动留出/正式。截断/逐题逐seed只诊断，没有隐含否决门槛。
+- 新本地忽略 `offline_audit_20261010.py` CPU脚本实际一次通过：112记录/112完整API payload-response、原gold/冻结评分、真实prompt/output IDs、时间token/ledger、7有效env、7summary/analysis、4组64历史输出复现、12点门槛及每组2000题聚类bootstrap一致；474输入hash/完整冻结source hash d25bb51a8c22d2f6ba86fea7b70b5dd7e6fdd1478e34458344808de09e614950通过。产物offline_analysis_20261010.json保留全部scope。首次临时只读查看把保存wrapper误作顶层choices，KeyError后按response字段核对；未影响实验/数据，正式CPU核验一次通过。
+- 新 `doc/RESULT-RAVEN-DOMINANCE-2026-10-10.md`、专门 `doc/upstream-changes/dominance-objective/results-2026-10-10.md`，本地CSV/固定输出优化距离JSON；README、优化入口、原方法/历史最佳专表、目标、原实现记录、当前计划追加完结notice。原analysis/gate/payload/冻结计划与运行源码不覆盖，A/B/C本阶段完成，下一D单元未登记/启动。未改算法/模型/默认参数/评分，检查新增GPU/HTTP调用0。
+- 主要剩余差距：D4相对Cactus轮成本约+25%而MAL+16.29%，接受收益被成本抵消；balanced输出比SpecCascade多22.41%。固定当前输出时，balanced联合速度需TPS>3.1929（再+18.84%），conservative需>2.8932（再+9.43%），后者适合优先成本优化、前者保留质量路线。该距离不是新GPU收益或保证。
+- 限制：8道已观察训练题/2seed，仅开发点结论；balanced对B TPS95%CI[0.9993,1.0438]仍包含1；没有组件profile、新fresh数值重放、独立留出/正式或三基线同等D3/D4选参。本轮运行与CPU数据检查通过不等于最终目标完成，当前没有新后台或发布/提交。最终文档/CSV/hash检查在本工作单元追加实际结果。
+- 最终CPU检查实际通过：7行CSV/中文表显示值与独立核验JSON一致、474输入hash未变、固定输出优化距离计算一致、10份受影响文档105个本地链接存在，git diff --check通过。验证范围充分后停止额外测试，本次不启动新GPU单元。
+
+## 2026-10-09：原 Adaptive RAVEN 三基线专表（CPU 完成）
+
+- 用户追加要求将未加入方法优化的版本与三个基线单独制表。新增 `doc/RESULT-RAVEN-ORIGINAL-VS-BASELINES-2026-10-09.md`，采用初次完整100题中的adaptive/native/cactus/spec_cascade组，列原评分正确率/E2E吞吐/平均整题秒/MAL；原Adaptive86/100、2.8278TPS、235.04秒、MAL3.4759。
+- 修改历史最佳汇总、优化报告入口、`doc/upstream-changes/history-summary/2026-10-09.md`与本日志。明确“原方法”仍在设备FP4/BF16适配环境中，旧100题数据早于后续数值修复，保留单seed/已观察数据限制；修复后16请求参照仅链接，不混入同一表。
+- 本次实际CPU复核400原始记录，4输入hash与已核验产物一致，100题/seed集合完全相同；正确数/总time/token/E2E/平均整题/MAL与原summary/汇总一致。没有新GPU/HTTP/模型调用，没有修改算法/默认参数/评分/运行冻结/历史gate；仍未声称超过三个基线。文档链接和diff最终检查在本工作单元记录。
+- 最终文档检查通过：原方法专表4行所有显示数值与核验JSON逐项一致，4份受影响文档53个本地链接存在，git diff --check通过；仅文档整理，不触发新实验。
+
+## 2026-10-09：历史最佳三基线结果与接受长度汇总（CPU 完成）
+
+- 用户在后台运行期间要求整理 Adaptive RAVEN 的历史最佳基线对照，并加入接受长度。新增 `doc/RESULT-RAVEN-HISTORICAL-BEST-2026-10-09.md`，分别呈现6配对D3/D4全基线选参、24题×2seed历史提速峰值、100题五方法完整历史对照、修复后8题×2seed完整对照，注明数据/数值快照不同；Uniform仅作消融，Gemma4不混入。
+- 本地 `results/raven_historical_best_summary_20261009.csv`/JSON保存29方法汇总、7历史单元、配对差值、91输入hash与扫描索引。CPU实际核验986记录：冻结评分/官方gold/原predicted-answer和correct/时间token/MAL计数/已存summary/同题同seed一致；100题五manifest一致、当前16题实际prompt IDs一致。100题旧单元评分文件未独立冻结，使用现有未变解析函数与原存字段逐条核对，未冒称原source freeze证明。
+- 扫描217历史summary行、117不同summary hash，复制证据不计作新实验；未完成20261009批次排除。48请求旧Anchor候选对原方法正确率+2.08百分点、吞吐+13.91%、平均整题-10.06%、MAL+13.34%，但无同批三基线完整质量对照；6配对Anchor6/6整题235.66秒，后续48请求42判对低于同批原44。100题原Adaptive86判对/2.8278TPS/MAL3.4759，仍无完整联合胜出。
+- 修改 `doc/RESULT-ADAPTIVE-RAVEN-OPTIMIZATION.md` 入口、专门 `doc/upstream-changes/history-summary/2026-10-09.md` 与本日志；本次无算法/模型/默认参数/评分/后台源码变更，无新增GPU/HTTP调用，不覆盖原gate/冻结/历史负结果。MAL采用总轮数加权，接受草稿token/轮=MAL−1；截断仅诊断。
+- 15:41 UTC+8查询当前单元active/running、NRestarts=0、主请求完成34/112，当前deep4_balanced；不是本轮最终结果。历史开发/单seed测试、旧数值路径与缺完整prompt IDs的限制写入报告。本次没有独立新正式测试、模型重放、提交或发布。文档/CSV/输入hash的最终检查在本工作单元记录。
+- 最终CPU检查实际通过：CSV29行逐项与JSON汇总一致、91输入hash未变、3份受影响文档45个本地链接存在、MAL−1草稿长度一致，git diff --check通过；没有新增模型加载/生成或重复后台实验。
+
+## 2026-10-09：用户收敛目标为超过三个基准，移除截断硬门槛（执行准备）
+
+- 用户明确不在乎是否发生截断，要求使用所有可用方法超过Native/Cactus/SpecCascade。当前验收改为原评分正确率不低于各基准且吞吐更高、平均整题更快；截断、正常结束判对、逐题/逐seed差异只报告，不再否决候选。原B保留参照，允许不同生成路径和训练集上的有限参数搜索。
+- remtp/optimization_metrics.py新增dominance_gate，保持summarize/paired_gate/clustered_intervals等历史函数原文不变。新门槛校验完整同题同seed配对、prompt/预算、有效时间与无探针计时；不改原评分、不隐藏单题损失、不选择有利seed。旧冻结/原gate保留，不重写历史结论。
+- 新scripts/run_raven_dominance_search.py复用已验证Round2启动、实际ID序列化、ledger及systemd流程，准备新独立112主HTTP单元：B、3个Adaptive候选、3基准，各8已观察题×2seed；7启动预热、24小时、0额外数值/重放、0重试、不自动采用。候选分别D3/N9/delta.75/mix.25，D4/N12/delta.75/mix.25，D4/N12/delta.5/mix.25，均head1/risk none；按完整质量/速度比较，不因单题损失或截断早停。
+- 研究扩大至delta/mix/深度节点预算、自适应树/预测接受、MTP训练及kernel/KV成本；Sequoia的硬件感知树和SpecDec++的自适应长度提供研究依据，不移植其硬件收益数值到本机。软件环境/公共Target数值/模型/prompt/评分保持当前单元公平配置；更换公共模型或协议需所有基准同条件重跑。
+- 新门槛与控制器尚待必要CPU检查、冻结preflight；没有新GPU生成或后台启动，未声称已超过三个基准。新计划/专门改动记录将在本工作单元同步，不使用先前计划中的未启用额度。
+- 新launch/status_raven_dominance与tests/test_raven_dominance.py完成，验证新目标、损益抵消/逐seed诊断、同协议与探针拒绝、原度量函数保留、真实startup MRO及112请求完整流程。源码核对纠正新控制器有效日志检查字段为实际N_max，尚未运行GPU，无实机失败。按新目标CPU重评旧target_odds仍对三个基准失败，失败项为accuracy/latency以及Cactus/SpecCascade的throughput；移除截断门槛不改变它的负结果。
+- 首轮必要CPU测试20通过/1失败：完整流程fixture模拟启动遗漏真实start_server的mkdir行为，已修正测试，生产运行算法未因此改变；截断fixture采用实际2048token预算。新计划/目标/专门改动文档形成，旧计划/研究/README/报告入口追加用户最新目标notice，避免旧截断硬门槛继续指导运行。重检、冻结preflight与实际启动待后续记录。
+- 修正后21项必要CPU检查通过0.20秒；py_compile、bash语法和git diff --check通过。实际CPU新目标重评保存results/raven_objective_revision_20261009.json，旧candidate对所有参照仍负；没有新GPU请求。控制器policy明确区分继承common protocol模板与实际3候选/2seed/无留出执行，增加真实IDs复现门槛测试后进行冻结前最终检查。
+- 冻结前22项必要CPU检查实际通过0.21秒，py_compile/bash -n/git diff --check通过；7份当前文档75个本地链接存在。真实workspace check-only成功，results/raven_dominance_preflight_20261009各ledger全0；包、数据、原prompt/数值、运行域源码与历史度量AST一致性检查通过，只新增目标函数。当前系统available约10GiB、旧单元inactive、8000空闲，准备独立冻结启动112完整请求；此处为启动前记录，不声称新质量/速度通过。
+- 2026-10-09 11:21:13 UTC+8实际冻结启动remtp-raven-dominance-search-20261009.service，目录results/raven_dominance_search_20261009；冻结check-only与全source hash d25bb51a8c22d2f6ba86fea7b70b5dd7e6fdd1478e34458344808de09e614950匹配，active/running、Restart=no、NRestarts=0、24小时上限。独立112主请求/7启动预热/3候选额度启用；首次状态B加载、starts尝试1、主请求/预热0，无新质量/速度结果，非正式/留出，不自动采用。新LIVE链接及计划/目标/入口/专门记录同步实际启动，运行冻结和冻结前plan原文保留。
+- 11:24 UTC+8实机核验：B服务health200、预热chat200、有效worker/env检查通过；1532/base42完整生成中，main尝试1/112、完成0，启动与预热各1/7、0重试。MemoryCurrent约10.72GiB；7份当前文档80条本地链接存在，git diff --check通过。当前只证明启动与首请求正在运行，新候选及三基准质量/速度尚待112完整校准，最终目标未宣称达成。
+
+## 2026-10-09：以原B重建优化计划，定位失败约束的真实首分叉（研究完成）
+
+- 用户要求以原Adaptive RAVEN为基准，研究上一轮失败原因并制定超过Native/Cactus/SpecCascade的计划。参考为已复现的B冻结，默认risk_policy=none；没有改变运行算法、模型、公共数值实现、评分或停止条件。
+- 新scripts/analyze_raven_baseline_research.py，仅CPU读取完整API IDs、自然逐轮summary及注册P/Q/H/RNG帧，按相同真实前缀/拓扑/候选/P_y/Q_y/随机数对齐直到首输出分叉；不把分叉后的不同状态误判为Target故障。加入候选条件H逐个保持EOS仍可改变算法EOS边缘的三token完整反例，防止下一轮重复无效概率保护。
+- 已执行的临时CPU摘要定位：3213/43前405token相同，generated_length403处no_reallocation使同一候选验收由约0.757降至0.528，同一uniform约0.634，B接受而候选拒绝；5180/42、1231/43改善也来自strict导致同候选接受翻转。局部低支持不能区分质量方向；末段答案损坏由后续长生成与2048预算截断表现，不能把首分叉自动等同全部最终因果。
+- 已查Cactus原论文的候选条件H与整体有效分布区分、精确推测解码原论文，以及vLLM0.18官方长度/EOS停止源码；计划将计算等价优化与新质量分布设计分开验收。新离线脚本的正式核验及中文研究/计划文件待本工作单元完成后追加真实结果。
+- 当前GPU/模型/HTTP新增调用均0，没有新后台；旧失败候选、gate、冻结和额度保留。本轮研究不会把编写脚本/计划称作实机修复成功。
+- 新CPU脚本首次已完成真实前缀/帧与EOS反例校验，但最后读取吞吐字段时误用e2e_tokens_per_second，原冻结指标实际名e2e_tok_s；已修正后重跑。没有写产物或触碰原始数据，此次错误仅为新离线分析字段名。
+- 修正后正式CPU核验通过，results/raven_baseline_research_20261009.json保存：6条真实轨迹、83注册完整帧；共同前缀上的26配对帧P/Q/候选/拓扑/RNG_before逐位一致，5处首输出改变均见同随机数验收翻转。3213/43为no_reallocation，另外4处strict，其中2条正常结束改善、1条原评分改善、1条仍截断错；信号没有单向质量关系。5个首分叉完整矩阵均未落在旧固定checkpoint，明确保留这个证据缺口。
+- 新研究进一步加入全部自然逐轮EOS标量统计及候选无关完整H的三候选接受/残差枚举，用于区分单个H与算法边缘；更新脚本后将另存v2产物，原产物保留。没有生产候选实现或新GPU。
+- v2研究实际通过，原v1保留。B自然主干7584/7592、候选6334/6341的Target EOS<1e-7；登记完整H各104事件的最大Target EOS约2.89e-11/1.52e-10，单纯恢复极小结束概率无改善证据。全逐轮结束机会与稀疏完整H的scope分开；候选条件EOS反例和共同H的3个beta数学枚举通过，不称为任务质量证明。
+- 新doc/RESEARCH-RAVEN-BASELINE-2026-10-09.md、plan/adaptive-raven-baseline-optimization-2026-10-09.md及doc/upstream-changes/baseline-research/2026-10-09.md已形成；README、优化报告入口与上轮结果链接更新。计划以B原行为为计算参照，精准补4退化/2改善、增量MTP计算等价、候选无关完整H数学研究、逐题哨兵及独立留出/正式依次验收。各新单元额度仅提议，未启用或消耗；没有新GPU、默认切换、提交/推送。
+- 最终验证：v2 CPU分析实际通过；新脚本py_compile及git diff --check通过；6份当前文档71条本地链接存在。两原systemd单元inactive/dead、Result=success、NRestarts=0，8000无监听。补明确E/Q1条件CUDA只验verifier，不添加额外模型前向，新proposer证明由有限自然窗口提供；F/E/Q1等新预算尚未启用。中文报告解释2048输出token预算触发length及120→12、256→25的实际截断损坏，保持原评分。最终目标未达成，生产修复未宣称通过。
+
+## 2026-10-09：根因与Target相对支持修复实验完结核验
+
+- 状态：原根因2026-10-08 10:32:30 UTC+8、修复21:32:26 UTC+8均正常结束，exit0、COMPLETED、Result=success、NRestarts=0，端口8000释放。根因6主HTTP/11fresh/2启动预热；修复86主HTTP/11fresh/48 CUDA/7启动预热完整完成。12自然现场中重复完整prefix明确共享，11不是漏跑。
+- 控制器记录的五方法每16校准：Native13原判对/11正常结束判对/5截断、Cactus14/8/8、SpecCascade14/11/5、B12/10/6、target_odds10/8/8。候选对B吞吐约-1.16%、平均整题+16.87%；对三个基准质量/速度联合门槛均未通过，未采用或展开留出/test。
+- 新scripts/analyze_raven_risk_repair_results.py，仅CPU复核冻结原评分/完整API payload/IDs、80条校准和12条自然记录、统计/逐seed/原bootstrap、数值原始张量与源码/资产hash、CUDA登记及实机门槛。独立写offline_analysis_20261009.json，不覆盖原gate/分析/冻结/失败。实际CPU核验进行中，不把检查脚本编写称运行通过；没有新GPU/HTTP/候选。
+- 原始配对已见2950/42、1231/42正常结束判对变截断错；6009/43从116正常结束到2048截断仍按末数判对；3213/43截断原判对变错。六条smoke被局部增益抵消后通过，不代表16条非退化。中文结果/旧计划与入口的完结notice待CPU复核后更新。
+- 限制：8道已观察训练难题×2seed，8题聚类；没有独立留出/正式实验。不把12现场的raw相同扩展为所有生成状态证明，也不把设计反例等同具体整题退化的完整因果。
+- 首CPU核验已完成所有校验，写输出时发现CLI变量a被帧校验循环遮蔽，导致AttributeError，未写产物；已改为独立args变量后重新执行。该错误仅在新离线分析脚本，不涉及已完成的GPU控制器、原始记录/门槛或模型调用。
+- 修正后独立CPU核验实际通过：80校准/12自然原评分、完整payload与IDs、各summary/analysis、逐seed与原2000题聚类bootstrap、83完整耦合帧、两单元各12现场raw及11fresh、CUDA16帧/48登记、冻结源码与200份资产hash。四个原方法均16/16历史输出签名重现。没有新模型/HTTP/CUDA调用；新offline_analysis_20261009.json保存，原资产不覆盖。
+- 已新增doc/RESULT-RAVEN-TARGET-ODDS-2026-10-09.md与doc/upstream-changes/root-cause/results-2026-10-09.md，给出五方法对比、3错损失/1错改善、3停止转截断/1截断转停止、子集门槛覆盖、正文正确数字被截为12/25以及输出+15.51%/长尾耗时74.20%分析。当前候选拒绝，risk_policy默认none已保持；未启动下一轮或调整运行算法。
+- README、RESULT-ADAPTIVE-RAVEN-OPTIMIZATION入口、两份计划、ROOT-CAUSE记录与原诊断/修复改动文件追加可见完结notice，旧运行状态和冻结原文保留。计划实际执行完成与优化目标未达成分开，门槛负结果不改写；当前两单元已退出、没有新后台。
+- 验证完结：CPU核验实际通过；新脚本py_compile、git diff --check通过；9份当前文档86条本地链接存在。对九份实际服务日志的OOM/CUDA error/Traceback/EngineDead检索无匹配。完成中文报告与核验，本次未新加载模型/发送HTTP/执行CUDA/提交推送；下一候选与独立验证仍未执行。
+
+## 2026-10-08：自然诊断运行中；Target相对支持约束候选实现
+
+- 状态：09:26:01 UTC+8独立冻结启动remtp-raven-root-cause-20261008.service，Restart=no、0重试。09:56核验自然请求完成3/6、尝试4，fresh Target尚未开始；旧冻结没有修改。下方“尚未启动新GPU”是启动前历史状态。
+- 5180/43改善对照105-token正常结束判对；6009/42失败对照2048截断判错。两者输出文本/数量/finish复现历史B，实际提交ID、摘要与自然raw/P耦合已通过；6009存在144次相对严格验收新增接受及5次相对uniform新增接受。低概率格式符号在改善对照中也会被接受，因此局部概率现象不是整题因果证明。
+- 在工作区实现一个默认关闭的target_odds候选：Target概率不足其最大值1/1000的候选改用严格P验收/残差；不足1/10的候选不允许跨位置追加松弛；其余保持原规划。严格位置额度在预算池回收前归零，EOS保护保留，H同时用于接受和残差。仅供新独立修复单元验证，不更改模型、原评分、停止规则或运行中的B。
+- 受影响文件：remtp/dynamic_mtp_tree.py、dynamic_tree_vllm.py、scripts/run_adaptive_round2.py、analyze_raven_root_causes.py、status_raven_root_cause_unit.sh，新tests/test_target_odds_risk.py及本日志。摘要将EOS/prefix保护与新增风险保护区分；残差是否实际消费明确标注；状态查询优先当前任务。
+- 验证：初轮必要CPU检查129通过/1失败，失败为EOS测试概率恰处FP32阈值边界，测试夹具改为0.02高于0.01阈值，未调整运行算法阈值。修正后检查进行中；新候选尚未运行GPU，未声称修复质量/速度目标达成。
+- 下一步：完成必要CPU验证和独立详细修复计划；后台等待原诊断完整通过，依次做CUDA旧/关闭兼容与新H检查、新候选自然轨迹及实际Target前缀门槛，再用同协议无探针对比Native/Cactus/SpecCascade/B。有限预算、无自动重试，未通过门槛即停止，不重复使用旧额度。
+- 修正EOS夹具后130项必要CPU测试通过（8.96秒），算法默认关闭兼容/局部H与RNG通过CPU范围。新增run/launch/wait/status_raven_risk_repair；新计划与专门target-odds-repair改动文档。标准库等待依赖成功后才exec冻结控制器，避免同时驻留第二模型。run_raven_root_cause_unit仅工作区复用Target检查、允许候选非历史B输出、按实际探针标记性能样本；运行冻结不改。新脚本py_compile/bash语法通过，控制器集成与冻结启动尚待实测。
+- 新tests/test_raven_risk_repair.py覆盖依赖拒绝/清理等待、源码白名单、CUDA帧选择/hash、真实startup MRO/env、完整86请求控制流/ledger/实际ID复现/中文分析及H残差/RNG错误拒绝。首轮85通过/1失败：测试transport错误用divmod(seed,10)回算题号，忽略base seed为42/43的进位；已修正夹具，实际seed公式和运行代码未改变。重检进行中，无新候选GPU。
+- 修正后86项控制器/观测/边界CPU检查通过（6.06秒）；真实workspace check-only实际成功，results/raven_risk_repair_preflight_20261008账本各类全0。CUDA子进程异常也finally重载ledger，失败预算不被旧缓存隐藏。根因文档新增四条实际轨迹/计数，README/结果入口/计划/改动文件同步真实状态；原Target fresh未开始，候选GPU尚未启动。
+- 另新增CUDA子进程超时后父进程报告仍保留失败尝试额度的必要边界测试，冻结前重检；不扩大算法试验、数据或GPU预算。
+- 冻结前最终87项CPU检查通过6.21秒；py_compile、bash语法、git diff --check及5份文档62条本地链接检查通过。下一步独立冻结启动轻量等待流程；工作区preflight与旧冻结原始记录保持。
+- 10:17:42 UTC+8实际冻结启动remtp-raven-target-odds-repair-20261008.service，目录results/raven_target_odds_repair_20261008；冻结check-only实际成功、全源码hash匹配。active/running、WAITING_ROOT_DIAGNOSTICS、Restart=no、NRestarts=0、RuntimeMax=1d、Linger=yes，截止10月9日10:17:42包含等待。实际等待进程未映射libtorch，MemoryCurrent约8.0MiB，模型/HTTP/CUDA额度全部0；不会与原B并发加载服务。
+- 人工diff及组件hash核对：允许变化只dynamic_mtp_tree、dynamic_tree_vllm、run_adaptive_round2；桥接仅新增env/日志，Target公共数值与MTP采样/缓存/评分源码保持。启动状态追加到新旧计划、README/报告入口/根因与专门改动文档，LIVE入口创建；原B冻结、历史失败/negative gate/原额度保留。新候选实机质量/速度尚待门槛，不声称超过三个基准，未提交/推送。
+- 10:22:33 UTC+8最终状态核验：原根因5/6自然完成、1231/43生成中，fresh Target0/12；修复等待单元active/running、NRestarts=0、各类额度0。7份当前文档72条本地链接存在，git diff --check通过；不需要持续对话监控。
+
+## 2026-10-08：根因定位离线证据与有限自然诊断实现
+
+- 状态：CPU定位/实现完成，53项相关CPU测试通过（4.10秒）；尚未启动新GPU。最终目标仍为原正确率/正常结束判对不降、截断减少，吞吐及整题耗时分别超过Native/Cactus/SpecCascade，后续独立留出/test。
+- 用原评分器重核上次全部64条，保存6个关键pair逐字分叉、答案marker与末尾数字；6009/42、2950/43已计算正确值但反复截断留下其他数字。正对照保留1231/43、5180/43，不把同seed不同算法的自然RNG路径差异当作实现错误。
+- 现代码默认参数的2token/D3全部8路径CPU枚举：每块adaptive局部TV总和都不增，但首token边缘分布TV由0.1407125升至0.2110687（+50%），有效delta参数最高2.25。证明跨位置预算不足以保护根分布质量；不冒称已证明具体GSM8K错题因果。原始CPU结果results/raven_root_cause_offline_20261008.json。
+- 修改remtp/decision_trace.py、target_diagnostics.py与scripts/run_adaptive_round2.py，仅新增可选、有界观测/env；摘要取实际诊断、一次小ID复制，不加模型前向/抽样；trace-only避免旧head额外投影，最小prompt跳过短预热，旧默认verifier-only保持。
+- 新scripts/analyze_raven_root_causes.py、run_raven_root_cause_unit.py、launch_raven_root_cause_unit.py、status_raven_root_cause_unit.sh、tests/test_raven_root_cause_unit.py；注册6主HTTP/12自然实际前缀独立Target/2预热/2启动，4h、Restart=no、0重试、无候选/留出/test，独立冻结与ledger/心跳。沿用正确ReviewUnit→Round2 MRO，无复制零参super到兄弟类。
+- 启动前补查两个5180 seed的首prefix可能相同：以完整实际ID严格去重fresh selector，只做至多12次独立调用，12个自然现场逐一比较并显式登记共享源，不因重名漏采或虚增不同前缀数；新增去重边界测试。
+- 最终CPU54项通过（3.96秒），真实workspace check-only通过；独立preflight ledger全0，没有GPU推理。README/优化报告入口更新本轮定位；用户追加授权找到原因后制定/执行修复并重跑，继续沿用原质量/数值门槛，不重复请求执行确认。
+- 新plan/adaptive-raven-root-cause-2026-10-08.md、doc/ROOT-CAUSE-ADAPTIVE-RAVEN-2026-10-08.md、doc/upstream-changes/root-cause/diagnostics-2026-10-08.md；所有旧freeze/失败/negative gate保留。研究参照Cactus原论文关于候选H/有效分布的区分；总TV不继承其分布约束保证。
+- 验证：原验证器仅调用一次与RNG不多消费、摘要上限、完整API提交ID/预算裁剪、真实prefix/位置/原始P错配拒绝、probe跳过预热/prefill、实际startup/env/MRO、旧探针和EOS测试共53项通过；py_compile、bash语法、git diff --check通过。首轮1个测试因mock属性未安装失败，测试夹具修正后通过，未消耗GPU预算。
+- 限制：新观测实机输出复现、六条真实轨迹、12个raw门槛尚未运行；历史API未保留token IDs，只能比较跨运行文本/数量/finish签名。CPU反事实与副本不是完整自然因果或MTP/KV证明，探针时间不作性能结论。本次未修改数学/模型/模板/评分，也未提交或发布。
+
+## 2026-10-08：复审证据单元完成，中文离线结果分析完成
+
+- 实际完成于06:25:15 UTC+8，续跑COMPLETED_EVIDENCE_UNIT、exit0、systemd inactive/dead、Result=success、NRestarts=0；journal内存峰值11.6G/swap0，端口8000释放。本轮全部64校准和2 Target-only完成，无新质量候选，运行完成不等于质量/速度目标达成。
+- 四方法各16请求：Native原判对13/正常结束判对11/截断5；Cactus14/8/8；SpecCascade14/11/5；B12/10/6。吞吐2.5264/2.8936/2.6068/2.6130token/s；B对Cactus约-9.70%，对Native+3.43%/对SpecCascade+0.24%，平均整题对三者均更慢。
+- 先用冻结原评分器对64请求逐条重算并核对四份summary/analysis完全一致；按题聚类原bootstrap与逐seed门槛CPU重算，B对三个基准均未过质量门槛。B16完整输出文本/token数/finish签名与修复历史一致，不把偏故障8题75%和旧24题93%跨数据组称为修复退化。
+- Target-only1532两seed均2048截断/判错/重复，约2125秒/条；五个实际晚段raw逐位一致、完整gate通过。前者提供独立AR可复现证据，后者只覆盖1532五现场，不代表所有错题KV或截断因果已解决。
+- 新scripts/analyze_raven_review_results.py已实际CPU核验通过：固定16配对、冻结评分/数值组件、有效env无探针、旧artifact哈希、五个raw张量、16签名、完整预算，并登记按题CI/迁移/截断成本；独立写offline_analysis_20261008.json，不覆盖原analysis/gate/freeze。B6条截断占63.41%耗时；MAL对Cactus+5.04%、轮耗时+16.44%，吞吐收益被抵消。
+- 受影响文件：新增doc/RESULT-RAVEN-REVIEW-EVIDENCE-2026-10-08.md、专门doc/upstream-changes/project-review/results-2026-10-08.md、CPU核验脚本；更新计划步骤4/5完成及定位优先级、README/结果入口、原专门实现/修复的完结notice与本日志。status_raven_review_unit.sh在终止阶段明确最后任务/历史心跳，不把最后True状态误称当前存活；仅查询显示，原记录/冻结不变。
+- 验证：新脚本py_compile、CPU完整核验实际通过（约8秒）、git diff --check通过；7份更新文档62条本地链接均存在，状态脚本bash语法和真实已结束查询通过，当前remtp运行单元列表为空。15W模式2四服务启动记录一致，遥测GPU53.6～64.5℃，采样不冒称完整限频证明。本轮没有启动新GPU服务/生成、调整算法或发布/提交。独立留出/test、uniform消融、HumanEval与优化候选仍未执行。
+
+## 2026-10-07：分段prefill修复后GPU末段门槛通过，Target-only长生成中
+
+- 21:38 UTC+8核验：补测late_4_target正确保存175-token最终chunk，末位置2222/输入18；fresh树与顺序raw逐位一致、最大差异0/TV0。完整五前缀gate通过，前四个原证据CPU哈希/张量复核后复用，原位置失败/exit3/ledger保留。
+- fresh树对历史保存P最大TV约9.17e-8，低于登记CPU归约容差1e-6；五现场树/顺序raw无需容差，均零差异。数值scope仅5个实际前缀，不能继承完整自然KV/质量证明。
+- 续跑active/running、NRestarts=0，新增数值1/1/预热1/5/启动1/5完成；当前1532/seed42实际15362、2048预算Target-only生成中，主HTTP完成0/66/尝试1。服务约1token/s，5400秒HTTP等待已登记；尚未判断该请求结束、正确率或截断。
+- 受影响文件：同步当前计划步骤3已完成、步骤4运行中，README/报告入口/专门实现与故障文档和本日志。没有新增源码修改或超预算请求，原冻结与负gate保持。
+- 验证：修复后真实模型加载/健康/8-token预热/末段采集及完整五前缀raw门槛实际通过；36 CPU/py_compile/bash语法/冻结预检证据已记录。实际venv CPU读取末段张量核对175行/位置2222/输入18与完整gate通过，5份当前文档53条本地链接存在，git diff --check通过。64无探针校准、新计算候选、质量/截断收益、三基准正式比较仍未完成；未提交/推送。
+
+## 2026-10-07：观测修复续跑已独立冻结启动
+
+- 21:35:02 UTC+8启动remtp-raven-review-continuation-20261007.service，目录results/raven_review_continuation_20261007；冻结check-only实际通过，active/running、Restart=no、NRestarts=0、Linger=yes。RuntimeMax约23小时33分，截止仍为原执行开始后24小时，没有重置总时间。
+- 冻结前36项必要CPU测试3.22秒通过；真实源码与冻结各一次CPU预检通过，重新核验原进度/覆盖/实际张量/四个精确gate、数学/Serving/评分与哈希。新增ledger66主HTTP/1数值/5预热启动，原10/9数值观测与失败保持；两单元合计尝试74/11/10/10。
+- 更新当前plan/README/报告入口/专门实现与故障文档的实际启动状态；本日志同步。只修改工作区文档，原冻结源码、失败、负gate不变；新LIVE入口指向独立续跑报告。
+- 验证：启动器真实成功；systemd实际RuntimeMax/Restart检查通过；5份当前文档50条本地链接存在、git diff --check通过。21:35当前Target加载、新主HTTP0/66/数值0/1，没有声称末段GPU gate通过。
+- 剩余限制：末段raw、2 Target-only长生成、64完整校准待后台；新计算优化候选/截断改善/三基准正式速度仍未达成。没有自动重复profile/前四个数值请求，未提交/推送。
+
+## 2026-10-07：末段探针分段prefill故障定位，有限续跑CPU预检通过
+
+- 原后台21:22:11 UTC+8 NumericRejected、exit3、0重试并清理服务。8 profile完成、数值10HTTP200/9满足采集门槛、预热与启动5。不是已完成长生成/校准，旧failure/exit/ledger/gate/冻结保留。
+- 明确故障：2223-token顺序prompt的chunked prefill上限2048，探针max_frames1在第一段保存位置2047/输入220，预期末位置2222/输入18。第一段消耗唯一保存名额，最终175-token chunk未保存；前四个fresh树/顺序raw零差异。没有本次OOM或模型崩溃证据，第五个正确raw尚未得到。
+- 修复remtp/target_diagnostics.py只在精确顺序prefix末位置保存，中间chunk不消耗名额；不增加投影/RNG/KV写入。完整HTTP等待1800→5400秒，Target约1.03秒/轮存在2048单步生成超过1800秒的具体风险，尚未实际触发HTTP超时。输出预算/种子/prompt/评分保持。
+- 新run_raven_review_continuation.py只复用该已定位观测故障的8 profile/4精确前缀，核对原进度、冻结运行域/评分、tensor/哈希和覆盖；新增66主HTTP/1次数值补测/5预热启动，合计尝试上限74/11/10/10，沿用原24小时绝对截止。不是无记录自动重试，旧负gate不改写。
+- 受影响文件：target_diagnostics.py、run_raven_review_unit.py（新增evaluation依赖域）、新run_raven_review_continuation.py、launch/status_raven_review_unit脚本、test_raven_review_unit.py；专门probe-prefill-fix文档、当前计划/报告/README/实现记录与本日志。
+- 验证：36项必要CPU检查实际通过3.22秒，包括2223前缀2048/175两chunk原投影两调用不变、第一段不保存/第二段唯一保存；完整HTTP等待参数与生成预算保持、续跑拒绝已花费工作/数学变化和原截止检查通过。py_compile、bash -n、git diff --check通过。
+- 真实续跑check-only通过，CPU重新核验旧进度/四方法计时覆盖/四个raw相同前缀/原数学与评分/哈希，新ledger全0；未加载模型、未新生成。修复后真实末段补测未启动，完整质量/速度和新候选未完成。冻结原运行源码未修改，未提交/推送。
+
+## 2026-10-07：四方法当前计时完成，晚段数值检查运行中
+
+- 21:19 UTC+8真实profile 8/8请求完成，Native/Cactus/SpecCascade/B各32 decode轮，B实际tree proposal覆盖通过。主HTTP8/74、预热4/9，五个树侧晚段前缀依序检查中；后台active/running、NRestarts=0。
+- 当前观测B平均轮跨度1.271秒，Target forward/logits stream跨度1027.67/21.41ms，约82.5%；proposal169.05ms、sampling30.49ms、cache17.16ms。候选选择25.35ms约2%，单独top-k不足以支持≥5%整体收益承诺。sampling CPU墙钟417.86ms包含等待，不能当作纯验收计算开销。
+- 受影响文件：更新当前计划步骤1/2为实际完成、步骤3为运行中；更新专门evidence-unit文档/README/报告入口与本日志。新增本地profile_overview.json汇总真实观测，不修改运行冻结或数学算法。
+- 验证：四服务实际profile覆盖检查与128轮观测完成；CPU汇总保留父子关系，只取顶层跨度，未相加嵌套子项。上一组文档47条本地链接存在、git diff --check通过。
+- 限制：两题早段带探针记录不计正式质量/速度，token/观测轮不替代完整MAL。独立Target侧数值门槛、Target-only、64无探针校准未完成；新候选仍未选，无新GPU请求超出注册预算，未提交/推送。
+
+## 2026-10-07：第一证据单元已后台启动，Native/Cactus真实计时覆盖通过
+
+- 状态：21:08:40 UTC+8冻结启动remtp-raven-review-20261007.service，结果目录results/raven_review_unit_20261007；active/running、NRestarts=0、Linger=yes、24小时上限。没有在运行冻结内打补丁。
+- 21:14实际核验Native/Cactus各两条308/641、seed42、64-token请求完成，均HTTP200；各32轮真实decode计时，Target/proposal/sampling/cache覆盖检查通过。完成主HTTP4/74、预热2/9、数值0/10；SpecCascade加载中。健康/预热单列，不当作质量证据。
+- 设备仍15W模式2，Native权重实际约6.11GiB，运行时系统available约2.0GiB、swap0，当前无OOM证据。CUDA事件是stream跨度，探针请求不计无探针质量与吞吐。
+- 受影响文件：更新plan/adaptive-raven-project-review-optimization-2026-10-07.md、doc/upstream-changes/project-review/evidence-unit-2026-10-07.md、doc/RESULT-ADAPTIVE-RAVEN-OPTIMIZATION.md、README与本日志；新增doc/RESULT-RAVEN-REVIEW-LIVE.md链接。保存新的launch/执行次数/policy/ledger/组件hash/设备记录，旧结果保留。
+- 验证：冻结启动器实际成功、冻结check-only通过；真实Native/Cactus服务与profile覆盖已验证。31项CPU检查为本单元实现证据，不代替晚段数值/完整输出门槛。
+- 剩余限制：SpecCascade/B计时、5个实际前缀fresh树/顺序Target门槛、Target-only完整生成与64条校准未完成。新计算候选未选，截断改善/三基准加速/独立留出与正式阶段仍未达成；不修改旧负gate，未提交/推送。
+
+## 2026-10-07：执行复审计划第一单元（CPU预检完成，准备启动）
+
+- 用户授权按复审计划优化。先执行有限证据单元，再依据当前成本选择一个计算优化方向；不重新启动已拒绝候选，不放宽正确率门槛。
+- 准备修正runtime_profile：只观测注册的实际decode轮，跳过预热，最多32轮/服务；CPU墙钟与CUDA event跨度分开、保存父子关系，不自动运行top-k验证或额外算子循环。
+- 准备新增第一单元控制器/冻结启动/状态查询、组件依赖hash、独立调用ledger和心跳；质量拒绝/数值拒绝/运行故障/预算停止明确区分。74主HTTP、10数值诊断、9固定预热、24小时上限，0自动重试。
+- Target晚段检查使用5个保存实际前缀的fresh树/顺序Target比较。观测只复制已有logits，不额外投影；Target-only两条和64训练校准仍用原2048预算。模型、公共数值与原prompt/评分保持。
+- 受影响文件：remtp/runtime_profile.py、target_diagnostics.py、scripts/run_adaptive_round2.py；新增run_raven_review_unit.py、launch_raven_review_unit.py、status_raven_review_unit.sh与tests/test_raven_review_unit.py；专门doc/upstream-changes/project-review/evidence-unit-2026-10-07.md、当前计划/报告/README及本日志。运行数学源码未改。
+- 验证：31项必要CPU测试通过（2.94秒）；py_compile与bash -n通过。首个CPU预检因repair快照缺少后续cap接口拒绝，旧目录/0模型调用保留；使用最新cap关闭B冻结核对运行域、repair B作输出回归参照后，真实v2 check-only通过。实际venv的10个vLLM/BNB入口存在；API导入初始化CUDA上下文后检查进程退出，未加载模型/生成。系统Python直接导入vLLM曾混入系统SciPy，已使用项目解释器，不改包。
+- 新单元来源/输入/每阶段有效配置、15秒心跳、9服务上限和ledger已实现；数值调用明确为10个顶层HTTP诊断，内部模型操作另记，shape额外投影关闭。profile仅两个实际请求/跳过预热和prefill，嵌套CPU墙钟/stream跨度不能累加成纯kernel时间。
+- 限制：当前GPU加载/真实profile/晚段P与KV/Target-only/64校准尚未执行，新优化候选未选。旧冻结/失败数据完整保留，未提交/推送。
+
+## 2026-10-07：全项目审查与优化优先级重新评估（审查完成）
+
+- 用户要求重新审查整个项目、判断优化方向与总目标；当前仅CPU/源码/文档审查，未启动GPU或新候选。重新核对方法/基准workers、构树/验证/缓存、Target数值适配、评分与统计、控制器和预算。
+- 新scripts/audit_raven_project.py已两次CPU运行通过：每次固定29真实B帧×旧/后剪枝=58验收调用、16实际Q×排序/精确top-k=32选择调用（合计116/64 CPU调用）；节点224→188，24 proposal帧累计326处理行/190最终节点。605轮精确后缀重复命中0、最大Target EOS质量1.69e-7；候选松弛与样本依赖branch保留的小词表枚举通过。CPU RNG不是原CUDA重放，不冒称live P/Q/KV或计时收益。
+- 已读代码确认anchor verifier不读取备选后代，当前B仍生成/物化这些节点；多轮MTP重复计算累计树。Target FP4固定64/LMHead16 padding意味着少节点不等于同比节省GEMM。现有profile参数未传入env，profile有额外top-k算子循环，需独立预算与计时范围修正。
+- 目标仍是Adaptive RAVEN对Native/Cactus/SpecCascade质量不降、截断更少、实际吞吐和整题速度提升；原评分/正常结束判对并列，不修改评分或结束规则绕过失败。旧100题基准不是当前数值冻结下的正式对照，尚缺新的同源基准与独立证据。
+- 原2684含64个CUDA调用，HTTP主请求为2620；自然额度16已用完；完整回归288已完成192、剩96，两个候选名额均已试。新计划先提议74主HTTP/10顶层数值诊断/9固定预热的有限单元，尚未启动，不能把旧额度重复支用。
+- 受影响文件：新doc/REVIEW-ADAPTIVE-RAVEN-PROJECT-2026-10-07.md、plan/adaptive-raven-project-review-optimization-2026-10-07.md、scripts/audit_raven_project.py、doc/upstream-changes/project-review/2026-10-07.md；更新README、报告入口、旧设备结果、第六轮计划、docs/exact_residual_hit_tree.md、专门CHANGELOG与本日志。strict续走仅新增条件提案律证明要求的可见notice，不改运行实现。
+- 验证：两次CPU离线审查实际完成，产物results/project_review_20261007.json记录帧hash/scope；python3 -m py_compile通过，9份文档63个本地链接均存在，新文件无末尾空格/缺少结尾换行，git diff --check通过。剩余限制：新profile参数/状态改进仍待实现，四方法当前成本、live GPU等价、Target-only、晚段顺序Target、留出/正式和HumanEval未完成；本次GPU新调用0。旧冻结/负gate保持，未提交/推送。
+
+## 2026-10-07：概率上限实验在seed42质量门槛停止，状态核验完成
+
+- 状态：17:39:27（UTC+8）GateRejected(train_seed42_quality)主动退出，后台inactive/dead、0重试；7自然诊断/32新CUDA完成，训练48/144完成，剩余96未执行，不是完整实验成功。journal记11.7G内存峰值、swap0，端口8000已释放。
+- 结果：B/cap2各24题22/21判对、19/21正常结束判对、5/3截断。候选2950/5180由对变错、6009由错变对净-1；固定R=2质量门槛失败。吞吐2.636529→2.493676（-5.42%），平均316.45→264.12秒（-16.54%），输出量-21.06%；更短整题与吞吐收益分开。
+- Native1532三个基础seed都截断判错，提示该现象也能在链基线复现；本故障集不能作总体正确率、三基准速度或唯一因果证明。晚段B5帧有限/重放与32条件门槛通过仅为限定数值scope。
+- 变更：新增doc/RESULT-RAVEN-PROBABILITY-CAP-2026-10-07.md中文阶段分析；更新报告入口、本轮计划和专门改动文档的停止notice；不修改代码、冻结、旧原始结果或负gate。
+- 验证：CPU按原summarize/paired_gate重算24配对，与保存gate的全部关键统计及失败原因一致，逐题正确/结束迁移核对。没有新增GPU请求/测试，也没有自动放宽质量门槛。完整多seed、组件profile、Target/KV长上下文与留出/正式仍未完成。
+
+## 2026-10-07：新Native服务健康/预热通过，首条完整诊断生成中
+
+- 状态：2026-10-07 12:17:10 UTC+8，日志实际GET /health 200及预热POST /v1/chat/completions 200；有效Native worker、head input_rows=1、ProbMTP full-Q adapter均确认。首条1532/基础seed42完整2048预算请求已进入生成，主请求仍0/7保存，尚未判断正确率/截断。
+- 系统：active/running，NRestarts=0，GPU KV/cache正常计数，内存available约2.1GiB、swap0。仅观察当前启动/生成成功，不把预热当完整质量请求。
+- 更新专门变更记录真实阶段与计划/报告入口链接；本次未增加请求，未修改冻结源码。后续B后段、32新CUDA条件门槛、144训练待后台依序执行；质量/速度/正式结论仍未形成。
+
+## 2026-10-07：Native诊断/概率上限单元已冻结启动
+
+- 状态：2026-10-07 12:15:28 UTC+8，remtp-raven-probability-cap-20261007.service active/running，NRestarts=0，Linger=yes。新目录results/raven_probability_cap_20261007；阶段diagnostics/native 0/6，正在真实模型加载，不能称健康检查/第一个完整请求已通过。
+- 冻结check-only实际通过，代码hash=a29e74d8c053ea76d0d27f88ec5e688a6a2ce7ba56b1510250a4ea67533a0562；11个未改数值/运行核心文件与修复后冻结逐字相同，只是来源核对，不替代Target数值gate。冻结manifest/policy的7自然/32新CUDA/144训练、R=2、lazy关闭及0重试一致性实际通过。
+- CPU125项+60项及16真实帧×两实现CPU等价已通过；py_compile/bash -n/diff检查通过。旧结果、冻结、负gate、旧latest入口保留，新实时报告doc/RESULT-RAVEN-PROBABILITY-CAP-LIVE.md独立链接。
+- 更新plan/raven-probability-cap-2026-10-07.md、修复旧计划notice、doc报告入口及专门变更记录；本单元仅在数值/质量门槛通过后释放下一seed块，完整训练结果/截断/速度与正式基准目标尚未验证。
+
+## 2026-10-07：按计划准备Native配对诊断与H/P上限单因素候选
+
+- 状态：实现中，尚未启动新GPU单元。前一150请求/32 CUDA完成，最终中文离线分析已保存在doc/RESULT-MTP-REPAIRED-REGRESSION-2026-10-07.md，懒残差速度失败、11/72截断未改善；下方“离线核验执行中”为历史启动记录。
+- remtp/dynamic_mtp_tree.py新增relaxation_max_probability_ratio，0默认保持旧逻辑，非0必须有限且>=1；预算分配的floor/max和最终完整H同时约束H(y)<=R*P(y)，接受与拒绝残差共用H，保护位置不参与预算回收。remtp/dynamic_tree_vllm.py解析/打印开关；scripts/run_adaptive_round2.py显式传递。
+- remtp/decision_trace.py新增最多8个已提交历史长度checkpoint的verifier-only观测，默认first8行为保留；本次只取128/512/1024/1792/2000五帧，无paired proposal/KV结论，不额外调用模型/RNG。
+- 新scripts/run_raven_probability_cap.py与launch/status控制器：6 Native配对+1 B后段重放，32次单独登记的新CUDA条件调用，负门槛停，再最多144条同源B/cap2训练。默认不采用、不跑留出/正式，0重试，72h上限，保持模型/环境/2048预算。候选R=2在结果前固定，不读取题号/gold作线上决策。
+- 预算：7自然诊断占原剩余7；新CUDA32独立登记，不重复旧64/32；同源B/cap2的144训练占剩余完整回归额度，旧D3质量门槛仍待后续安排，不声称本单元完成全部2684计划。
+- 验证：相关CPU125项通过11.87秒；有效worker/控制器回归60项通过6.84秒；16真实帧×旧/关闭=32 CPU调用实际输出/事件/RNG等价通过。py_compile/bash -n/diff --check通过；GPU尚未运行。完整Target/KV/长上下文不继承旧gate；H/P局部上限不保证总体质量或加速。
+
+## 2026-10-07：修复与懒残差后台单元完成，开始离线结果核验
+
+- 状态：2026-10-07 11:03:28（UTC+8）完成150请求=2短探针+4完整诊断+144训练，32次CUDA条件验收另计；systemd inactive/dead、Result=success、ExecMainStatus=0、NRestarts=0。journal记录11.8G内存峰值、0swap，未见failure.json。
+- 保存结果：两配置各72请求67判对/61正常结束且判对/11截断；完整输出72/72逐对一致。吞吐2.624640→2.623474token/s，约-0.0444%，速度gate失败；完成状态不等于优化速度成功。
+- 新scripts/analyze_mtp_repaired_results.py：CPU离线按原评分/汇总/按题聚类bootstrap重算、核对自然完整token、48捕获帧有限性/边界及MTP同输入同输出、逐题截断与过强松弛现场；另写分析文件，旧冻结/原始日志/gates保留。
+- 本次未启动GPU服务/新测试。离线验证执行中，最终中文文档与历史notice随后更新；没有承诺总体正确率或三基准速度达成。
+
+## 2026-10-06：两配置修复后GPU smoke与新32次CUDA条件验收通过
+
+- B/Anchor两条32token真实模型探针完成，各8帧原始Q/P/全部tree隐藏有限、proposal→verify边界通过；不是整体质量/速度证据。
+- 16实际帧×两实现=32次新CUDA条件验收实测通过，记录new_cuda_equivalence_gate.json；原始CUDA RNG恢复，输出、节点诊断、事件概率/索引/终止及随机末状态全匹配。
+- 15:51:41 UTC已进入diagnostics/old_eos01完整2048预算诊断。4完整诊断和144训练尚未完成，不声称正确率/截断/速度提升，也未跑独立留出或三基准正式测试。
+- 更新修复报告/专门改动记录/计划真实阶段。后台Restart=no、Linger=yes，负gate自动停止，不需要对话监控。
+- 旧负门槛、故障tensor和冻结不改写；新的门槛scope仅上述条件范围及后续首根P核验，不继承完整旧数值gate。
+
+## 2026-10-06：修复后B真实模型smoke门槛通过
+
+- 新冻结实际B/1231/seed12353的32token请求完成；old_eos01_short_probability_gate通过（8/8 trace帧的有限P/Q、全部tree隐藏与proposal→verify边界）。
+- 首MTP pass实际bias stride=(1,1)、Attention输出0NaN、MTP最后隐藏0NaN；原始Q为9×151680且全部有限。旧现场first pass 4096NaN、深Q两行全NaN不再出现在该复测。
+- 新后台单元active/running、NRestarts=0，Anchor加载中，Linger=yes；完整2048诊断、144训练和三基准正确率/速度不能宣称完成。
+- 更新中文修复报告实际smoke状态，三份更新文档本地链接检查实际通过，旧现场/冻结保留。
+
+## 2026-10-06：新修复单元已冻结启动，中文报告更新
+
+- 冻结results/mtp_repaired_regression_20261006，真实check-only通过，remtp-mtp-repaired-regression-20261006.service实际启动（0重试、72h上限、Linger后台）；正在修复后第一smoke模型加载，尚未声称smoke完成。
+- 新doc/RESULT-MTP-PROBABILITY-REPAIR.md说明首坏Attention、singleton stride2逻辑外读取、真实Inf padding反事实、代码修复、合法Q RNG保持、guard速度开销及正式结论边界。
+- 更新RESULT-ADAPTIVE-RAVEN-OPTIMIZATION.md入口与故障旧文历史 notice，新实时报告链接单独保留第六轮旧报告。
+- 读源码进一步明确adaptive_relaxation_max_ratio限制TV相对baseline，不是H/P上限；低P token局部H/P可数百倍。后续质量/截断候选需要独立局部约束/深度策略，不能把懒残差冒称截断修复。
+- 验证：启动器实际成功、控制器协议/hash check-only实际通过。完整模型smoke/CUDA/2048诊断/144训练与质量速度仍由新后台单元逐阶段产生，不预写成功。
+
+## 2026-10-06：准备冻结启动修复后2048诊断与144条训练对照
+
+- 增加launch_mtp_repaired_regression.py冻结启动器、status_mtp_repaired_regression.sh中文进度，实时报告新独立链接，不覆盖第六轮故障报告。
+- 新控制器/概率/metadata/audit 22项CPU实际通过2.83秒，py_compile/bash -n/git diff --check通过。修复后8次GPU attention对照完成：紧密stride1有限并逐位匹配参考，故意非法stride2+Inf仍NaN，证明metadata修复必须存在；未隐瞒负对照。
+- 更新专门计划/上游改动文档，登记2短+32条件+4完整诊断+144训练，首根P scope有限、正式数值不继承，guard开销待测。
+- 下一状态：冻结check-only和真实修复后smoke待执行；不能提前宣称原始Q已在新完整请求全程有限或质量/速度改善。
+
+## 2026-10-06：新源码有界概率门槛与后台训练控制器
+
+- scripts/run_mtp_repaired_regression.py：2条32token新修复探针→32次新CUDA条件验收→4条完整2048诊断→新Target首根P与历史精确比对→144条B/懒残差训练；每阶段负门槛停，0重试、不自动采用、不跑heldout/test。
+- 源码修复后自然输出允许改变，不强制复现非法Q旧输出；保留模型/数值参数/数据/提示hash，执行源码新hash，不继承旧门槛。新P门槛仅4首根，不冒称完整Target/KV/长上下文已通过。
+- 4自然诊断占原剩余11额度，执行后剩7；144训练沿用未执行额度，固定24题×3种子×2配置，按seed块交替顺序，并每块立即核对完整输出/结束/正确率/截断相等。质量与速度单独记录，不能因速度未升而冒称成功。
+- 新CPU gate/报告测试；前一修复单元120项相关CPU测试实际通过11.60秒。再登记8次修复内核真实Q/KV条件重放，和旧8次分文件保留，尚待本次执行。
+- 限制：Q合法性guard同步耗时需训练实测；懒残差不减少截断；后续应在新有限Q下研究过强松弛/低P token接受的质量候选，再经新全面数值与独立留出gate做三基准正式比较。
+
+## 2026-10-06：修复MTP单元素树bias错误步长，禁止无效Q抽样
+
+- 状态：8次受控GPU重放实际完成。两份真实Q/KV：自有Inf padding + stride2各输出4096NaN；紧密stride1与无bias参考逐位一致且有限。原始B/Anchor首pass Q/K/V和写入后visible KV也完全相同。
+- 首次独立重放Triton启动器编译缺Python.h，尚未执行GPU kernel；补用现有scripts/cuda_env.sh用户目录头文件后成功。没有安装/改变软件包。
+- fixed6_vllm.py在draft metadata边界使bias row stride等于逻辑宽度，单元素view必须clone(contiguous_format)，普通dense bias不分配；不改变逻辑树掩码。
+- target_attention_fp32.py补充query有效行/头mask，避免padded query读取bias范围外；QQ列界限仍要求上述dense metadata。
+- dynamic_tree_vllm.py在primary/branch/fallback抽样前验证Q有限非负正总量，无效Q报错且不消费RNG，避免旧argmaxNaN→0与验收均匀回退不一致；合法Q随机原语保持不变。
+- 新概率安全测试与singleton stride回归；既有Round6 NaN故障测试改为验证修复后的拒绝/no-RNG行为，旧冻结保留旧故障代码。
+- 限制：guard增加GPU同步，速度影响需实测；条件重放因果支持步长路径，不冒称已读到旧现场真正相邻字节的Inf。修复后完整2048质量/截断与新Target验证待执行。
+
+## 2026-10-06：首坏算子实测为MTP注意力，登记有界掩码步长重放
+
+- 2条32token探针实际完成；B首pass注意力之前所有算子、Q/K/V和写入后可见KV均有限，Attention输出4096NaN。Anchor对照完整保存。
+- 现场1×1 tree bias的stride(0)=2。PyTorch切片contiguous对单元素保留父步长，vLLM统一内核把该步长同时用作有效列数；存在逻辑形状外读取路径。是否解释NaN待受控GPU重放确认。
+- 新scripts/replay_mtp_attention_fault.py：只用保存真实Q/KV，2帧×原步长/带inf的自有padding/紧密stride1/无bias参考=8次GPU attention调用，无RNG、0质量请求。调用前写attention_replay_protocol.json，保留旧现场，不修改冻结代码。
+- 验证状态：算子定位已真实运行；因果对照和修复尚未声称通过。测试mtp_operator_audit.py验证快照原地语义与异常卸载。
+
+## 2026-10-06：继续优化，先做MTP首坏算子有界定位
+
+- 状态：实现与新计划已写入，GPU诊断准备中；未声称故障修复或速度/质量提升。
+- 新remtp/mtp_operator_audit.py：首个真实proposal首个tree pass临时pre/post hooks，复制原地修改前输入，记录实际attention元数据、forward槽、可见KV写入前后；默认关闭、512位置上限、finally卸载。
+- decision_trace.py按显式诊断开关集成；run_adaptive_round2.py默认关闭并显式传递；新scripts/run_mtp_probability_repair.py保存逐算子有限性及中文阶段报告。
+- 新plan/mtp-probability-repair-2026-10-06.md、doc/upstream-changes/target-probability-consistency/mtp-operator-repair-2026-10-06.md。
+- 登记另一个修复诊断单元：B/Anchor各1条32token、独立服务各8token预热、0自动重试、0 CUDA验收重放，不计2048主质量和速度；保留原剩余11自然/144训练额度和所有旧负门槛。
+- 验证：29项Round6/metadata测试通过（7.05秒）、3项探针原地输入快照/异常卸载/RNG测试通过（3.95秒）、py_compile及git diff --check通过。冻结check-only通过，remtp-mtp-operator-20261006.service已启动，真实GPU health=200；算子定位与修复尚待现场。
+
+## 2026-10-06：第六轮阶段结束，完整分叉概率与MTP同输入复核
+
+- 状态：v2于14:19:45 UTC结束：4/4自然复现、32帧×两实现=64/64 CUDA验收通过；原始Q非有限门槛拒绝，分类implementation_fault。
+  systemd inactive/dead、Result=success、NRestarts=0，预期gate码3；内存峰值11.5G、swap0。剩余11自然诊断、144训练、留出/正式均未开始。
+- 逐请求：B/1231 1583token/stop/120正确，B/5180 105/stop/1360正确；Anchor/1231 179/stop/100错，Anchor/5180 2048/length/last_number160错。
+  全部与第五轮各自输出/长度/结束方式一致；不能把预选故障2题当总体准确率，也不计探针耗时为正式性能。
+- 新scripts/analyze_adaptive_round6_results.py：读取完整日志/CPU存储的真实GPU帧，4条提交token重建与API解码核对通过；
+  写postrun_analysis.json（输入SHA256、首次分叉角色/P/抽样输入/原CUDA RNG、MTP同输入比较），不新增GPU调用，不修改冻结源码/原门槛。
+- 共同根前缀4组全P逐位一致，两题首次分叉前缀各1组全P也一致，TV均0。1231第6token分叉bonus→残差、RNG不同；
+  5180第13token残差→bonus、原CUDA RNG相同，实际抽样输入CPU归一化TV约0.062689。属于条件分支差异，不把同seed不同文本等同bug或最终质量因果。
+- GPU懒残差32帧行为/事件/RNG全部相同，可省58次接受节点残差构造；行为等价包括保留旧NaN回退，不能证明原算法概率合法或真实吞吐提升。
+- 原始Q全NaN仅捕获于B/1231首轮的两行，Anchor前8轮未见；不能用B的NaN解释Anchor错答/截断，也不能声称后续未捕获轮次皆有限。
+  1231第一MTP树计算B/Anchor根隐藏、输入隐藏、token、位置、seq_lens及prefix KV全相同，B输出4096个NaN、Anchor输出有限。
+  重点缩小至当前节点KV/attention元数据及执行状态/内部算子；没有声称具体NaN算子已修好。
+- 新doc/RESULT-ADAPTIVE-RAVEN-ROUND6-ANALYSIS.md，更新总报告入口、计划阶段状态、MTP故障记录与专门上游记录，旧启动期描述加可见历史说明。
+- 验证：实际离线分析执行完成、4完整token重建与帧提交历史匹配通过，64 CUDA原门槛的complete/count复核通过；脚本py_compile及git diff --check收尾核验。
+  109项CPU测试、GPU服务及条件重放均为此前实测，未冒称本次又启动正式测试。局部全P一致不替代全部raw logits/KV/长上下文重验。
+- 收尾复跑离线分析成功，保存分析器SHA256；py_compile、git diff --check及5份更新文档本地链接检查实际通过。
+
+## 2026-10-06：初始GPU现场发现原始Q全NaN，修正观测并转入MTP状态定位
+
+- 状态：初版服务模型加载/health=200/8token预热通过，q1231首次完整预算请求尚未完成时8轮实际张量已保存；13:46 UTC主动停止，0条完成、1条中断，不是模型崩溃。
+- 首轮Q第1/2行各151680个NaN、草稿ID0；Target P有限。提议器argmax(NaN/noise)固定0，验收normalize_distribution回退均匀Q：实际提议/验收不一致。
+  同精确前缀历史节点标量与返回IDs全一致；历史原始Q未保存，不冒称看过旧NaN。尚未证明该局部问题导致最终错答/循环。
+- 修正Round6 pending观测校验：vLLM set_inputs_first_pass移token但不移对应Target隐藏的位置，实测rootpos=prompt+history-2；
+  NaN-aware原始张量相等仅用于核对观测边界，同时独立非有限概率gate，不把NaN当正常概率放行。
+- decision_trace增加仅前8个proposal内部MTP树计算输入/输出隐藏状态、有界有效prefix KV（root<512时），不复制整片KV。
+  分析器记录Q/P异常与MTP各pass有限性；控制器先4条自然+64条件重放，原始Q/P故障时阻止后续训练性能扩展，分类implementation_fault。
+- 初版冻结及轨迹全部保留，early_conditional_diagnosis.json、operator_stop_reason.json记录实际证据/主动停止。
+  新版传入prior_aborted_dir，1条中断占原16诊断额度，新单元≤15自然诊断；B/1231额外完整重启明确暂未安排，不无限重试。
+- 新doc/FAULT-MTP-Q-NONFINITE-2026-10-06.md、更新计划及上游专门改动记录。先定位NaN源，禁止只在验收改Q冒称修复，修复后再数值/质量/截断验证。
+- 验证：109项相关CPU实际通过（12.05秒），含原始NaN下懒残差等价、MTP位置/同NaN mask边界、提议/验收分布不一致的真实函数回归定位。
+  GPU完整自然输出/CUDA条件等价/NaN修复/性能质量仍未完成。
+- 13:52 UTC新版冻结check-only通过并启动remtp-adaptive-round6-v2.service，13:55 UTC后实际health=200/预热通过、首题正常生成；
+  前8轮proposal/verification位置、ID、含NaN mask的Q与RNG边界全通过，写live_trace_acceptance.json。
+  首轮MTP有效prefix KV与输入隐藏均有限，第一树计算输出4096个隐藏值全NaN；随后输入/输出异常扩大。
+  第一次可见NaN定位至首轮MTP树计算内部，具体当前节点KV/attention/norm/投影算子未指认，不能称已完成修复。
+  最新结果入口已指向v2中文报告，原初版冻结/中断/现场保留；启动期及8轮观测通过不替代完整质量/数值门槛。
+
+## 2026-10-06：执行第六轮有界诊断与决策保持的性能优化
+
+- 状态：用户授权执行；新实现已落地，CPU验证与GPU启动验收进行中。下方“未执行”条目为历史状态。
+- dynamic_mtp_tree新增默认关闭lazy_residual，仅跳过接受节点的纯残差；可选完整决策事件P/Q/H、uniform、纠正/bonus概率输入与原RNG复制，不改变抽样次数。
+- 新decision_trace及generation_guard集成：每真实请求前8轮、忽略预热，保存proposal根隐藏/位置/完整Q及验收全P/Q/H；不复制整片KV。
+  阅读本机vLLM sample_tokens实际顺序确认proposal先于CPU bookkeeping，早一步history显式命名，核对下一验收的提交前缀、位置、Q/ID及RNG边界，避免观测错位。
+- dynamic_tree_vllm传递开关并报告；Round2启动显式写D层全1松弛权重与默认关闭trace/lazy；新增Round6控制器/冻结启动器/进度脚本、条件分析器及针对性测试，真实Round4→Round2启动链验收。
+- 本执行单元16自然诊断、64CUDA条件调用、144新训练请求，均占原计划预算；先4条复现，门槛通过才扩展。
+  训练42/43/44种子块交替B/候选顺序；保留2048预算与评分器。固定8token预热单列，诊断不计速度。
+- 新上游专门记录round6-execution-2026-10-06.md、计划执行状态更新；旧冻结代码/原始结果/gate只读保留。
+- 限制：源码变更不复用旧数值gate；新重放仅证明测得范围。懒残差不能减少截断，质量候选/数值重验/留出/三基准正式阶段仍待证据门槛。
+- 验证：107项针对性CPU测试实际通过（11.80秒，含既有dynamic_mtp_tree、generation_guard、Round5启动与新Round6测试）；
+  修改文件py_compile及git diff --check通过。新增worker实际开关验收后再次运行新Round6测试，实际21项通过（6.82秒）。
+- 2026-10-06 13:37 UTC：冻结目录results/adaptive_round6_20261006_trace_lazy，真实冻结代码check-only通过，
+  remtp-adaptive-round6.service已启动（Restart=no、72小时上限、用户Linger=yes）；当前进入old_eos01首组自然诊断。
+  主请求尚未完成，模型health/首条完整复现及CUDA等价门槛尚不声明通过；后续实际证据自动写中文report.md。
+
+## 2026-10-06：已有现场离线故障定位与第六轮优先级细化
+
+- 状态：离线定位完成，最终错答单一因果未证明；新GPU/算法阶段未启动。
+- 新scripts/analyze_adaptive_round5_faults.py与tests/test_adaptive_fault_forensics.py：
+  按实际提交长度/API末轮预算重建token，检查已有prefix与全文，5项CPU实际通过（0.04秒）。
+  真实3配置×2题重建全部通过。新fault_localization.json保存输入hash、精确ID、首次分叉角色/P/Q/H/u与缺口。
+- 1231前5token共同、第6分叉（旧Target bonus/新残差）；5180前12共同、第13分叉（旧残差/新Target bonus）。
+  两题初始共同top8/EOS一致，但第一验收u不同；主proposal/验收共用request generator，深度影响抽样调用序列。
+  不将同seed不同文本认作概率bug或质量因果证明。
+- 1231在g21实际fingers：P1.264e-5、Q0.05304、H0.003568、u0.02017，同u严格拒绝而当前接受。
+  这是局部风险证据，不证明其单独导致错答。5180的514轮没有重复或EOS保护触发。
+- 源码定位keep=true仍构造全residual_distribution；四轨迹已接受主节点对应1147/105/65/1382次潜在冗余计算。
+  懒残差真实GPU收益尚未测，拟保留决策/RNG作为首选性能候选。
+- 新doc/FAULT-LOCALIZATION-ADAPTIVE-RAVEN-2026-10-06.md与专门上游改动记录；
+  更新已有round6-path-quality-speed计划与报告入口/第五轮后续提示。保留既有2684总上限、
+  源码绑定和全部质量门槛；新等价验证/profile占现有64诊断调用/最多2候选额度。
+- 原始日志/gate/冻结代码保持，Target/MTP/采样/RNG/评分均未修改。
+  文献核对PyTorch2.10 randomness和严格推测解码论文，一般要求与本地原因分开，不将严格P保证套到近似H。
+- 限制：首次分叉处bonus/纠正全P/Q及CUDA RNG状态尚缺，需要计划中的有界GPU证据。
+  不把计划中的质量/速度成功写成实测，不自动采用新候选；相对三个基准目标仍待独立验证。
+- 收尾验证：分析器py_compile、git diff --check及定位/计划/结果入口的本地证据链接检查通过；
+  5项针对性CPU测试再次通过（0.02秒）。没有执行新的GPU请求或改变运行配置。
+
+## 2026-10-06：制定下一轮路径定位与质量速度完整优化计划（未执行）
+
+- 状态：用户要求按第五轮分析制定完整计划，本次仅规划/文档更新，没有启动GPU或修改算法。
+- 新plan/adaptive-raven-round6-path-quality-speed-2026-10-06.md：保守old_eos01参照、失败Anchor现场，
+  16自然诊断、同前缀P/Q/H及实际CUDA RNG重放、正确的已提交token/KV/budget、有限单因素矩阵，
+  深度D与节点N独立；最多2候选、完整24题×3种子训练、唯一冻结候选后24题×3种子留出、
+  100新test题×3种子/5方法正式三基准比较。分阶段主路径最多2684新调用，预计7—15天属估计。
+- 保持现有模型、量化/数值路径、软件、温度、提示和2048预算；质量总体/各seed门槛不放宽，
+  截断确实减少与正式三基准速度区间分别验收，历史计时不作当轮正式速度依据。
+  相同seed不同算法token不一致不是bug证明，局部TV不是全句分布/正确率证明。
+- 明确控制器实际启动/MRO/选项路径测试、样本隔离与已观察留出重新分配、固定追加样本/多重比较，
+  新源码冻结、完整兼容检查点、故障分类、无自动重试和阶段预算。预期算法更改须另记并消融。
+- 更新doc/RESULT-ADAPTIVE-RAVEN-OPTIMIZATION.md入口、第五轮计划后续链接、Target改动README历史状态；
+  新doc/upstream-changes/target-probability-consistency/round6-plan-2026-10-06.md记录本次仅文档范围。
+- 实际检查：第五轮结果、控制器与配置/验收代码，训练与留出无交集，第四轮heldout/formal/selection/manifest未生成，
+  文档链接与diff检查。未运行新候选测试，不把阶段预期写成验证结论。
+- 限制：故障因果尚未定位；小集仅作筛查，24题训练/留出不能代表全域真实正确率；论文目标仍未达成。
+
+## 2026-10-06：第五轮完整结果核查与中文分析（训练消融完成）
+
+- 状态：v2最终COMPLETE_TRAIN_ABLATION、104/104新请求、MainPID0、NRestarts0、正常退出。
+  2026-10-06 10:10:15 UTC结束，journal峰值内存11.6G、swap0B；未启动新GPU任务。
+- 实际验证：读取最终status/journal/policy/runtime/replay/regression/EOS诊断，重新核对96条新回归、
+  96条历史参照与8条诊断，逐题配对与按题聚类2000次bootstrap；无需新代码测试。
+- old_eos01：44/48判对、39正常结束且判对、9截断，所有配对判对/结束类型与旧D3一致；
+  43/48输出逐字同，4正确正常回答减少1162token，1截断错误文本改变。质量门槛通过。
+  均时299.0→290.2秒（-2.91%），吞吐2.641→2.637（-0.16%），没有解码加速证据。
+- Anchor：42/48判对、38正常结束且判对、8截断，质量未通过；相对上轮Anchor仅6530/43改变，
+  2048截断→937正常正确，其余47条逐字同。相对旧D3吞吐+6.02%但正确数少2。
+- 原失败1231/43与5180/43及两旧结构四重放均通过；增强保护未改变Anchor这两题。
+  1231正常结束答100、gold120；5180访问主路径最高EOS质量仅2.218e-7，无节点达到0.01，
+  不支持以中等EOS质量受抑制解释该现场。旧D3两题的2条EOS抑制记录消失，但原本就能正常正确结束。
+- 新增doc/RESULT-ADAPTIVE-RAVEN-ROUND5-ANALYSIS.md；更新RESULT入口、第五轮计划、
+  第四轮质量分析与专门上游改动记录的可见历史说明。原raw report/gate/冻结源保持。
+  明确原始模板“旧配置重跑”不适用于本轮完整参照，本轮参照只读来自第四轮，两题实际重放。
+- 限制：24题×2种子的训练消融、历史参照计时不是正式独立证据；质量门槛passed只表示至少一个候选通过。
+  独立留出和Native/Cactus/SpecCascade正式同题比较未执行，总目标未达成。
+  建议保留保守参照，先定位Anchor最早路径分叉与有限单因素消融，再决定下一候选；没有自动采用或改评分。
+
+## 2026-10-04：执行第四轮详细定位与优化（实施进行中）
+
+- 最新检查：D3/head1四题完整完成，D3/head3已1/2；主长状态累计5请求，
+  unit持续active/Result=success/NRestarts0、Linger=yes。静态分析移除过时的3/4当前值，
+  后续阶段以动态报告为准；尚无全部长数值、截断改善或正式速度结论。
+- v3截至本次记录已完成D3/head1四题组3/4，服务持续active，未自动重启。
+  中文静态结果标注记录时点，实时阶段/请求数以live report/status为准；正式质量/速度尚未完成。
+- 长评分/保存完整自然检查点相关CPU实际20 passed（3.30s），编译/diff通过；旧2629/26332
+  真自然2048输出正常以length落盘，说明截断尚未解决（不当作质量提升）。
+  主动迁移v3控制器避免已证实的长评分矩阵内存风险，不变更数值模型；原已完整通过11请求只读复用，
+  2629完整请求及匹配prompt/probe UUID复制新目录，原目录/中断q2950不复用不追加。
+  v3已实际active/NRestarts0，CPU协议检查、数值源码/数据/模板核验和复制成功，服务实际处理新的
+  2950自然请求完成，四失败题组已2/4。实际调参/留出重叠检查为空。
+  source与policy明确single-last评分，不计算全prefix词表矩阵；原2048质量/测试预算保持，评分单token不计性能。
+  中文计划/分析/改动记录/动态进度入口更新；正式正确率/截断改善与三基线速度结论仍待后续门槛。
+- 长评估内存预检：当前Tree进程模型6.11GiB、整机available1.9GiB；纯Target少0.39GiB。
+  安装版sampler.compute_logprobs明确全矩阵log_softmax(float32)：2048×151680的logits+logsoftmax
+  约2.31GiB（还未计BF16中间矩阵与其它临时），大于可用余量，不能直接把长评分当成小评分扩展。
+  在长评分到达前把诊断改为完整prefix独立prefill、只取末行采样前完整raw词表；max_tokens1产生的
+  单额外token丢弃且不算质量/速度，不强制EOS、不缩短主2048预算；长矩阵临时降到一行。
+  新增chunked single-last选择测试；排除诊断warmup。数值模型/权重/采样主协议不变。
+  launcher支持复制完整自然请求及对应精确prompt/probe UUID，验证数值源码/数据/模板/题seed顺序；
+  不复制未完成请求、不向旧目录追加。待当前请求落盘后冻结新控制器，避免丢弃已完成GPU工作。
+- 统一norm+head16新完整GPU实际通过：4prefill五组比较逐位一致；原自然483输出与历史相同、
+  原287hash匹配；6晚期窗口top/EOS/完整TV全0，36层算子/KV逐位一致，228复制全相同。
+  首版controller在长组服务加载期间主动停止，修正2048评分配对后冻结v2；
+  首版停止产生unit exit1（SIGTERM→KeyboardInterrupt），明确为控制器迁移而非数值/质量失败，
+  原`controller_migration.json`保留原因，旧代码/通过gate不改。
+  新unit`remtp-adaptive-round4-v2.service`已实际active、NRestarts0，CPU预检和同数值来源核验通过，
+  只读复用11个完整前置GPU请求，开始D3/head1四失败题的2048长状态诊断。
+  中文静态分析、计划/改动记录更新；进度脚本只展示当前组token，避免把已经完成前置481token当作新组进度。
+- 2048特殊配对相关实测CPU19 passed（3.71s），编译/diff通过。控制器把候选gate拒绝
+  与runtime/protocol错误分开归档：gate保留具体STOPPED_*阶段、中文原因并exit3；
+  unit视3为预期任务停止（候选未通过，绝非目标达成），不会把质量门槛不满足误报为服务崩溃。
+  当前统一候选已完成原自然483请求，进入6个晚期参考；修正配对的新控制器待冻结迁移。
+  原首轮doc symlink改为带历史说明的报告入口；原2026-10-01冻结报告保留未编辑。
+- 启动后的进一步安装版源码复核发现2048评分边界特殊情况：原root位于上一完整chunk末尾，
+  最后chunk仅EOS且不产生prompt-logprobs，不能只找最后chunk倒数第二位置。
+  在长测试到达前修正配对，新增真实分派结构测试；不是已发生GPU失败。当前候选预填充已通过，
+  自然晚期复测在230token处运行稳定，6帧已保存。诊断控制器改动将新建冻结版本，
+  只读复用完整通过的相同数值前置验收，核验所有数值文件/服务脚本/模型协议，旧code不编辑。
+- 当前统一候选编译/bash/diff通过，18项相关CPU测试实际2.84s通过；launcher CPU协议/预算预检通过。
+  已启动用户unit`remtp-adaptive-round4.service`，新目录
+  `results/adaptive_optimization_round4_20261004_norm_head16/`，代码冻结与协议绑定；未覆盖旧run。
+  已核实Linger=yes、Restart=no、KillMode=control-group、14天时限；TREE模型已实际启动并执行请求，
+  服务实际打印BF16 LMHead weight=(151680,4096) fixed16，正在完整prefill验收，不是仅提交命令。
+  实时doc入口指向新报告；新增中文静态原因分析，进度显示主/子阶段累计数避免主请求0误判子任务未推进。
+- 计划与专门改动记录更新为实测证据及九步执行，明确第二项舍入修复后可出现新自然轨迹，
+  仍精确复查所有旧故障IDs；不能把旧轨迹不一致当作运行失败或新现场冒充原复现。
+  修改初始gate保留自然hash/输出是否相同作为证据，放行依据实际逐层/概率/复制及后续旧IDs gate。
+  launcher限定结果在项目results内；完整多种子任务可能多日，有限总时限14天。
+- 新增launcher冻结remtp/scripts/configs/tests并先CPU协议/上下文预算检查，再用户级systemd运行，
+  不自动重启；有限工作总量+每请求30分钟+14天总时限。关闭对话后继续；最新结果入口和进度脚本
+  动态读取launch manifest，子阶段/实际已提交token/门槛可查看，不再硬编码已经停止的v2unit。
+  中文实时报告追加本轮来源、诊断/质量区别和验收阶段。新的统一norm+LMHead候选待启动。
+- LMHead第二微测16/32/64三候选在M1～2048全词表逐位跨M一致；只有fixed16同时保持
+  真实自然280前缀概率（TV0、top/EOS0），32/64保持的是另一条舍入路线（TV0.007642）。
+  因此新增默认关闭`REMTP_TARGET_LM_HEAD_ROW_BLOCK=16`，只作用于实际ParallelLMHead的
+  BF16未量化输出GEMM，复用已有fixed_rows_linear；不量化权重/不修改Target36层。
+  所有方法及草稿LMHead统一采用、记录协议。流水线会按同冻结源码重新跑prefill和原自然state，
+  不复用只有norm修复的GPU结果；后续优化等待新完整模型复测。初步候选未宣称速度收益。
+- 未量化LMHead微测真实重放：最终norm各M逐位相同；原M1/10/13匹配现场，M64/255/256/
+  280/1024/2048匹配参考且相对现场top差0.125，证实第二来源是BF16 LMHead GEMM形状。
+  首个微测退出2：其fixed64候选不保留M1概率（保留此失败），未采用；不是新的服务崩溃。
+  下一微测对固定16/32/64逐位跨M稳定性和相对现场/参考差分分别报告，避免把稳定性与保留旧数值混为一谈。
+- 修复norm后的原自然轨迹实机483token与历史逐字相同；6窗口全部36层算子/KV逐位相同，
+  原287 top/EOS误差从0.25/0.046876降为0/0，228复制全部相同，6数值门槛均通过。
+  仍发现280现场hidden逐位相同但LM输出top差0.125/TV0.007642；同hidden M1/10/13对照跨实际/参考逐位相同，
+  表明剩余差异在compute_logits的最终norm或未量化LMHead，而非36层/KV。
+  虽在旧0.15以内，先新增真实权重+hidden分离测量CLI，避免直接带着可定位偏差进入长测。
+  新流水线18相关CPU测试3.20s通过（其后仅新增此诊断CLI）；逐项变化与边界明确记录。
+- 后台流水线复核：新增按实际最后chunk位置配对echo prompt-logprob（>2048预填充可能分块，
+  最后两input时sampling与prompt-logprob均M1，取后者），避免把EOS后分布冒充root；
+  新增此问题、top8以外真实draft token和旧norm协议拒绝三项测试。
+  每组服务保存实际开关/检查点/数值协议；旧六晚期前缀及此前D4失败祖先精确IDs加入新fresh验收，
+  不仅测试相同长度的新前缀。服务脚本/template也参与复用源码核对。实际验证待执行。
+- RMSNorm修复后的四请求完整模型对照实际完成：五组比较中同位置129的36层全部算子与
+  逻辑前缀KV逐位相同。结果保留 `results/target_prefill_norm_round4_20261004/`。
+  已启动原自然2950完整2048预算+6晚期完整状态对照新候选，不复用修复前张量。
+  新增 `scripts/run_adaptive_round4.py` 有限后台流水线：绑定prefill/state来源及数值代码；
+  D3/D4×head1/3真实2048请求、实际跨点root及主/备选祖先独立重算；块边界/全部旧故障/
+  长度2048及独立重启/逆序，未覆盖则失败；再严格delta0、减小delta/保护/结构的训练集质量优先选参，
+  三基线训练选深度、24题回归/留出、100新test×3seed正式速度。没有新GPU/质量结论；
+  numeric/quality失败归档并停止，无自动重试或test选参。新CLI/检查点验证待执行。
+- 独立GPU真实norm输入/权重实测全部通过：156/288分别逐位复现原现场输出；原fused在
+  256/257/288/512/1024/2048行均与小M不同，255行限额修复后全部与小M逐位一致；
+  plain该输入未分叉（不能推广所有输入）。14相关CPU测试2.90s通过。
+  已冻结新完整模型四对照候选，后台运行中；不是质量/速度或长状态通过。
+  为长状态验收增加默认关闭、有界generated检查点：一步跨过127/128等边界仍保留实际root，
+  不要求改变采样使长度正好落点；检查点仅控制记录，不强制生成。新增越界跨点/不重复测试。
+- 156/288 × TREE/TRITON四请求实机全部完成：同长度跨后端36层/129位置及KV逐位一致；
+  改长度两后端均首次在6:input_norm出现输入差0、输出差0.0078125，KV6/129差0.015625。
+  对照vLLM v0.18官方CUDA源码发现plain/fused RMSNorm在num_tokens=256切换thread block。
+  新增默认关闭`REMTP_TARGET_RMSNORM_ROW_LIMIT=255`：仅把原CUDA算子分为≤255行view调用，
+  保留原融合残差原地更新、短batch数值及公式，所有方法共同应用；不改attention/split-K/阈值。
+  新增真实输入/真实checkpoint norm权重的独立GPU重放CLI及边界/alias CPU测试；验证待执行。
+  控制器显式记录/传递norm协议；新的修复轨迹可显式允许与旧输出不同，仍要求实际捕获/独立重算，
+  不能借用修复前自然/参考结果，协议增加norm配置核验。
+- 用户授权制定详细计划并执行。新建 `plan/adaptive-raven-round4-execution-2026-10-04.md`，
+  固定原2950/29542/old自然轨迹、2048预算和120～136快照范围；先现场/首次层分叉/单因素修复，
+  再累计状态、质量与三个基线。旧冻结来源和失败结果保持可追溯。
+- 开始实施默认关闭、有界Target逐层/逻辑KV/源目的提交诊断与有限控制器；
+  实際验证、变更文件、失败及后续结果在本节逐项追加，不沿用旧短gate声称长状态成功。
+- 新增 `remtp/target_state_audit.py`、`scripts/run_target_state_audit.py`、
+  `tests/test_target_state_audit.py`；`target_diagnostics.py`支持按generated范围选择晚期帧，
+  `run_adaptive_round2.py`记录探针协议并显式传递控制参数。全部默认关闭；原地norm前拷出输入，
+  仅实际MiMoModel的36Target层记录CPU张量/逻辑KV，源目的拷贝检查不修改state。
+  controller先原2048自然请求，逐帧检查历史287hash，再独立完整重算与逐算子/逻辑KV比较；
+  有快照运行不计质量/速度。CPU与GPU实际验证待下一步执行。
+- 相关CPU实际9 passed（3.00s）、编译/diff通过；冻结natural_code并启动有限state-round4。
+  首次GPU采集在18:55:28北京时间失败：新增探针误用Attention.prefix，本机API实际layer_name。
+  失败完整保留在 `results/target_state_round4_20261004/`，未改变模型算法或掩盖为原数值故障。
+  根据安装版attention源码修正字段，并新增每个实际模型warmup的metadata/KV接口检查；
+  下一候选新目录重新冻结，旧代码/结果不改。旧round3仍停止。
+- 新v2来源和有限unit已创建/启动；中文结果入口指向新run，新增进度脚本与本轮专门改动记录。
+  逐层/长状态验收等待实机完成，未恢复正式优化或声称质量提升。
+- v2原自然请求实际483token正常结束，输出逐字与旧2950相同；6帧包含原131/287 hash，
+  现场top误差0.25、root hidden差1.0、完整TV=0.0140458，首次获得原故障完整分布。
+  窗口228源目的复制检查全相同（37不同Attention层含MTP，不等于源KV已正确）。
+  独立TRITON参考warmup被新KV形状检查阻止：其layout为(blocks,2,...)，TREE为(2,blocks,...)。
+  修正探针为显式backend的可见token gather，不permute/flatten整个GPU cache；新增双布局和2block歧义测试。
+  新CLI只读复用已完成自然现场，需公共数值/模型/包/请求协议及非诊断remtp源码一致；不复用失败参考。
+  原v2失败完整保留，新冻结参考候选待验证启动。
+- 双KV布局相关测试实际11 passed（2.88s）。v3复用真实自然现场后，独立GPU6参考全部完成，
+  最后CPU配对因每次forward有sampling/prompt-logprobs两次compute_logits而误判多份state。
+  源GPU请求与张量均保留；改按精确compute调用编号配对，增加能击中此错的测试。
+  新CLI只读复用完整参考，核验数值/模型/版本/源码及全部请求前缀、echo/温度，不重复GPU。
+  此问题属于新增诊断控制器，不当作模型/方法故障；后续CPU分析结果继续追加。
+- 精确配对测试初次因插入位置把旧测试断言移入新测试而NameError；立即恢复独立测试，实际12 passed（2.96s）。
+  v4只读CPU分析完成：6真实窗口均超过0.15，287raw TV0.0140458，前6层KV全相同；
+  layer6仅逻辑位置129首次不同，属于原156提示而非新生成；第131root到layer6 attention才出现输出差1.53e-5，
+  后续层放大最终hidden差1。228窗口复制全部一致。具体提示129的首次算子仍须单独观测。
+- 新增按实际query位置选择探针，新增 `scripts/investigate_prefill_history.py` 四请求长度×后端对照：
+  TREE/TRITON各156/288，捕获相同129的36层/KV；不改变原输入前130tokens，不做正式优化。
+  比较器按算子数据依赖顺序排列，避免父layer hook提前插入掩盖内部首次算子位置。
+
+## 2026-10-04：详细复查第三轮失败与下一步方案（有限诊断完成，长状态定位待执行）
+
+- 用户要求详细检查、资料调研与更审慎方案。保持所有旧冻结来源/失败gate及正式优化停止。
+  先对第三轮真实109/238/157/287 manifest核验hash，再做原生prefill/单行/末token decode，
+  同hidden投影及新鲜树对照；避免仅重复旧109/236/157/286案例。新增诊断CLI显式manifest，
+  源token被改变或重复case必须拒绝，新增针对性测试；正式算法不改。
+- 初步源码发现：当前BF16 flag=False仍允许split-K，本机vLLM 0.18 batch-invariant实现
+  在torch≥2.10使用(False,False)并调整RMSNorm/线性等算子；支持列表不含TREE_ATTN，
+  不能直接开启全局模式当作现成修复。官方资料支持batch/shape-dependent数值差异存在，
+  尚未证明本次根因；不得把版本更高的官方硬件支持范围当作0.18已验证sm87。
+- 本机隔离进程实际torch2.10读回：flag=False时reduction=False、splitK=True，
+  (False,False)读回splitK=False；此检查未改变模型worker。本次未实施新的数值修复。
+- 新冻结 `results/target_consistency_deep_audit_20261004/audit_code` 关键9执行文件与round3
+  原来源逐字节一致；原生24请求完整完成，新四例echo/decode hidden/top差均0，
+  完整TV≤9.74e-11；same-hidden M1/10/13检查top差均0；旧长树287相对新echo仍差0.250001。
+  补查三方式每例两次raw logits重复相同，single/decode与echo全词表少数raw值仍有≤0.0625差，
+  因而不宣称raw logits全词表逐位相同。
+- 新鲜D3/D4共16root请求、24root项及16祖先评分全部通过，top/EOS差均0，
+  root TV≤1.133e-12、祖先TV≤7.985e-12。追加原old D3/head1/无anchor/无topk配置
+  157/287两例×seed29542/29543共4请求，实际root/position对齐，hidden/top/EOS差均0。
+  总计60对照请求（warmup另计），17:57:51北京时间结束，两个有限user unit均exit0。
+  正式round3仍failed/exit2/NRestarts0，未恢复；新鲜状态不等于原131token提交历史，具体根因未确定。
+- 本次相关CPU实际7 passed（3.12s）。初始.venv -m pytest缺模块，系统pytest直接入口缺scripts导入；
+  改用既有系统pytest并显式项目/.venv依赖PYTHONPATH后通过，无安装/升级。历史379/2skip不冒充本次验证。
+- 阅读PyTorch2.10 numerical accuracy、vLLM0.18 batch invariance/源码、ThinkingMachines原始研究、
+  speculative decoding原始论文；中文 `doc/ANALYSIS-TARGET-CONSISTENCY-DEEP-AUDIT-2026-10-04.md`
+  和 `plan/target-consistency-deep-repair-2026-10-04.md` 固定下一顺序：原seed短自然现场→首次
+  token/层/KV提交定位→单因素最小修复→128/512/1024/2048长状态→质量/截断→独立三基线。
+  明确先前前4唯一prefix仅两题、state前8/Target前32/仅128采点及HTTP EOS缺项覆盖缺陷。
+  对原计划/修复记录加最新入口，同步专门upstream目录及CHANGELOG；旧冻结证据不改。
+- 收尾：实际逐请求数量60、9关键来源hash匹配、5份文档相对链接/空白检查及git diff --check通过。
+  汇总保存 `results/target_consistency_deep_audit_20261004/investigation_summary.json`，
+  两项诊断unit均inactive/dead、exit0，无遗留模型进程；正式unit仍failed/exit2。
+  修正日志头部本地工作分支名称，区分本地适配与上游研究分支。
+
+## 2026-10-04：第三轮再次停止核查（仅调查与文档，未重启）
+
+- 用户询问为何再次中断；读取user unit/journal/status、全部10生成记录、4新前缀原始评分，
+  确认13:43:53北京时间主动exit2、NRestarts=0、MainPID=0，STOPPED_PROTOCOL_ERROR。
+  新真实前缀109/238/157 top误差约1e-6，287/gen131差0.250001>0.15、EOS0.046876，
+  来源old、train2950/seed29542。原24root/16祖先固定验收仍真实有效，覆盖范围不足。
+- 完整跨服务重放通过，7311/73153两次1250token、正常结束、hash相同。
+  old/anchor4各4题原判对4/4，正常结束2→3、截断2→1，吞吐2.569→2.932(+14.1%)，
+  均时567.3→293.8(-48.2%)；2950却483正常→2048截断，质量问题仍在，尚无三个主基线证据。
+- 服务日志未检出OOM/CUDA error/traceback/fatal；systemd内存峰值11.6G。不能据此认定
+  剩余误差是KV或特定算子，需固定新前缀区分新鲜计算与长生成状态；不放宽容差或盲目重启。
+- 新中文 `doc/STATUS-ADAPTIVE-RAVEN-ROUND3-2026-10-04.md`，修复报告/计划/上游改动记录
+  加最新停止提示；冻结代码、原始结果和失败gate不改。实际验证仅日志核查和结果重算，
+  本次没有新GPU请求、算法改动、后台重启；文档链接核对与git diff --check通过。
+
+## 2026-10-04：执行Target概率一致性修复（固定前缀验收通过，优化继续运行）
+
+- 收尾确认：新round3模型已实际加载，health=200、warmup HTTP200，第一条2048-budget质量请求
+  正在真实生成（服务token/接受指标持续更新），user unit仍active/running、NRestarts=0。
+  自动中文报告链接可读，最终diff检查通过；不等待后台全流程完成才交还用户，服务独立继续。
+- 最终实机：12:28:14北京时间canonical验收32请求全部完成exit0，D3/D4 24项root检查和
+  16条祖先评分全通过；top/EOS最大差均0，完整TV root≤8.31e-12、祖先≤1.88e-10。
+  两个关键160/161祖先评分的修复前后实际prompt逐token相同，排除换前缀冒充修复。
+  本次只是固定前缀概率门槛，不宣称所有上下文/正确率/速度目标已满足。
+- 12:29:47北京时间 `remtp-adaptive-round3.service` 已enable/start，MainPID515188、
+  active/running、NRestarts=0；新numerical_gate带来源hash，关键9文件匹配实机来源。
+  当前diagnostics old 0/4，先完整2048生成/跨服务重放/独立Target，再消融/选参/回归/留出/正式。
+  user lingering=yes，关闭对话不停止；质量/协议exit2/3不重试，其余有限3次重启并逐请求续跑。
+  中文修复文档已收尾，plan步骤1～6标记本范围完成、步骤7运行，新doc第三轮自动报告链接。
+  最终CPU379/2skip后仅复用source校验的小修改，相关6测试再次通过；编译/bash/diff/unit验证通过。
+- canonical候选完整CPU回归实际379 passed、2 skipped（46.88秒），新mapping相关9测试已先通过。
+  已启动独立 `remtp-target-canonical-check.service` 16root+16祖先验证，顺序FP32参考算术不变。
+  round3 unit及进度脚本改为新 `adaptive_optimization_20261004_target_canonical`；先前target_fixed
+  仅预检未启动并加显式未使用说明，冻结来源不编辑。新的9个关键执行文件与canonical实机来源
+  字节一致、SHA256 manifest已保存，预检与服务启动仍等待概率gate。
+- FP32最终实机验收56请求完成（24原生+16root+16祖先）：D3原8祖先全部通过，
+  旧prefix160误差由0.1875变0；但D4 prefix161 top0.25、EOS0.15234375、TV0.0668187，
+  仍gate失败，不启动优化。备选/实际输入和draft IDs已核对一致，不能用root通过冒充完成。
+  新增 `remtp/canonical_tree_attention.py` 可选修复：一节点映射为一个virtual单token query，
+  token-level block table将已提交前缀和祖先按逻辑顺序映射原BFS KV槽；原cache只view不复制、
+  不写KV，保留原算子/数值/采样规则。索引布局仅跨层复用，每次runner prepare清空，
+  避免跨请求原地更新block table造成陈旧映射；table按32列补齐覆盖原kernel无mask表读取。
+  新CPU回归检查置换block映射、兄弟/拒绝槽隔离、32边界padding；真实GPU验收待执行。
+- FP32原生24请求已完成，四例prefill/decode hidden/top差均0；D3新鲜8root请求通过，
+  D4/祖先尚未结束。新优化目录已冻结并 --check-only 实际PREFLIGHT_COMPLETE，
+  关键8个执行文件与本次GPU验收来源字节相同，保存独立SHA256 manifest；尚未启动优化。
+  新增 `scripts/status_adaptive_round3.sh`，显示user unit/JSON逐阶段进度和中文报告入口，bash语法通过。
+- 当前代码第二次完整CPU回归实际376 passed、2 skipped（45.86秒）；FP32本地kernel与安装版
+  源码核对仅一处P×V表达式改变。中文修复结果/限制文档已建立、旧状态添加可见历史提示。
+  自动报告标题去除旧轮次并显示全部公共数值配置，阶段标题改中文；属于报告展示修改，
+  后续检查编译即可，不改变已完成模型验证/筛选规则。最终FP32 GPU验收仍运行中。
+- FP32 kernel CUDA隔离测试实际编译运行完成：该随机输入原版与候选均输出完全一致，
+  因此不能作为原失败原因或修复效果证明；初次未source cuda_env导致Python.h缺失，
+  使用既有环境脚本后解决，不改安装环境。下一步以真实失败前缀全模型结果判定。
+  新有限 `remtp-target-fp32-checks.service` 已启动：24原生cache-off请求→16树root请求→
+  16祖先路径，采用固定路径规则（无root备选时取第一条内部备选）并核对逻辑位置。
+  所有组冻结在新fp32_code，旧失败及冻结代码保留；控制器也保存native实际JSONL进度。
+- 新建 `deploy/remtp-adaptive-round3.service`（尚未启动）：ExecStartPre核验最终gate、
+  24root检查/16branch检查、显式FP32等公共数值协议和cache-off；质量失败exit2/3不重启。
+- 最终祖先回放12条实际完成：24项root检查全通过，但D3主路径prefix160 top误差0.1875、
+  EOS0.125、TV=6.90e-6，原门槛失败exit2；D4 prefix161 top0.125、TV=0.001034。
+  不恢复优化。源码进一步确认TREE的BFS物理槽跨32-token attention tile，顺序祖先槽连续；
+  unified kernel在每tile将softmax P转BF16再与V相乘，在线softmax分块可引入不同量化误差。
+  新增可选本地 `remtp/target_attention_fp32.py`：复制当前vLLM Apache-2.0 kernel，仅将P×V
+  保留FP32/IEEE，其余KV布局/mask/位置/launch参数不变；原安装包不编辑。
+  适用于所有方法，协议显式记录 `target_attention_fp32`；隔离及全模型验证尚待执行。
+- 收尾CPU回归实际376 passed、2 skipped（48.49秒），包含数值协议漂移与失败root复用必须拒绝。
+  此后FP32 attention候选为新增未验证修改，不能沿用已完成测试宣称该候选通过。
+- 最终2D真实树新验证实际24请求：D3/D4 cache-off16请求，所有root top/EOS差0、
+  备选seed变化root一致；D3 cache-on8请求中286前缀top差0.25，保持原0.15门槛停止exit2。
+  决定本轮全部方法关闭跨请求前缀缓存（保留普通解码KV），不把cache-on宣称修复。
+  树验证新增显式cache-modes和只读复用：仅接受24条cache-off root检查全部通过、
+  模型/包/数值协议/输入manifest一致、关键执行源码hash一致的快照，旧失败gate保留；
+  接下来独立运行16条祖先路径，不重跑已通过16条root请求。验证尚待执行。
+- 用户授权实施优化与修复；先固定4个原失败前缀并做Target数值对照，不复用旧失败gate。
+- 新增 `remtp/target_diagnostics.py`：默认关闭，每请求最多32次Target真实hidden/raw logits及
+  同hidden投影shape=1/10/13快照，无采样、无KV写入；仅用于诊断，不计入性能。
+  `remtp/fastmtp_verified_worker.py` 和服务脚本新增诊断Target worker；Round2仅在显式诊断参数启用。
+- 状态：代码初步实施，尚未启动新GPU/尚未确认数值来源；实际验证与后续修改继续追加。
+- 新增 `scripts/investigate_target_consistency.py`：显式固定anchor4四例109/236/157/286和
+  原source/request/generated_length/hash；保存全部HTTP参数/响应。原生Target缓存开/关，
+  echo评分、单行生成、强制末token后真实decode三方式，各例两次，共48请求；
+  强制token仅用于诊断构造相同条件前缀，raw logits采集位于采样约束前，不用于质量测试。
+  记录同hidden投影shape对照与完整词表TV，GPU执行尚待开始。
+- Python编译、服务bash语法、git diff --check通过，代码冻结为新目录probe_code，
+  已启动有限 `remtp-target-consistency.service`，正在加载cache-off Target。
+  新增 `tests/test_target_probability_diagnostics.py` 验证新增目录不改变固定案例、歧义必须报错，待执行。
+- 固定前缀测试实际2 passed；原生48请求cache off/on对照全部完成，unit退出0。
+  原生prefill/decode本身log-odds差可达0.625，prefix236 cache-off完整TV=0.05144；
+  同hidden输出投影仅解释0～0.0625，差异已出现在主干hidden。
+- 本机bitsandbytes源码确认sm87 M≤4走custom GEMM、较大M走dequant+BF16 linear。
+  新增默认关闭 `remtp/target_numerics.py` 统一为后者（保留FP4存储，只暂时反量化单层），
+  适用于Target/全部MTP基线；服务与Round2新增显式开关并纳入协议。
+  这是待验证修复候选，不直接当作Target一致性已通过；后续独立实验与逐层定位继续。
+- CUDA隔离真实量化权重测试：统一bnb路由但仍保留BF16 reduced precision reduction时，
+  同一输入行M1/M13差1.0，未修复。直接BF16 F.linear与FP32参考对照发现M13误差1.0、
+  M1误差6.1e-5；关闭 `allow_bf16_reduced_precision_reduction` 后M1/M13差0。
+  新增默认关闭 `REMTP_TARGET_BF16_FULL_ACCUM`，只改BF16 GEMM累加策略，不改权重dtype，
+  Round2与诊断CLI显式记录并公平用于所有worker；全模型概率验证仍待执行。
+- BNB隔离验证：原custom路径关闭reduced accumulation仍M1/M13差1.0；同时统一反量化路由
+  且关闭reduction后差0。已冻结两项组合并启动48请求全模型候选原生对照，尚未验收。
+  Target probe进一步记录实际input IDs/positions，树模式保存全部13以内logit/hidden行、
+  topology/draft IDs，并用实际root行做同hidden形状对照（运行中的候选冻结代码不编辑）。
+- 组合全模型cache-off仍prefix157误差0.4375；cache-on236/157为0.1875，不能验收。
+  同hidden输出投影形状误差均0，剩余差异在主干。增加默认关闭FP4固定行块16/64候选，
+  同层反量化一次、分块固定shape计算并返回原行数，保持FP4权重/真实attention token数；
+  仅sm87启用、协议记录，尚未GPU验证。不是提高容差或更换模型。
+- 固定row helper CPU测试实际4 passed；row64候选已冻结启动原生48请求对照。
+  新增 `scripts/validate_target_tree_consistency.py`：固定prefix[:-1]、仅诊断强制末token构造
+  完全相同条件前缀，捕获实际树root raw logits；比较D3/D4、PC开/关、改变备选seed。
+  核对实际root token/position，独立回放primary/backup祖先路径，保持0.15 gate；尚未执行。
+- 真实树D3/cache-off8请求已完成：root token/position均对齐，备选seed改变root raw logits不变；
+  与FLASH_ATTN独立参考仍误差0.125/0.1875/0.375/0.25，109的EOS误差0.15625也失败。
+  因root未通过主动停止该有限诊断（不推进优化）；这是未修复残差，不算通过。
+  新增显式独立Target attention backend选项并纳入协议，以控制FLASH_ATTN/TREE_ATTN差异。
+  树检查脚本以后首组root失败立即exit2，避免无效后续祖先评分。
+- 本机TREE_ATTN源码确认prefill/decode均调用unified_attention，默认Target却FLASH_ATTN/FA2。
+  下一对照以公开TRITON_ATTN为独立参考（同unified算子、无MTP）；若验证后采用，
+  Native/Cactus/SpecCascade同样改为TRITON_ATTN，保持原chain proposer/sampler。
+  不用TREE_ATTN改变原生链草稿语义；配置纳入协议。尚未执行新后端一致性验证。
+- 完整CPU回归375 passed、2 skipped（44.82秒）；随后shell防errexit的小修复与协议/诊断更新
+  待收尾检查。新建专门改动目录 `doc/upstream-changes/target-probability-consistency/README.md`，
+  同步总CHANGELOG。TRITON原生48请求诊断已冻结启动，未宣称树/祖先检查或正式质量通过。
+- TRITON原生48请求完成，复用已保存D3/D4树raw logits与新TRITON prefill做独立计算：
+  两种深度四例top/EOS差全0、TV≤1.08e-13。证明同条件树/统一attention参考可以一致。
+  但TRITON单token decode仍有0.3125差异；源码确认仅单token启用3D分段softmax，而TREE始终2D。
+  新增默认关闭2D launch选择，清空两个受支持的3D选择参数，不改query长度/位置/mask；
+  公平应用所有TRITON worker并记录协议，独立GPU复核待执行。
+- 2D最终参考48请求已实际完成：cache-off4例top/hidden差0；cache-on109/236/157差0、
+  286 top差0.125，完整TV均≤2.41e-13，满足原top0.15。新增参数组合校验，避免单独
+  启用row块但遗漏精度/路由配置。接下来独立重做树root、备选seed、缓存和16祖先条件。
+- row64/cache-off24请求真实完成，4例prefill/decode hidden差0、top log-odds差0、TV≤2.72e-13；
+  cache-on待结束。修复不是仅统一route或关闭reduction，而是三项共同对照获得的候选。
+  主控制器改为old/old_repeat/anchor4固定顺序选前缀，保存不可变化manifest与每条完整API响应，
+  gate附来源/request/generated_length/hash；新增共同logit偏移不误报、相对/EOS错差必须失败测试。
+- 原生row64候选48请求全部完成，相关CPU5 passed；树检查脚本保存API逐例JSONL和scheduled jobs，
+  使总进度可核实。下一步冻结真实树root/祖先路径验证，不将原生一致直接当作树一致通过。
+
+## 2026-10-04：Target概率一致性行动方案（计划完成，实施待开始）
+
+- 用户要求下一步行动方案；新增 `plan/target-probability-consistency-2026-10-04.md`，
+  更新总计划入口、上游改动日志和本日志。保持现有模型/环境、0.15门槛和停止状态。
+- 实际调查：读取采集、temperature处理、Target输入、KV压紧与独立回放代码。
+  旧checks缺prefixhash/来源、case选择依赖glob；新增strict目录后直接枚举将改变前4例，
+  排除该后增目录可重建anchor4的1/128/1/130轮次、长度109/236/157/286，计划先显式固定并核对。
+- 方案：固定案例→核对token/预测行/约束→原生prefill/decode与缓存误差对照→
+  树root/祖先路径与不可见槽污染检查→同hidden Target投影与逐层定位→局部修复→
+  原4例/独立例/2048预算复现验收→恢复优化；多指标报告，不用原生误差或加阈值直接绕过门槛。
+- 限制：只制定计划，没有新GPU执行/算法修复/验收结果；旧失败记录和冻结代码未修改。
+  文档步骤/总计划链接核对完成，git diff --check通过。
+
+## 2026-10-04：实验状态核查与修复后结果分析（后台已停止）
+
+- 状态：`remtp-adaptive-round2-fixed.service` failed、exit2、NRestarts=0、MainPID=0；
+  于10月2日15:17:27北京时间因Tree/sequential root mismatch停止，完成10生成诊断和4前缀评分。
+  完整2048预算7311/seed73153重放通过，两次363token、正常结束、输出hash相同。
+- 四题旧/anchor4均4/4正常答对、0截断；原始记录核算吞吐2.828→3.295（+16.5%），
+  平均238.4→254.2秒（+6.6%），tokens2696→3350（+24.3%）。不是三个主基线正式收益证据。
+- Target前缀109/236/157/286，各匹配8个top token；max log-odds差0.125/0.1875/0.2500/0.3750，
+  三条超0.15门槛。尚未区分数值形状误差与缓存/位置问题，不放宽门槛；严格短诊断128token
+  截断不并入2048质量统计。消融/选参/留出/正式测试都没有运行。
+- 文件：新增中文 `doc/STATUS-ADAPTIVE-RAVEN-2026-10-04.md`；修复说明、实施记录和下一轮计划
+  添加历史状态提示；同步 `doc/upstream-changes/CHANGELOG.md` 和本日志。
+- 实际验证：读取服务状态/journal/status、reproduction_gate、4条Target checks与全部10生成记录，
+  独立重算分组和逐题性能；仅文档修改，不改算法/冻结来源，不启动GPU；文档链接与git diff --check通过。
+
+> 以下“后台已启动/正在运行”为历史记录；当前服务已停止，以本次核查为准。
+
+## 2026-10-02：继续定位草稿复现差异并修复（进行中）
+
+- 收尾：14:33:33北京时间，修复版7请求GPU短回放全部通过，unit自动退出0。
+  cache-on/off同进程与cache-off独立重启，各8次提案Q最大TV=0、root hidden差0；
+  cache-on额外24次树hidden/KV差0，RNG一致。修复成立于本次短前缀对照，不等同质量通过。
+- 已启动新冻结 `remtp-adaptive-round2-fixed.service`，MainPID=442893，active/running、NRestarts=0，
+  缓存显式开启、深度探针关闭；旧失败unit/协议/原始输出保留。新报告本地链接
+  `doc/RESULT-ADAPTIVE-RAVEN-ROUND2-FIXED.md`，同步计划、旧实施记录的历史提示和修复说明。
+  全量2048-token复现、Target对照、筛选/回归/留出/正式测试仍等待后台门槛，未声称通过。
+- 新后台实机收尾：模型health=200、warmup已完成，首条2048-budget诊断实际生成中；
+  unit仍active/running、NRestarts=0，git diff --check通过。已清楚告知短复现通过不等于截断/质量目标完成。
+
+- GPU cache-on 顺序重放已实际失败；CPU 快照显示第二轮 root=114、有效前缀115，
+  传入 Target seq_lens=123。两次 root hidden、logits、RNG、真实 prefix KV 完全相同，
+  首次三节点草稿 hidden 已有 maxabs=4.0，Q maxabs=0.0373194。原草稿按123+count
+  配置 attention，误读额外8个旧 speculative 槽位；不是仅凭输出差异猜测。
+- 修改 `remtp/fixed6_vllm.py`：草稿序列长度改为 root_position+1+count，同步 max_seq_len、
+  CPU query_start_loc 并清除旧长度影子；不改根分布、接受规则、RNG 或物理 BFS 写槽。
+  新增 `tests/test_draft_tree_metadata.py` 覆盖实际 root114/seq123、不同树大小和初次prefill。
+  GPU修复回放和CPU测试尚待执行；正在运行的 probe_code 保持原失败版本用于cache-off对照。
+- probe 脚本新增前8次实际 proposal Q 的 TV 与草稿 token/拓扑/前缀对照；`--require-match`
+  要求三组128-token输出相同且Q最大TV≤1e-6，失败exit2。防止“输出相同但概率仍污染”漏过。
+- 完整CPU测试实际369 passed、2 skipped（47.79秒）；编译与git diff --check通过。
+  追加独立注意力回归：只改变被拒绝槽位内容时，修复metadata的输出必须不变，原长度算法
+  必须显著改变输出；该新增案例尚待执行。修复冻结在 fixed/frozen_code，已启动
+  `remtp-repro-fixed.service` 7请求真实GPU开关/重启测试；最终结果待完成。
+- 新增独立缓存污染回归实际6 passed（3.22秒）；新增中文修复说明
+  `doc/FIX-ADAPTIVE-RAVEN-REPRODUCIBILITY-2026-10-02.md`，同步
+  `doc/upstream-changes/CHANGELOG.md`，记录旧cache开/关、重启7请求证据与新GPU尚未结束。
+- 下一轮控制器将完整旧配置复现门槛提前到anchor诊断之前，并单独保存
+  `reproduction_gate.json` 的2048预算、tokens/结束原因/输出哈希；失败仍exit2，不进入选参。
+  新增 `deploy/remtp-adaptive-round2-fixed.service`，新冻结目录、新记录、缓存显式开启。
+  unit 尚未启动，等待短GPU复现门槛；旧失败目录/unit不覆盖。
+- 修复版缓存开启3请求实际完成：相同128token输出，8次提案Q TV=0、root hidden差0；
+  24次树forward hidden/prefix KV差均0，提案RNG一致。cache-off 3请求已结束，重启1请求待结束。
+  新优化目录已冻结（不复用旧请求），`--check-only` 实际PREFLIGHT_COMPLETE，unit verify通过；
+  下一轮尚未启动，独立Target检查与2048-token长重放都不宣称通过。
+
+- 用户授权继续查因和修复；旧 9 请求和冻结代码保持不变，新目录为
+  `results/adaptive_repro_fix_20261002/`，已保存工作区 before.patch 和旧 v4 证据。
+- 先做同题/同 seed 的同进程请求顺序与独立进程对照、前缀缓存开关对照，
+  补充真实 root hidden/Q、备选拓扑、RNG 和 MTP 缓存诊断；不绕过原复现门槛。
+- 初始状态（历史）：准备诊断代码，尚未确认根因、尚未开始新 GPU 实验；后续改动/验证随本条追加。
+- 修改 `scripts/serve_fastmtp_verified.sh`：新增显式 ENABLE_PREFIX_CACHING=0/1；
+  未设置时保留 vLLM 原默认，不改接受规则。`scripts/run_adaptive_round2.py` 将该开关
+  纳入协议/各任务配置，修复已保存顺序 Target 检查失败时不能被恢复逻辑跳过的问题。
+- `remtp/generation_guard.py` 新增默认关闭、每请求前8次提案有界的真实 root hidden/Q、
+  主/备选拓扑、MTP 输入/输出、一个实际 MTP attention 层 prefix KV 与 RNG CPU 快照。
+  只诊断，不修改 KV 或消耗 RNG，同步成本不计入性能。
+- 新增 `scripts/investigate_adaptive_repro.py`：128-token 同进程同题→其他题→同题，
+  cache on/off，再加 cache off 独立服务重启对照；短前缀不当作完整正确率证据。
+  Python 编译及服务 shell 语法检查通过；GPU 结果待执行。
+
+## 2026-10-02：第二轮停止与结果分析（诊断完成 9 请求，完整计划未完成）
+
+- 状态：北京时间 10:11:54 `STOPPED_PROTOCOL_ERROR`，服务 exit=2、NRestarts=0、failed；
+  journal 明确为同配置/同种子输出重放差异，当前不在运行。未进入保护选参、留出或正式测试。
+- 已核算：旧 D3 vs anchor D4 四个固定失败诊断题，原判对 3→2，正常结束且判对 2→2，
+  截断 2→2；E2E 2.85765→3.30614 tok/s（+15.69%），平均 468.392→409.995 秒（−12.47%）。
+  诊断/失败回归样本不作为正式收益证据；anchor4 没有启用新保护。
+- 重放：7311/seed73153 两次均正常判对，592 vs 1700 token、212.989 vs 564.135 秒。
+  最早同前缀 Q 差异为第 2 轮二层 0.250476→0.213698，同位置 P 与接受随机数相同；
+  第 23 轮草稿/验证路径不同但提交相同，第 24 轮接受 RNG 分叉，第 25 轮（生成长度88）输出分叉。
+- 诊断观测：候选 EOS 质量在正常结束题 2629/2950 的换行接受处被显著降低；
+  截断候选的已访问主路径最大 EOS 质量约1e-9，阈值0.5保护未必覆盖该类循环。
+  连续相同 token 块检测全为 false，但存在重复句段，说明该启发式覆盖有限；不是保护效果实测。
+- 文件：新增 `doc/ANALYSIS-ADAPTIVE-RAVEN-ROUND2-2026-10-02.md`，同步
+  `plan/adaptive-raven-next-optimization-2026-10-02.md`、
+  `doc/OPTIMIZATION-ADAPTIVE-RAVEN-2026-10-02.md`、
+  `doc/upstream-changes/CHANGELOG.md` 和本日志；自动报告追加停止分析入口。
+- 验证：读取服务/status/journal、全部9个输出与三组逐轮诊断，重新计算对照、分叉与EOS统计；
+  新分析文档链接存在，`git diff --check` 通过；原始请求、冻结代码与协议不改。
+  仅文档归档，没有新模型运行或算法修改。
+- 限制：草稿Q差原因仍需 hidden/KV/拓扑/请求顺序/缓存诊断；前缀缓存命中只是候选因素。
+  不把数值/状态影响直接归因于方法，不绕过门槛，不声称截断优化或三个主基线对照已完成。
+
+> 下面“执行下一轮优化”的运行状态为历史记录；当前以本次停止分析为准。
+
+## 2026-10-02：执行下一轮优化（进行中）
+
+- 授权：执行下一轮优化计划；保持当前模型/依赖和 2048 token 主质量协议。
+- 已保存 `results/adaptive_optimization_20261002/before_code/`、`before.patch` 与
+  `v4_evidence/`，包括旧冻结协议、质量门槛及全部 96 输出；原 v4 不覆盖。
+- 实机预检：统一内存 available 约 10 GiB（模型未加载），15W 模式，user lingering=yes；
+  旧优化服务已因质量门槛退出，不在运行。
+- 实施范围：独立 head 开关、生成前缀与 EOS 诊断、风险位置松弛保护、可恢复的下一轮
+  控制器及公平对照。涉及文件/实际验证随本条目追加；尚无新 GPU/质量结论。
+- 当前限制：v4 截断根因尚未通过概率回放确认；旧 356 项测试只代表历史代码。
+- 已实现默认关闭的 EOS 松弛保护、前缀重复严格验证与独立公共 head 开关，涉及
+  `remtp/dynamic_mtp_tree.py`、`remtp/dynamic_tree_vllm.py`、
+  `remtp/fastmtp_verified_worker.py`、新增 `remtp/generation_guard.py`。
+  受保护位置在 TV 回收池计算前置零，接受和 residual 使用一致的验证分布；不强制 EOS。
+- 新增 `remtp/optimization_metrics.py`、`scripts/run_adaptive_round2.py`、
+  `tests/test_generation_guard.py`：逐请求断点、唯一配对/各种子质量与截断门槛、
+  请求局部 branch RNG、真实 head 同前缀探针、独立顺序 root 概率回放、单因素筛选、
+  原题回归/留出/正式测试串联。公共 head 开关用于三个适用基线，单独保存原实现控制。
+- 本轮协议显式设置请求局部 branch RNG，避免重启或请求顺序改变备选采样；旧配置会重新跑，
+  不直接把历史 v4 校准当新协议对照。正式题只在选择/留出通过后抽样，排除旧 100 题。
+- 已实际验证：原动态树测试 68 passed；新增保护/残差一致性、重复边界、校准门槛与
+  按题聚类区间测试 8 passed；新增文件 py_compile 通过。完整回归及 GPU 执行仍待结束。
+- 首次不指定目录的完整 pytest 收集了 `before_code/tests` 快照，发生同名模块冲突；
+  不删除快照，改为显式 `pytest -q tests`，正在重跑实际工作区回归。
+- 新增 `deploy/remtp-adaptive-round2.service` 与
+  `doc/OPTIMIZATION-ADAPTIVE-RAVEN-2026-10-02.md`，有限后台流程、保护语义、评估与限制有独立中文说明。
+- 已核实 config 主 EOS=151645，generation_config 附加 EOS=151643；新控制器将两者
+  都用于概率诊断/保护（不改实际停止参数）。输出预算与 user service 配置预检通过。
+- 收尾验证：显式工作区 `pytest -q tests` 实际 364 passed、2 skipped（44 秒）；
+  Python 编译、`git diff --check`、`systemd-analyze --user verify` 与冻结控制器 --check-only 均通过。
+  保存预检活代码产物到 `preflight_live/` 后，将所有运行源码冻结到 `frozen_code/`，运行时不编辑冻结副本。
+- 已 link/start `remtp-adaptive-round2.service`（未 enable 开机启动），MainPID=435562，
+  active/running、NRestarts=0；模型 health=200，warmup HTTP=200，退化回放请求正在生成。
+  GPU warmup 三次 head 对照 argmax 一致，max_abs_logit=0.0625、最大概率 TV=1.79185e-9；
+  仅覆盖三个 warmup 输入，不能外推全部前缀等价；顺序 Target 回放尚未执行。
+- 同步本轮计划执行状态、`doc/upstream-changes/CHANGELOG.md` 与中文实施记录，
+  新建 `doc/RESULT-ADAPTIVE-RAVEN-ROUND2.md` 自动报告链接。结果不覆盖旧 v4。
+- 后台按诊断→单因素筛选→固定 train 选参→最多两候选回归→公平基线选择→留出→正式/消融
+  自动推进，各种子质量/截断不退化且吞吐和平均耗时改善才放行。尚未声称优化达标；
+  若某阶段未通过，保留明确门槛原因，不自动采用，也不按留出/正式答案再调参。
+
+## 2026-10-02：v4 校准完成与下一步优化计划（计划已制定，实施待开始）
+
+- 状态：v4 四组各 24 请求共 96 请求全部落盘；`STOPPED_QUALITY_GATE`，
+  user service `ExecMainStatus=3`、`NRestarts=0`，这是门槛失败后的主动退出。
+  完成时间为北京时间 2026-10-02 00:52:43；没有启用失败候选默认值。
+- 已核算结果：原判对 41/48→42/48，正常结束且判对 41/48→40/48，截断 7→8。
+  请求总时长 11702.287→10525.238 秒，平均 243.798→219.276 秒，减少 10.058%。
+- 检查全部截断输出及 7 个配对变化，确认 4 个旧版正常答对/v4 截断案例与 3 个反向改善；
+  2629/42 明显反复输出同一句，7300/42 在答案标记后继续生成。源码的 anchor 验证
+  没有使用现有 EOS 保护配置；是否为截断原因需前缀回放验证，尚无因果结论。
+- 改动：新增 `plan/adaptive-raven-next-optimization-2026-10-02.md`，明确质量/截断/速度
+  门槛、head/构树/深度消融、EOS 与重复风险位置降松弛、分阶段 train 调参与留出、
+  Native/Cactus/SpecCascade 公平对照及 100 test × 3 seed 正式协议。
+- 受影响文件：上述新计划、`plan/adaptive-raven-optimization.md`、
+  `doc/OPTIMIZATION-ADAPTIVE-RAVEN-2026-10-01.md`、
+  `doc/upstream-changes/CHANGELOG.md` 和本总日志。旧状态添加可见历史提示，原实验不覆盖。
+- 验证：读取 `status.json`、四组 `requests.jsonl`、自动中文报告与 `quality_gate.json`，
+  重新计算请求数与耗时；核对当前 verifier 和配置代码。`git diff --check` 通过；
+  新计划全部相对链接存在，质量数字、7 个配对变化与 4 个退化案例核对通过。
+  未修改算法、模型、依赖或服务；未启动新测试。
+- 限制：只有 24 道 train 双种子校准，未证明零质量损失、未完成与三个主基线的正式质量/速度对照。
+  风险保护会改变方法设置，必须单独消融；公共 head 加速需给适用基线同等机会。
+
+> 下文 2026-10-01 的“进行中/未完成”均为历史过程；当前结论与计划以上述 2026-10-02 条目为准。
+
+## 2026-10-01：Adaptive RAVEN 优化实施（进行中）
+
+- 已将修改前代码、工作区差异及版本存入 `results/adaptive_optimization_20261001/`。
+- `dynamic_mtp_tree.py`、`dynamic_tree_vllm.py`：新增默认关闭的
+  `REMTP_DYNAMIC_TREE_PRUNE_ANCHOR_DESCENDANTS`，仅 anchor 模式可启用；保留原始候选
+  选择/预算，最终计算前删除不会被读到的备选后代，按新拓扑重建 KV。
+- `runtime_profile.py`、`fastmtp_verified_worker.py`：可选同步分段计时，包含嵌套耗时，
+  正式吞吐不启用；`serve_fastmtp_verified.sh` 支持显式空审计路径关闭审计。
+- 验证：代码实施中；概率/随机数等价测试、GPU 缓存与性能测量待完成，尚未采用为默认。
+- 限制：CPU 等价不能保证 GPU 行数变化后逐位相同；不得提前宣称正确率和速度提升。
+- `tests/test_dynamic_mtp_tree.py`：新增概率决定、输出、选中路径、随机数状态等价检查；
+  首次覆盖断言失败是均匀测试分布在 delta=1 下没有产生 hit，改为尖锐分布后复测。
+- `scripts/run_adaptive_optimization.py`：有限控制器，代码/协议哈希锁定、逐请求落盘、
+  profile/纯测速/24 train 题双种子完整质量校准分离；速度未过门槛不进入质量校准。
+  新脚本尚待 GPU 执行验证。测试使用系统 pytest 路径，不修改服务环境依赖。
+- `deploy/remtp-adaptive-optimization.service`：后台控制器运行冻结的 candidate_code，
+  最多有限重试，质量/速度门槛不通过停止。CPU 树测试实际为 57 passed（新增 5 项）。
+- 全部 CPU 回归实际通过：345 passed、2 skipped；服务 shell/新 Python 编译与 diff 检查通过。
+- GPU baseline 分段短测已完成：Target 平均 937.6 ms、proposal 216.1 ms、验证
+  23.5 ms（规划包含其中 3.2 ms）、缓存更新 15.3 ms。不可把嵌套时间重复相加。
+- 代码检查发现每个父节点为取最多 3 个 sibling 对整个词表稳定排序；新增默认关闭的
+  `REMTP_DYNAMIC_TREE_EXACT_TOPK`，在 topk 截点补齐最小 token ID 的并列项，
+  保持稳定排序与全部候选/诊断/预算语义。独立于裁剪 v1，验证后再冻结 v2。
+- GSM8K train 从官方 `openai/grade-school-math` 下载并校验 7473 条；质量使用 train，
+  初次控制器因本地仅有 test 而停止，补齐后已重新启动。未修改服务依赖。
+- 稳定 topk 的 6 项新测试已通过，树测试累计 63 passed。v2 profiler 加入候选选择、
+  草稿 logits 与节点计数，分离剩余 proposal 耗时；控制器锁定配置/包版本，
+  校准同时检查每个种子并保存配对错误变动，配置错误返回 2 禁止无意义重试。
+- 更新 `doc/OPTIMIZATION-ADAPTIVE-RAVEN-2026-10-01.md`、上游改动表与计划进度，
+  明确裁剪单次 profile 变化很小、topk 性能待测、质量尚未完成；未改默认参数。
+- 裁剪 v1 的纯短测已得到 baseline 2.637、candidate 2.552 E2E tok/s，
+  轮成本近乎不变但输出/接受长度改变；保留失败候选证据，不采用裁剪。
+  v2 候选仅启用 stable topk，保持 GPU 树行数与原概率计算不变。
+- v2 profile 在排除的 warmup 内运行 CUDA 稳定 topk 等价探针（20 个并列/随机词表案例）
+  和小型独立算子对照；其结果保存到 topk_probe.json，不计入正式性能请求。
+- 裁剪 v1 纯性能完整结束：两次 baseline 合计 2.6384、裁剪 2.5515、Cactus 2.7760
+  E2E tok/s；裁剪 -3.29%，门槛自动停止（未跑质量）。已冻结并启动仅 topk 的 v2。
+- v2 完整 CPU 回归实际为 351 passed、2 skipped；未启用裁剪默认。
+- 为下一个独立候选添加默认关闭的 `REMTP_DYNAMIC_TREE_ANCHOR_ONLY_PROPOSAL`：
+  anchor 模式复用已有 caterpillar 构树器，只对主路径计算后续 Q，并把备选预算用于直接
+  sibling。这改变候选分配/覆盖，不声称与原树完整输出等价；接受规则与 adaptive TV 规划
+  不变。v2 冻结副本仍只测试 topk。新候选待主路径 Q/RNG 测试、GPU 测速及完整质量校准。
+- v2 GPU 20 案例稳定 topk 等价通过，但首版算子为 1.28 ms，比全排序 0.74 ms 更慢。
+  保留 v2 证据。下一候选增加无并列快速路径（取 K+1 检查顺序与截点），
+  只在有并列时补齐；anchor-only 构树在 N=3/6/9 共 60 个模拟前缀中保持主路径 Q、
+  sampled token、随机数状态一致。树测试 66 passed，下一候选待实机测量。
+- 下一轮控制器采用 >1% 的短测吞吐改善门槛以减少微小时间波动的误选；阶段完成自动生成
+  中文 `report.md`，分别报告组件、相对旧方法/Cactus 吞吐、完整校准与配对变化。
+  v2 已因 GPU 算子和 proposal 都变慢而主动停止，未完成普通测速，不声称纯测速结论。
+- v3 代码已冻结，启用无并列 topk 快速路径与 anchor-only 提案，继续相同 profile/
+  纯短测/完整校准流程。完整 CPU 测试实际为 354 passed、2 skipped。
+- 按本机 systemd.unit 手册将新服务 StartLimitIntervalSec 改为 infinity，
+  StartLimitBurst=3 覆盖整个启动计数周期，避免长时间间隔故障导致无限自动重试；
+  质量/性能/协议错误直接停止。已有 user lingering 可用。
+- 更新计划状态与中文优化记录：保存 v1/v2 负结果，说明 v3 候选分配会变，完整质量
+  未完成。v3 GPU topk 探针实际通过：20 cases，快速路径 0.502 ms vs 全排序 0.742 ms；
+  不能把算子改进幅度直接当作端到端加速。
+- v3 纯测速已结束，anchor-only D3/N9 为 2.5179 E2E tok/s，性能门槛失败，
+  不进入质量。profile 确认 BF16 草稿 logits 单行路径 51.1 ms，比原多行约 40.9 ms 慢。
+- 下一候选在 anchor-only 中仅将 head 输入复制为 3 行，取第 1 行输出；不增加 MTP
+  KV 节点和随机数消耗。控制器提供 depth/nodes 显式参数，将 D4/N12 单独测速，
+  利用 Target 近似固定的轮成本多验证一级主路径。这是新候选，不提前采用或宣称质量。
+- 增加 D4/N12 模拟构树校验；新增 `scripts/validate_anchor_tree_cuda.py`，用独立
+  BF16 Q/K/V 对照真实 TREE_ATTN 和路径 KV 搬运，验证范围明确不含完整模型质量。
+  此诊断待执行，避免把 CPU 拓扑检查当作 GPU 缓存正确性的充分证据。
+- CUDA 诊断实际通过：真实 TREE_ATTN vs FP32 独立参考 max_abs=0.0037183；
+  保留节点裁剪前后 BF16 输出 max_abs=0；8 个主路径/sibling KV 搬运逐位一致。
+  只证明合成后端与搬运，不证明完整模型概率相等。新增 D4 检查后的全套为 355 passed、2 skipped。
+- anchor-only worker 对单行初始 head 也使用 3 行复制，返回原行数，基线不安装此补丁；
+  新增 head 行数/值检查。D4 候选的短测 Cactus 也改用 4 个草稿 token 作等深度控制，
+  明确旧 Adaptive 对照仍 D3；正式复测须追加等深度 Native/SpecCascade，不能只用 D3 基线宣称胜出。
+- v4 D4/N12 + 3-row head 已冻结，由同一 user service 启动 profile/纯测速及有条件校准；
+  v1/v2/v3 负结果保留，默认入口仍不启用优化候选。
+- v4 实际 profile 和前两组纯性能请求完成：candidate decode 3.0391、E2E 2.9413
+  tok/s、MAL 3.700；baseline E2E 2.6477、MAL 3.3247。纯测速未开 profiler/审计。
+  目前尚等 Cactus D4 与第二次 baseline，质量未开始。完整回归实际 356 passed、2 skipped。
+- 中文记录与计划追加公平对照要求：D4 基线、D3 + head 优化消融、基线共享 head
+  优化控制；不可将组合候选的收益全归因于 Adaptive 规则或深度。
+- v4 完整短测门槛实际通过：重复 baseline 输出逐题一致；合并 baseline E2E 2.643036，
+  candidate 2.941323（+11.29%），Cactus D4 2.613783（candidate +12.53%）。
+  仅两个固定短提示，不能当正式性能/质量结论。控制器实际进入 calibration/baseline_seed42，
+  共 24 题 × 2 seed × 2 方法=96 请求、max_tokens=2048；当前质量未结束。
+- 建立 `doc/RESULT-ADAPTIVE-RAVEN-OPTIMIZATION.md` 到本机自动结果的链接；
+  更新实施状态快照、计划和改动表。结果正文在 ignored results 中由控制器继续更新，
+  手动文档明确进度快照范围。当前默认不开候选，质量下降会停止而非自动采用。
+- 计划表同步为实际后台校准状态；当前服务 active、NRestarts=0，原版质量协议下的
+  baseline_seed42 已进入实际请求，后续由控制器逐题保存、生成中文汇总。
 
 本文档是仓库的唯一持续维护总索引，记录已经做过的实现、实验、负结果、协议
 变更和当前有效入口。算法细节仍可保存在各专题文档中，但任何后续修改都必须
@@ -3527,3 +4582,333 @@ GSM8K/HumanEval 数据、Docker 镜像和 8000 端口检查通过；运行 `git 
 限制：FastMTP checkpoint、数据集、`results/`、`logs/` 和 `paper_zh/` 均保持本地，不纳入
 本次代码发布。当前推荐协议面向单 GPU、`max_num_seqs=1` 和 vLLM 0.18.0；自适应松弛的
 质量—MAL 权衡仍需使用 README 中的实际 benchmark 命令在目标 GPU 上复核。
+
+### 2026-09-28：Jetson R39.2.1 上的 FastMTP/RAVEN 设备适配
+
+状态：`历史阶段记录；GPU 未验证的描述已被下方实测补充取代`。
+
+用户以方法验证为主，允许调整模型加载精度。该分支目前只对 MiMo/FastMTP 的一个物理
+MTP 层和 vLLM 0.18 Tree Attention 提供运行适配；已有 Gemma 4 模型不能直接使用此方法。
+官方 FastMTP 四个 BF16 分片共 14.59 GiB，接近本机 15.17 GiB 统一内存，因此先试
+bitsandbytes 4 位加载。原有 Gemma 4 工作目录不做覆盖。
+
+受影响文件：`scripts/install.sh`、`scripts/cuda_env.sh`、
+`scripts/serve_fastmtp_verified.sh`、新增 `scripts/prepare_fastmtp_jetson.sh`、
+`scripts/serve_fastmtp_jetson.sh`、
+`plan/raven-jetson-r39.md`、`doc/RESULT-RAVEN-R39.2.1.md`、
+`doc/upstream-changes/CHANGELOG.md` 及本日志。权重仅下载到忽略的 `models/`。
+
+验证：独立 venv 已安装并导入 vLLM 0.18.0+cu130、PyTorch 2.10.0+cu130 和
+bitsandbytes 0.50.2；本机 vLLM 提供 `TREE_ATTN`、`speculative_token_tree`、
+`--quantization`、`--load-format` 和 `--kv-cache-memory-bytes`。设备脚本 `bash -n` 与
+`git diff --check` 已通过。62 项方法/模型适配测试通过，MiMo 与树验证 hook 在独立
+Python 进程中安装成功。完整测试为 338 通过、2 跳过、2 失败；两处失败来自官方
+`tokenizer_class` 列表与当前 Transformers 4.57 的接口不兼容，已加入本地配置规范化
+脚本并保留原始副本；两项 tokenizer 测试单独复测通过。权重下载仍在进行；尚无 GPU 生成、
+服务或性能结论。仍需检查 4 位 MiMo MTP 层的权重加载和树 KV 状态压缩。
+
+补充验证：本地配置规范化后复跑完整 `pytest -q`，340 通过、2 跳过；
+bitsandbytes 0.50.2 在 Orin SM 8.7 的 4 位 BF16 小矩阵 CUDA 运算通过。
+
+附注：对 vLLM 0.18 的配置对象做无权重解析检查，Target `bitsandbytes` 与草稿
+`draft_load_config=auto` 可分别解析为目标 4 位、草稿 BF16。运行入口仅在 4 位加载时添加
+这一草稿配置；当前未声称草稿权重加载成功。
+
+评测准备：官方下载 GSM8K test 1319 条及 HumanEval 164 条，均存于忽略的
+`data/`。本机 Docker socket 属于 `root:docker` 且当前用户不在 `docker` 组，
+`docker info` 权限被拒；HumanEval 执行评分暂不可运行，GSM8K 与 HTTP 生成可继续。
+
+GPU 实测补充：固定 FastMTP revision `70b34477e1f274516ddadf778dd96a7f037bf176`
+的四个分片下载完成，`remtp.fastmtp_checkpoint` 确认 451 个权重、单物理 MTP 层。
+4 位 Target HTTP 服务 `/health` 返回 200、32-token 生成成功；vLLM 报告 Target 权重
+5.72 GiB。Native MTP 初次启动时 BF16 草稿权重遇到 vLLM 全局继承的 4 位构造参数，
+在 `mimo_mtp.py` 的参数形状断言失败。新增仅设备量化入口激活的草稿 BF16 构造钩子
+`remtp/jetson_bf16_draft.py`，并在 `remtp/fastmtp_verified_worker.py` 调用；目标仍为
+4 位，验证语义不改。该修复还需实机复测，不能将首轮 Native 失败记为成功。
+
+### 2026-09-28：Jetson FastMTP 4 位目标 + BF16 草稿层实测
+
+状态：`核心方法已在设备上验证；正式质量/性能评测待完成`。
+
+动机与修改：由于本机 15.17 GiB 统一内存不足以稳妥容纳 FastMTP 四个 BF16 分片
+（14.59 GiB）及推理工作区，选用官方 FastMTP 目标 4 位、草稿层 BF16 的组合，保持
+RAVEN 树验证实现。首次 Native 启动时 vLLM 将目标量化配置继承到草稿层，导致 BF16
+权重形状断言；只在草稿层构造期间暂置该量化配置。将 Jetson 默认上下文设为 1024，
+因 256 MiB KV 实测仅提供 1760 token，原 2048 默认值无法启动。
+
+受影响文件：`README.md`、`scripts/install.sh`、`scripts/cuda_env.sh`、
+`scripts/serve_fastmtp_verified.sh`、`scripts/prepare_fastmtp_jetson.sh`、
+`scripts/serve_fastmtp_jetson.sh`、`remtp/jetson_bf16_draft.py`、
+`remtp/fastmtp_verified_worker.py`、`plan/raven-jetson-r39.md`、
+`doc/RESULT-RAVEN-R39.2.1.md`、`doc/upstream-changes/CHANGELOG.md` 及本日志。
+
+验证与结果：安装脚本复跑成功，完整 CPU 套件 340 通过、2 跳过；Target、Native、
+Adaptive RAVEN 的服务健康检查和 32-token HTTP 生成均成功。RAVEN 32-token 请求
+16 个验证轮次均为一次 Target forward，4 次 residual target anchor 命中。官方
+GSM8K test 固定 3 条冒烟：Adaptive RAVEN 105 轮均为一次 Target forward，平均
+7.257 个验证节点，32 次 residual target anchor 命中；1/3 正确、2/3 达到
+128-token 截断，decode 2.648 tok/s、E2E 2.555 tok/s、MAL 3.229。
+Native 使用同一模型、抽样、温度、seed 和输出上限：1/3 正确、3/3 截断，
+decode 2.553 tok/s、E2E 2.476 tok/s、MAL 2.777。原始数据保存在本地忽略目录
+`results/raven_jetson_gsm8k3_{adaptive,native}/`，RAVEN 逐轮审计在
+`results/raven_jetson_smoke_rounds.jsonl`。后续同协议 uniform RAVEN 也完成：
+1/3 正确、2/3 截断，decode 2.573 tok/s、E2E 2.485 tok/s、MAL 3.181；
+116 轮均为一次 Target forward、35 次 residual target anchor 命中，审计中的
+adaptive 开关均为 false。数据在本地
+`results/raven_jetson_gsm8k3_uniform/` 与
+`results/raven_jetson_uniform_rounds.jsonl`。三组样本 manifest 一致；
+数据规模不足以评价质量或速度差异。
+
+限制：尚未完成分支推荐的五方法 GSM8K/HumanEval 100+100 对比；当前用户无法访问
+Docker daemon，HumanEval 受限执行评分不可用。4 位目标与原始 BF16 目标的质量差异
+未测量。RAVEN 松弛改变输出分布，仍为近似方法。
+
+### 2026-09-29：Jetson 五方法 GSM8K 100 题正式对照启动
+
+状态：`历史启动记录；768-token 长跑已暂停，诊断见下一节`。
+
+动机与修改：3 题冒烟的 128-token 上限导致大量 `finish_reason=length`，不能用于
+判断方法质量。新增独立的设备版 GSM8K 入口，在同一 FastMTP 4 位 Target/BF16
+草稿层、同一 100 题抽样、temperature 0.6、generation seed 42、空 system prompt
+与 no-thinking 模板下，依次测 Native、Cactus、SpecCascade、uniform RAVEN、adaptive
+RAVEN。沿用原 `remtp.gsm8k_benchmark` 的请求、答案解析与断点逻辑；不修改方法实现。
+固定样本中的最长提示约 209 token，本机服务最大上下文 1024，因此输出上限设置为
+768 token，而非上游通用脚本的 2048 token。脚本写入 `protocol.json`，重启时拒绝
+混用不同协议。
+
+受影响文件：新增 `scripts/run_jetson_raven_gsm8k.sh`；更新
+`plan/raven-jetson-r39.md`、`doc/RESULT-RAVEN-R39.2.1.md`、
+`doc/upstream-changes/CHANGELOG.md` 及本日志。
+
+验证：Shell 语法和 `git diff --check` 通过，100 题运行已在
+`results/raven_jetson_gsm8k_n100_r39/` 启动；正式准确率、截断率、吞吐和树审计
+需待各方法结束后写入。运行中的请求按题保存，可续跑。
+首次入口把服务日志写到评测输出目录，评测器按设计拒绝已有目录，故没有生成任何样本；
+已将日志改存独立 `logs/` 子目录并重新启动。该失败不计作模型或方法负结果。
+
+限制：本机 Docker socket 无访问权限，且 `sudo -n` 需要密码，HumanEval 受限执行
+评分不能启动；因此本轮只覆盖 GSM8K。768-token 输出上限也与上游 2048-token
+协议不同，报告必须显式标注，不得和原仓库数字直接合表。
+
+### 2026-09-29：正式评测质量诊断与无人值守控制器准备
+
+状态：`质量诊断中；正式五方法结果未形成`。
+
+动机与修改：首轮 100 题 Native 的第一题在 768-token 输出上限仍以 `length`
+停止，约耗时 299 秒，内容反复自我修正，未给出可靠最终答案；随后主动暂停长跑，
+保留 1 题 checkpoint，避免数十小时后仍只有高截断率结果。曾在隔离诊断中尝试
+NF4 动态 BitsAndBytes 加载，Target 与 RAVEN 能启动，但短题仍截断，故实验入口
+未保留在仓库。设备评测脚本增加 KV、上下文和最长输入的协议检查；续跑时若树审计
+跨进程不完整，明确不生成完整树统计。准备用户级 systemd 服务以在协议稳定后进行
+无人值守运行，失败重启并依靠逐题 checkpoint 续跑。
+
+受影响文件：`scripts/run_jetson_raven_gsm8k.sh`、
+`scripts/status_jetson_raven_gsm8k.sh`、`deploy/remtp-raven-gsm8k.service`、
+`plan/raven-jetson-r39.md`、`doc/RESULT-RAVEN-R39.2.1.md`、
+`doc/upstream-changes/CHANGELOG.md` 及本日志。模型 NF4 诊断目录与输出只在忽略的
+`models/`、`results/` 和 `/tmp` 中。曾临时新增 `remtp/jetson_bnb_entry.py`
+与修改 `scripts/serve_fastmtp_verified.sh` 的 NF4 分支，因未验证质量收益已撤回。
+
+验证与结果：原始 128-token 冒烟中的多次截断来自输出上限；提高到 768 后仍有
+首题截断，说明不是 128 单一限制。默认 FP4 Target 在“只给答案”提示下有一道题
+97 token 正常结束并答对，另一道题仍在 256 token 截断；开启原生思考模板的题目在
+384 token 仍截断。NF4 Target 与 RAVEN 均能启动并完成 32-token 请求，RAVEN 16 轮
+均一次 Target forward，但数道 NF4 诊断题仍会在 128/256/384 token 截断，不能声称
+量化类型是唯一原因或 NF4 已提高质量。4 位 Target 在 4096 上下文、1 GiB KV 配置
+下已健康，KV 容量为 7280 token，运行时 `MemAvailable` 约 2.9–3.2 GiB；正用
+2048-token 上限检查已完成：同一题生成满 2048 token 仍以 `length` 停止，末尾
+重复题干。原评测器提取末尾数字 20，碰巧等于 gold 20，说明截断输出的 last-number
+fallback 可产生伪正确。设备报告额外计算严格正确数：必须正常 `stop` 且最后一行
+为正确的 `#### <number>`，并同时保留仓库原有准确率以便对照。
+
+追查本日志 `2026-08-09：FastMTP verified pilot 慢速诊断` 发现，原 RTX 4090
+路径的 GSM8K 10 条平均生成 1,019.7 token，HumanEval 10 条平均
+1,737.1 token，且已观察到重复推导。因而“输出冗长”有原模型/评测协议层面的
+历史证据，不能将其单独归咎于 Jetson 或 FP4。为优先保留原版质量协议，控制器
+拟用 GSM8K 原版 2048-token 上限、4096 上下文和 1 GiB KV，仍固定 no-thinking
+模板、同模型同题同 seed；该配置还需通过长上下文 RAVEN 实机请求。
+
+限制：HumanEval 评分仍无 Docker 权限。NF4 未选为正式路径，正式质量协议未确定；
+systemd 配置尚未启动。`loginctl enable-linger apex` 已成功，用户级服务在 SSH/对话
+断开后可继续运行。控制器单元已链接到
+`~/.config/systemd/user/remtp-raven-gsm8k.service`，目前保持 inactive；新增
+`scripts/status_jetson_raven_gsm8k.sh` 供查看服务及逐方法断点。不得把首题
+checkpoint 或 NF4 短诊断计作正式五方法结果。
+
+### 2026-09-29：原版输出上限的 Jetson GSM8K 五方法无人值守运行
+
+状态：`历史启动记录；正式 GSM8K 100 题五方法已于 2026-09-30 完成，见下节`。
+
+动机与修改：质量优先，因此把设备正式协议改为仓库 GSM8K 原定的
+`max_tokens=2048`，本机服务最大上下文 4096、KV 预算 1 GiB。固定 FastMTP
+4 位 Target、BF16 草稿层、100 条相同题目、temperature 0.6、seed 42、空 system
+prompt 和 no-thinking 模板。新增严格正确数：只有服务正常 `stop`，且输出最后一行
+恰为正确的 `#### <number>` 才计入；同时保留原仓库准确率，避免截断输出末尾偶然
+数字造成伪正确。评测脚本在启动前核对最长 prompt 与上下文预算，使用文件锁防止
+重复实例，协议不同时拒绝混用，失败或中断后按请求 checkpoint 续跑。
+
+受影响文件：`scripts/run_jetson_raven_gsm8k.sh`、
+`scripts/status_jetson_raven_gsm8k.sh`、`deploy/remtp-raven-gsm8k.service`、
+`plan/raven-jetson-r39.md`、`doc/RESULT-RAVEN-R39.2.1.md`、
+`doc/upstream-changes/CHANGELOG.md` 及本日志。
+
+验证：Target 在 4096 上下文、1 GiB KV 健康启动，KV 容量 7280 token，系统
+`MemAvailable` 约 2.9–3.2 GiB。单道 GSM8K 在 2048 token 仍截断，末尾复述题干；
+原评测器却提取到碰巧正确的最后数字 20，严格指标会将该类输出排除。Cactus、
+SpecCascade、uniform RAVEN、adaptive RAVEN 均在同配置完成 HTTP `/health` 和
+32-token 生成；两组树各 16 轮均一次 Target forward，adaptive 开关分别为
+false/true。完整 Shell 语法、Python 编译、systemd unit 校验和 `git diff --check`
+通过。`loginctl` 确认 `Linger=yes`，用户服务已 `enabled`、`active`，Native 的
+100 题 benchmark 已创建 manifest 并开始逐题生成。运行协议在本地忽略的
+`results/raven_jetson_gsm8k_n100_fp4_2048/protocol.json`，结束后脚本自动写
+`comparison.md` 与 `COMPLETE`。
+
+限制：此处只启动并验证运行，尚无正式五方法准确率或吞吐结论；长跑预计很久。
+FastMTP/MiMo RL 的冗长输出是原仓库历史已知现象，4 位量化的额外质量影响未定量。
+HumanEval 执行评分仍被 Docker socket 权限阻挡。关闭对话不影响已启用的用户级
+systemd 服务；设备关机后服务会随用户 manager 重新启动并按 checkpoint 续跑。
+
+### 2026-09-30：Jetson 五方法 GSM8K 100 题正式结果
+
+状态：`GSM8K 五方法完成；HumanEval 未运行`。
+
+改动与受影响文件：核对无人值守评测结果，更新
+`doc/RESULT-RAVEN-R39.2.1.md`、`plan/raven-jetson-r39.md`、
+`doc/upstream-changes/CHANGELOG.md` 和本日志；算法、模型权重与评测脚本未改。
+本地实验产物位于忽略的
+`results/raven_jetson_gsm8k_n100_fp4_2048/`，包括固定协议、五组各 100 条
+逐题记录、汇总、树审计、`comparison.md` 和 `COMPLETE`。五组抽样 manifest
+完全一致。协议是 FastMTP 默认 FP4 Target、BF16 MTP 草稿层、GSM8K test
+固定 100 题、temperature 0.6、generation seed 42、2048 输出上限、4096
+上下文、1 GiB KV、空 system prompt、no-thinking。
+
+验证与结果：`scripts/status_jetson_raven_gsm8k.sh` 显示五组均 complete；
+`systemctl --user show` 显示 `Result=success`、退出码 0、服务 inactive；
+`COMPLETE` 标记为 `2026-09-30 21:09:56 UTC`。Native、Cactus、SpecCascade、
+uniform、adaptive 的原仓库准确率分别为 88/100、83/100、88/100、91/100、
+86/100；要求正常停止且最后一行是正确 `#### <number>` 的严格正确数分别为
+70/100、63/100、69/100、68/100、64/100；截断数分别为 16、12、14、13、15；
+E2E tok/s 分别为 2.659、2.988、2.799、2.837、2.828；MAL 分别为
+2.911、3.272、3.068、3.469、3.476。RAVEN 两组树审计分别覆盖 19,878、
+19,108 轮，记录每轮一次 Target forward。最后一组结果写完后控制器曾以 127
+退出；systemd 自动重启，跳过五组已完成结果，并成功生成报告和完成标记，
+没有重复样本。
+
+限制：此为单次固定 100 题样本，不能断言方法间微小差异稳定；大量输出仍以
+2048-token 上限截断，原仓库回退到最后数字的答案解析会高估可靠的最终解答。
+HumanEval 执行评分仍受 Docker socket 权限限制，尚未完成 100+100 全套协议；
+4 位 Target 相对原始 BF16 的质量差异未测量。
+
+### 2026-09-30：中文正式报告与逐题结果分析
+
+状态：`已完成；仅重新生成报告，未重新运行模型`。
+
+修改与受影响文件：更新 `scripts/run_jetson_raven_gsm8k.sh` 的报告生成段，
+把 `comparison.md` 改为中文，新增正常结束且判对、每题平均输出、请求耗时中位数、
+uniform/adaptive 同题配对和树审计权重变化统计；已有 `COMPLETE` 标记不再因
+单纯重生成报告而改写时间。扩充 `doc/RESULT-RAVEN-R39.2.1.md` 的结果分析，
+更新 `doc/upstream-changes/CHANGELOG.md` 与本日志。评测请求、答案解析、模型
+及方法算法未改。本地忽略的 `results/raven_jetson_gsm8k_n100_fp4_2048/comparison.md`
+已按原记录重新生成。
+
+验证与结果：五方法各有 100 条唯一题目记录、相同样本 manifest；请求汇总的判对数
+和截断数与逐题记录一致。`bash -n` 通过，报告生成入口运行成功并跳过全部已完成
+方法。原仓库判对为 88、83、88、91、86；正常结束且判对为 82、81、81、83、80；
+严格最终行正确为 70、63、69、68、64。uniform/adaptive 原判分同题配对分别有
+5/0 道独有正确；adaptive 的实际松弛权重偏离基础权重的审计节点为 51,231，
+uniform 为 0。Cactus 总体端到端吞吐比 Native 高约 12.4%，但单题耗时中位数
+98.8 秒，高于 Native 的 80.6 秒；报告明确区分总体吞吐与单题耗时。
+
+限制：严格最终行指标会排除 boxed 等可能有效的答案格式；单次 100 题固定种子
+仍不足以断言小幅方法差异稳定。HumanEval 与 BF16 Target 对照尚未完成。
+
+### 2026-10-01：Adaptive RAVEN Jetson 正式结果瓶颈复核
+
+状态：`离线诊断完成；优化方案已记录，算法优化和新正式实验尚未执行`。
+
+修改与受影响文件：新增 `doc/ANALYSIS-RAVEN-GSM8K-2026-10-01.md`，更新
+`plan/raven-jetson-r39.md`、`doc/RESULT-RAVEN-R39.2.1.md`、
+`doc/upstream-changes/CHANGELOG.md` 与本日志。明确论文主对照为 Native、Cactus、
+SpecCascade，uniform 为自适应消融。运行代码与模型未改；离线统计写入本地忽略目录
+`results/raven_jetson_gsm8k_n100_fp4_2048/diagnosis.json`。
+
+验证与结果：完整读取两组树审计，结合五组 summary、requests 和 server 日志重新
+核算。Adaptive 相对 Cactus 的 MAL 高约 6.2%，总解码时间/验证轮数估算的轮成本
+高约 12.3%（1.2224 对 1.0885 秒），对应实际吞吐落后。Adaptive 的 129,166 个
+节点中 26,006 个（20.1%）为主路径备选 sibling 的后代；在当前 anchor verifier
+中不会继续走这些后代，审计中这类节点的 SELECTED 数为 0。同块 uniform 控制
+TV 为 0.24686，Adaptive 实际 0.17214，降低 30.3%；61.6% 块没有重新分配 TV，
+实际重新分配量仅为默认可用池的约 14.4%。访问过的主路径位置中，未发现接受概率
+低于 uniform 变换（1e-6 容差），平均接受概率增加约 0.35 个百分点。
+
+复核 Adaptive 相对 uniform 原判分少的 5 题：4 题重复推导至 2048-token 截断，
+1 题正常结束但重复计数；其中 1 题 uniform 也截断却由末尾数字判对。对 256 条
+既有审计、4 次回放测量轻量记录构建和 JSON 文件追加，耗时中位数约 0.38 ms/轮；
+该测试不含验证器或 GPU 同步，不能归因完整方法成本。回放临时文件已删除。
+
+限制：旧审计独立 target_forward_seconds 全为 0，未能分解 Tree Attention、
+MTP、验证、KV 各组件时间；约 1.156 秒持平 Cactus 的目标由现有吞吐比例推导，
+不是优化实测。局部 TV 节约不代表全序列质量保证。后续需验证输出/缓存语义并在
+独立校准数据选参，多 seed 留出复测；HumanEval 与 BF16 Target 对照仍未完成。
+
+### 2026-10-01：制定正确率优先的 Adaptive RAVEN 优化计划
+
+状态：`执行计划完成；实施与新评测待开始`。
+
+修改与受影响文件：新增 `plan/adaptive-raven-optimization.md`，更新
+`plan/raven-jetson-r39.md`、`doc/ANALYSIS-RAVEN-GSM8K-2026-10-01.md`、
+`doc/upstream-changes/CHANGELOG.md` 与本日志。原适配计划中的概要优化步骤明确标注
+已由新计划细化取代，避免两个执行入口产生冲突。
+
+计划：优先固定对照与 profiling，裁剪 anchor 模式不会使用的备选后代，再处理
+重复前缀、概率计算和规划同步成本；每项实现优化需核对概率、位置、KV 与随机流。
+随后比较 N=3/6/9，并在独立 GSM8K train 校准题上筛选参数；配置冻结后使用与
+旧诊断题不重叠的新 test 样本，对 Native/Cactus/SpecCascade/Adaptive 做三种子
+对照，uniform 为消融。沿用 systemd 无人值守机制并保持每个协议的独立断点。
+
+验证与结果：计划目标设为原仓库准确率及正常结束且判对尽量不下降、实际吞吐与
+耗时改善；先争取追平 Cactus，再以吞吐高至少 5% 为工程目标。时间预算据四种
+主方法旧记录约 25.3 小时/100 题对照推算，三种子约 76 小时量级。文档内容与
+既有诊断和协议核对。本次仅修改文档，没有运行新 GPU 实验或改变算法。
+
+限制：零质量下降与 5% 速度收益是目标，尚无优化后的实测保证；单次无显著差异
+不能证明质量相同。旧 100 题已用于诊断，不作为最终参数选择的独立测试证据。
+HumanEval 仍待 Docker 访问条件，当前验收范围为 GSM8K。
+# 2026-10-06：第四轮质量门槛拒绝与第五轮EOS单因素定位
+
+第五轮启动补记：首个 `adaptive_optimization_round5_20261006_eos01` 在0条请求时出现
+`TypeError: super(type, obj)`，原因是将Round4的零参super方法赋给仅继承Round2的兄弟类。
+尚未加载GPU模型，旧目录与failure保持原样。已改Round5继承Round4、明确调用Round2的公共初始化与报告；
+新增真实start_server包装路径的CPU测试，验证MRO委派和有效runtime选项。
+后续从新目录/新unit重新冻结启动；没有在失败冻结代码上补丁或重写失败记录。
+同时修正本轮报告通用模板中的历史128 token描述；本轮所有请求均2048预算。
+
+修复后实际验证：38项相关CPU测试通过（3.64秒）；py_compile、bash语法与git diff --check通过。
+`adaptive_optimization_round5_20261006_eos01_v2`纯CPU证据核对通过，
+已于2026-10-06 02:09 UTC启动 `remtp-adaptive-round5-eos01-v2.service`，Restart=no，Linger=yes。
+旧第五轮失败unit/冻结目录保持；最新第五轮入口指向v2，第四轮入口保持原失败结果。
+实机启动复核：模型加载成功（6.11GiB），/health及预热HTTP200；已开始1231/seed43实际重放，
+探针记录生成50token，unit active/running、NRestarts0。完整重放/质量仍未完成，不能声称已解决截断。
+
+状态：第四轮v3完成全部回归但候选拒绝；第五轮代码和CPU验证完成，准备后台GPU消融。
+
+- 核对failure/gate/逐题日志与systemd：721条主流水线请求保存，两个候选各48回归完成。
+  old判对44/48、正常结束且判对39、截断9；anchor为42/37/9；D4为40/38/10。
+  停止为candidate_gate/regression，NRestarts0；本次日志不支持CUDA崩溃或OOM解释。
+- 数值证据：长状态152+fresh344项raw逐位一致，top/EOS/TV/full-relative误差0，
+  最长实际前缀2167；不将这些有限检查推广为全输入或正确率证明。
+- 分析发现6条选参范围不足、截断题目迁移、真实错误答案与末尾数字fallback共存。
+  未保护自然诊断证实松弛可压低EOS，但没有直接证明已失败的受保护回归因果。
+- scripts/run_adaptive_round2.py仅增加默认兼容的EOS阈值/repeat开关透传。
+  scripts/run_adaptive_round5.py、launch_adaptive_round5.py、status_adaptive_round5.sh冻结old_eos01与anchor4_eos01，
+  控制4条原故障重放+4条候选诊断+96条完整回归；只读证据核对源码、运行协议、完整配对与评分。
+  不改Target数值路径、模型、temperature0.6、模板或2048输出预算；不强制EOS、不放宽质量门槛。
+- 新doc/ANALYSIS-ROUND4-QUALITY-REJECTION-2026-10-06.md、plan/adaptive-raven-round5-eos-2026-10-06.md、
+  doc/upstream-changes/target-probability-consistency/round5-quality-ablation-2026-10-06.md。
+  两份第四轮文档加历史通知，旧RESULT入口链接新分析/消融，不改第四轮原report或gate。
+- 实际验证：test_round5_controller、test_generation_guard、test_round4_controller、test_target_norm、
+  test_target_state_audit、test_target_probability_diagnostics共37项CPU测试通过（4.11秒）。
+  包含中等EOS质量保护与严格P/Q输出/RNG一致、不完整或不兼容参照拒绝。
+- 限制：阈值0.01尚未GPU验证，可能影响答案或吞吐；CPU测试不构成GPU质量成功。
+  新阶段最多104请求、无自动重试、72小时上限；训练通过后仍需要独立留出和三个基线正式对照，
+  本轮不会自动采用或声称达到论文目标。旧代码/失败结果/量化与环境保持可追溯。

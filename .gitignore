@@ -15,3 +15,5 @@ logs/
 dse_results/
 /docs/four_way_comparison_summary.md
 参考论文/
+data/gsm8k/train.jsonl
+deploy/**/*.tar.gz

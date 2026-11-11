@@ -246,13 +246,44 @@ def _set_builder_topology(builder: Any, topology: DynamicTreeTopology) -> None:
     current = builder.tree_attn_bias
     device = current.device
     dtype = current.dtype if current.dtype.is_floating_point else torch.float32
-    builder.tree_attn_bias = _prepare_tree_attn_bias(
-        choices,
-        _get_depth_counts(choices),
-        dtype=dtype,
-        device=device,
-    )
+    if os.getenv("REMTP_DYNAMIC_TREE_FAST_METADATA", "0") == "1":
+        # Same 0/-inf mask, built once per topology on the host and copied in
+        # one transfer instead of ~20 one-element device writes per call.
+        builder.tree_attn_bias = _cached_tree_attn_bias(
+            tuple(choices), dtype, device, _prepare_tree_attn_bias, _get_depth_counts
+        )
+    else:
+        builder.tree_attn_bias = _prepare_tree_attn_bias(
+            choices,
+            _get_depth_counts(choices),
+            dtype=dtype,
+            device=device,
+        )
     builder.reorder_batch_threshold = builder.tree_attn_bias.shape[0]
+
+
+_TREE_BIAS_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
+_TREE_BIAS_CACHE_LIMIT = 4096
+
+
+def _cached_tree_attn_bias(
+    choices: tuple[tuple[int, ...], ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    prepare: Any,
+    depth_counts: Any,
+) -> torch.Tensor:
+    """Return the read-only tree mask for ``choices``; values equal ``prepare``."""
+    key = (choices, dtype, str(device))
+    bias = _TREE_BIAS_CACHE.get(key)
+    if bias is None:
+        ordered = list(choices)
+        host = prepare(ordered, depth_counts(ordered), dtype=dtype, device=torch.device("cpu"))
+        bias = host.to(device)
+        if len(_TREE_BIAS_CACHE) >= _TREE_BIAS_CACHE_LIMIT:
+            _TREE_BIAS_CACHE.clear()
+        _TREE_BIAS_CACHE[key] = bias
+    return bias
 
 
 def _set_target_tree_topology(runner: Any) -> None:
@@ -618,12 +649,15 @@ def _dynamic_propose_tree(
             ),
         }
     ]
-    for rank, token in enumerate(root_ids):
+    # One device transfer for all root candidates; the values are the same
+    # float32 entries that float(root_q[int(token)]) read one by one.
+    root_probabilities = root_q[root_ids].tolist()
+    for rank, (token, probability) in enumerate(zip(root_ids, root_probabilities)):
         path = (rank,)
         token_by_path[path] = token
         q_by_path[path] = root_q
         hidden_by_path[path] = root_hidden
-        log_q_sum[path] = math.log(max(float(root_q[int(token)]), 1e-30))
+        log_q_sum[path] = math.log(max(probability, 1e-30))
 
     topology = DynamicTreeTopology.from_paths(tuple(token_by_path))
     fixed._RUNTIME.topology = topology
@@ -708,9 +742,12 @@ def _dynamic_propose_tree(
                     "proposal_role": proposal_role,
                 }
             )
-            for local_rank, token in enumerate(candidate_ids):
+            candidate_probabilities = parent_q[row, candidate_ids].tolist()
+            for local_rank, (token, probability) in enumerate(
+                zip(candidate_ids, candidate_probabilities)
+            ):
                 path = parent_path + (local_rank,)
-                token_probability = max(float(parent_q[row, int(token)]), 1e-30)
+                token_probability = max(probability, 1e-30)
                 path_log = log_q_sum[parent_path] + math.log(token_probability)
                 value = path_expansion_value(path_log, depth, config)
                 proposed.append(
@@ -786,20 +823,32 @@ def _dynamic_propose_tree(
 
     # Materialize the final dynamic topology and all branch-local draft KV.
     current_paths = list(topology.choices)
-    node_tokens = {
-        index: token_by_path[path] for index, path in enumerate(current_paths)
-    }
-    node_hidden = {
-        index: hidden_by_path[path] for index, path in enumerate(current_paths)
-    }
-    _run_dynamic_tree_nodes(
-        self,
-        node_ids=list(range(len(current_paths))),
-        node_tokens=node_tokens,
-        node_hidden_inputs=node_hidden,
-        root_positions=positions,
-        base_common_metadata=common_attn_metadata,
-    )
+    if (
+        os.getenv("REMTP_DYNAMIC_TREE_SKIP_DEAD_DRAFT_KV", "0") == "1"
+        and not config.prune_anchor_descendants
+    ):
+        # The outputs of this pass are discarded and its only side effect is
+        # draft-layer KV for the tree nodes.  Every cumulative MTP pass
+        # rewrites its own node slots before attending, and the next round's
+        # first MTP pass rewrites slots root+1..root+nodes+1 from the target
+        # hidden states, so nothing ever reads that KV.  Skip the forward and
+        # tell the path commit there is no draft KV to move.
+        fixed._RUNTIME.draft_slots = None
+    else:
+        node_tokens = {
+            index: token_by_path[path] for index, path in enumerate(current_paths)
+        }
+        node_hidden = {
+            index: hidden_by_path[path] for index, path in enumerate(current_paths)
+        }
+        _run_dynamic_tree_nodes(
+            self,
+            node_ids=list(range(len(current_paths))),
+            node_tokens=node_tokens,
+            node_hidden_inputs=node_hidden,
+            root_positions=positions,
+            base_common_metadata=common_attn_metadata,
+        )
 
     ids = torch.stack([token_by_path[path] for path in current_paths]).to(torch.int32)
     probs = torch.stack([q_by_path[path] for path in current_paths]).contiguous()
@@ -851,13 +900,24 @@ def _dynamic_verify_dispatch(*args: Any, **kwargs: Any) -> Any:
         protected = frozenset(n.index for n in args[0].nodes
                               if n.path == (0,) * n.depth) if repetition else frozenset()
         from remtp.decision_trace import active_trace
+        trace = active_trace()
+        if os.getenv("REMTP_DYNAMIC_TREE_FAST_VERIFY", "0") == "1" and trace is None:
+            from remtp.raven_fast_path import residual_hit_tree_verify_fast
+            fast_result = residual_hit_tree_verify_fast(
+                *args,
+                **kwargs,
+                config=config,
+                protected_node_indices=protected,
+            )
+            if fast_result is not None:
+                return fast_result
         return residual_hit_tree_verify(
             *args,
             **kwargs,
             config=config,
             protected_node_indices=protected,
             lazy_residual=os.getenv("REMTP_DYNAMIC_TREE_LAZY_RESIDUAL", "0") == "1",
-            decision_trace=active_trace(),
+            decision_trace=trace,
         )
     branching = construction.get("branching", [])
     if branching and bool(branching[0].get("forced_top1")):
@@ -889,6 +949,27 @@ def _anchor_batched_logits(self: Any, hidden_states: torch.Tensor) -> Any:
     return None if logits is None else logits[:1]
 
 
+def _install_fast_select(config: Any) -> None:
+    """Rebind the sampled-primary proposal helpers to the two-transfer versions."""
+    global _sample_q_token, _sample_branch_q_token, _cactus_trunk_children
+    from remtp import fixed6_vllm as fixed
+    from remtp import raven_fast_path as fast
+
+    if config.support_mode not in fast.SAMPLED_PRIMARY_MODES or config.anchor_only_proposal:
+        raise ValueError(
+            "REMTP_DYNAMIC_TREE_FAST_SELECT requires a sampled-primary tree mode "
+            "without anchor-only proposal"
+        )
+    _sample_q_token = fast.sample_q_token_fast
+    _sample_branch_q_token = fast.sample_branch_q_token_fast
+    _cactus_trunk_children = fast.cactus_trunk_children_fast
+    fixed._temperature_probs = fast.temperature_probs_fast
+    print(
+        "[ReMTP][DynamicTree] fast candidate selection: two device transfers per parent",
+        flush=True,
+    )
+
+
 def install_mimo_dynamic_tree() -> None:
     global _INSTALLED, _ORIGINAL_TREE_RUN
     if _INSTALLED:
@@ -902,6 +983,22 @@ def install_mimo_dynamic_tree() -> None:
     # forward. It only gives shared runtime code a valid initial topology.
     fixed._RUNTIME.topology = DynamicTreeTopology.from_paths(((0,),))
     fixed._RUNTIME.dynamic_construction = None
+    if os.getenv("REMTP_DYNAMIC_TREE_FAST_SELECT", "0") == "1":
+        _install_fast_select(config)
+    if os.getenv("REMTP_DYNAMIC_TREE_FAST_VERIFY", "0") == "1":
+        print("[ReMTP][DynamicTree] fast residual-hit verification: batched transfers", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_FAST_COMMIT", "0") == "1":
+        print("[ReMTP][DynamicTree] fused KV path commit across layers", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_FAST_COMMIT", "0") == "2":
+        print("[ReMTP][DynamicTree] in-place ordered KV path commit, identity moves skipped", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_FAST_METADATA", "0") == "1":
+        print("[ReMTP][DynamicTree] cached host-built tree masks and position offsets", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_SKIP_DEAD_DRAFT_KV", "0") == "1":
+        if config.prune_anchor_descendants:
+            raise RuntimeError("REMTP_DYNAMIC_TREE_SKIP_DEAD_DRAFT_KV is only validated without anchor pruning")
+        print("[ReMTP][DynamicTree] dead draft KV skipped: no final tree rematerialization, no draft KV commit", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_PATH_ORDERED_FIRST_PASS", "0") == "1":
+        print("[ReMTP][DynamicTree] first MTP pass reordered to the accepted path (changes proposals)", flush=True)
 
     eagle = importlib.import_module("vllm.v1.spec_decode.eagle")
     runner_module = importlib.import_module("vllm.v1.worker.gpu_model_runner")

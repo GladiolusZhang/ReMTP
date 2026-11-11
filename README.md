@@ -1,5 +1,33 @@
 # RAVEN / ReMTP
 
+> 第三层开销优化与通宵结果（2026-11-11，UTC+8）：通宵 GSM8K-100 上优化后 RAVEN 89/100、E2E 2.773 tok/s、MAL 3.471（原 RAVEN 2.612，Cactus 2.833）；Spec-Bench 70 次请求 E2E 2.336 对 Cactus 2.306（单次运行，不作显著性声明）。下午完成第三层（跳过死的草稿 KV、树元数据缓存、原地路径提交），三道 GSM8K 题逐 token 等价、每轮 1.2385 → 1.2155 s；4090 未测。汇总与移植步骤见 `doc/PORTING-RAVEN-OVERHEAD-OPTIMIZATIONS-2026-11-11.md`，全天实验输出 `results/day_20261111/`。
+
+> 每轮开销优化（2026-11-10，UTC+8）：定位出 RAVEN 比 Cactus 每轮多约 172 ms 的来源——canonical 树注意力逐节点扫前缀（随上下文增长）与 Python 编排里约 100 次主机/设备同步（固定）。两层等价优化已实机验证：`REMTP_CANONICAL_TREE_ATTENTION=0`（原生 qq_bias 树注意力，探针确认掩码正确、输出至多差 1 个 bf16 ulp）和 `REMTP_DYNAMIC_TREE_FAST_SELECT=1`/`REMTP_DYNAMIC_TREE_FAST_VERIFY=1`（输出与参考逐 token 相同）。三题实测每轮 1.306→1.241 s，仍未追平 Cactus；第三层候选与全部数字见 [结果文档](doc/RESULT-RAVEN-OVERHEAD-OPTIMIZATION-2026-11-10.md)。默认开关全部保持原值。
+>
+> 采用结论更新（2026-10-14，UTC+8）：按用户转述的组长意见，deep4_conservative（D4/N12）因树预算大于原Adaptive RAVEN（D3/N9），不予采用。下方D4对D3的数值改善保留为历史配置实验，不能作为相同树预算的方法改进证据。后续固定D3/N9优化，目标仍为正确率不下降且速度超过Native、Cactus、SpecCascade。[相同树预算优化计划](plan/adaptive-raven-equal-budget-2026-10-14.md)。
+
+> 完整结果（2026-10-13，UTC+8）：100+100五方法20:59:11正常结束，1000生成/500判题、exit0，独立CPU核验通过。deep在两任务点结果上超过Native；对Cactus仍少1/2道正确且吞吐低5.41%/6.63%，对Spec整题时间更长，目标尚未达到。原Adaptive的GSM8K正确率最高88%；deep的HumanEval63%、相对原方法整题−15.05%。[中文完整结果与分析](doc/RESULT-RAVEN-100X100-2026-10-13.md)，[CSV](results/raven_full_100x100_20261010/summary.csv)。当前无后台实验，下方恢复/运行描述为历史快照。
+
+> 续跑更新（2026-10-12，UTC+8）：断电重启后600生成/230判题完整核验并保留，12:57:46后台恢复；关机前的Spec44候选代码OOM误分类已单独修复登记，原冻结生成代码/数据/种子不变。SpecCascade判题已补齐，总判题300/500，正在继续两RAVEN的余400生成。[恢复记录与再次续跑命令](doc/RESUME-RAVEN-100X100-2026-10-12.md)，[实时报告](doc/RESULT-RAVEN-100X100-LIVE.md)。下方启动/停止状态均保留为当时快照。
+
+> 当前正式复现（2026-10-10）：用户确认原协议GSM8K100+HumanEval100及原种子，11:22:57后台已启动；100参考解与错误控制判题通过，Native health/预热/Worker核对通过，正式生成进行中。[启动配置与验收](doc/RESULT-RAVEN-100X100-2026-10-10.md)，[实时中文报告](doc/RESULT-RAVEN-100X100-LIVE.md)，进度`bash scripts/status_raven_full_benchmark.sh`。本轮只运行三基线、优化前原方法和deep4_conservative，不自动继续优化；下方“无新后台”等状态均为历史快照。
+
+> 最新完成（2026-10-10，UTC+8）：优势搜索00:32:59正常结束，112/112生成、7启动预热、exit0、0重试。当前修复配置下deep4_balanced对原B正确12→16/16、吞吐+2.36%、整题−4.99%；conservative14/16、整题−16.56%。两个D4通过对B/Native开发点门槛，仍未同时超过Cactus吞吐与SpecCascade整题耗时。独立CPU核验112payload/64复现/12比较通过。[中文结果与分析](doc/RESULT-RAVEN-DOMINANCE-2026-10-10.md)。当前无新后台；以下运行/准备状态按当时历史保留。
+
+> 当前后台（2026-10-09 11:24 UTC+8核验）：新目标112完整生成搜索已运行，原B健康/预热通过、首题1532/42生成中，尚无新质量/速度结论；22项CPU/真实preflight/source hash通过。[实时中文报告](doc/RESULT-RAVEN-DOMINANCE-LIVE.md)，查询bash scripts/status_raven_dominance.sh。以下“预检中”为启动前历史状态。
+
+> 当前目标更新（2026-10-09）：用户明确不要求减少截断，只以原评分正确率与实际速度超过Native/Cactus/SpecCascade评价。新门槛和三个Adaptive候选的112完整请求搜索已实现，CPU预检中；[新执行计划](plan/adaptive-raven-dominance-2026-10-09.md)，[目标/优化范围](doc/OBJECTIVE-RAVEN-DOMINANCE-2026-10-09.md)。以下截断/正常结束硬门槛属于旧目标，历史结果保留。
+
+> 最新研究（2026-10-09）：重新以原Adaptive RAVEN（B）为基准。CPU核验定位5处真实验收翻转，26组共同前缀完整帧P/Q/RNG一致；新计划先验证B行为等价计算优化，再独立研究完整分布质量约束。[失败机制与截断解释](doc/RESEARCH-RAVEN-BASELINE-2026-10-09.md)；[步骤、预期效果与有限预算](plan/adaptive-raven-baseline-optimization-2026-10-09.md)。研究完成，新GPU尚未启动，最终三基准目标仍未达成。
+
+> 最新完结（2026-10-09核验）：根因与target_odds修复单元已在10月8日正常完成，exit0、0重试。80条五方法校准完整：原B12判对/10正常结束判对/6截断，候选10/8/8；候选对B吞吐-1.16%、整题+16.87%，对三基准联合门槛均未通过，未采用。两单元各12现场Target raw、48 CUDA验收及独立CPU核验通过。[中文结果与分析](doc/RESULT-RAVEN-TARGET-ODDS-2026-10-09.md)。以下准备/运行状态为历史；当前没有新后台实验，最终目标仍未达成。
+
+> 当前定位与修复（2026-10-08）：原B根因诊断09:26 UTC+8冻结启动，10:11完成4/6自然轨迹；已证明预算可能放大局部偏差。Target相对支持约束已实现，130项算法/87项最终控制器CPU检查和冻结check-only通过，10:17:42后台轻量等待依赖成功后自动重跑。[中文根因](doc/ROOT-CAUSE-ADAPTIVE-RAVEN-2026-10-08.md)；[修复计划](plan/adaptive-raven-target-odds-repair-2026-10-08.md)；[实时中文报告](doc/RESULT-RAVEN-TARGET-ODDS-REPAIR-LIVE.md)，查询bash scripts/status_raven_risk_repair.sh。下方“当前无后台”只描述上一单元完结时，最终质量/速度目标仍未达成。
+
+> 最新完成（2026-10-08）：复审证据单元06:25 UTC+8正常结束，74主HTTP完成；五个实际晚段raw门槛和B16输出签名复现通过。四方法校准B原判对12/16、截断6/16，吞吐低于Cactus9.70%，质量/速度目标未达成。[中文结果与原因分析](doc/RESULT-RAVEN-REVIEW-EVIDENCE-2026-10-08.md)；[控制器报告](doc/RESULT-RAVEN-REVIEW-LIVE.md)。当前无后台实验，`bash scripts/status_raven_review_unit.sh`用于查询已结束单元。
+
+> 当前审查入口（2026-10-07）：[全项目审查、目标与优化判断](doc/REVIEW-ADAPTIVE-RAVEN-PROJECT-2026-10-07.md)；[新的执行优先级与有限预算](plan/adaptive-raven-project-review-optimization-2026-10-07.md)。MTP修复已完成，懒残差没有实测加速；cap2因质量门槛拒绝。当前仍未完成新数值配置下的三基准正式比较。
+
 本分支的当前方法是面向 native MTP 的 RAVEN：以 FastMTP 的完整 proposal
 distribution 构造三步主路径和稀疏备选树，在一次目标模型 Tree Attention
 验证后进行候选条件化概率接受；主路径拒绝时先从残差分布采样 correction，随后通过
@@ -9,6 +37,16 @@ token-ID 精确匹配复用已验证 sibling 状态。当前推荐配置进一�
 研究过程、失效路线、协议变化和验证状态统一记录在
 [研究与开发总日志](docs/research_and_development_log.md)。模型、数据、实验结果与运行日志
 保存在本地忽略目录，不随代码上传。
+
+Jetson Orin NX（R39.2.1）的 4 位 FastMTP + BF16 草稿层适配、实测结果和
+运行限制见 [设备适配记录](doc/RESULT-RAVEN-R39.2.1.md)。该设备的服务入口是
+`./scripts/serve_fastmtp_jetson.sh`。
+
+2026-10-04 的历史 Target 数值一致性修复见
+[中文修复记录](doc/FIX-TARGET-PROBABILITY-CONSISTENCY-2026-10-04.md)。
+已拒绝cap2单元的历史状态入口为 `bash scripts/status_raven_probability_cap.sh`；
+该单元结果见 [历史中文阶段分析](doc/RESULT-RAVEN-PROBABILITY-CAP-2026-10-07.md)。
+第三轮查询脚本仅用于历史单元。新的审查计划第一单元已完成；当前数据未满足三个主基线的质量/速度门槛，独立正式测试尚未执行。
 
 ## 当前推荐流程：FastMTP + RAVEN
 

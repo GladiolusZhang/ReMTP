@@ -20,6 +20,11 @@ def install_target_numerics():
     if os.getenv('REMTP_CANONICAL_TREE_ATTENTION','0')=='1':
         from remtp.canonical_tree_attention import install_canonical_tree_attention
         install_canonical_tree_attention()
+    probe_path=os.getenv('REMTP_TREE_ATTENTION_PROBE_JSONL','')
+    if probe_path:
+        # Diagnostic only; installed after the canonical switch so it wraps the active path.
+        from remtp.tree_attention_probe import install_tree_attention_probe
+        install_tree_attention_probe(probe_path,int(os.getenv('REMTP_TREE_ATTENTION_PROBE_LIMIT','400')))
     if os.getenv('REMTP_TARGET_ATTENTION_FP32','0')=='1':
         from vllm.v1.attention.ops import triton_unified_attention
         from remtp.target_attention_fp32 import kernel_unified_attention_2d
