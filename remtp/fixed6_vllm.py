@@ -230,6 +230,61 @@ def _tree_positions(
     return root + offsets.unsqueeze(0)
 
 
+def _draft_tree_metadata(base: Any, query_start_loc: torch.Tensor,
+                         root_position: int, count: int) -> Any:
+    """Expose the committed prefix and current BFS nodes, excluding old branches.
+
+    The incoming metadata comes from vLLM's padded first MTP pass and still
+    counts every row of the previous target step (anchor plus all tree
+    nodes).  TreeAttention reads keys ``[0, seq_len - count)`` as context and
+    ``[seq_len - count, seq_len)`` as the masked tree part, while this pass
+    writes its nodes at ``root+1..root+count``.  ``base.seq_lens + count``
+    therefore exposed rejected/stale slots and read the tree part from slots
+    this pass never wrote.  The valid draft prefix ends at ``root_position``.
+    (Ported from Jetson commit 0481325, where it was located on GPU.)
+    """
+    length = root_position + 1 + count
+    updates: dict[str, Any] = dict(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=torch.tensor([0, count], dtype=torch.int32),
+        seq_lens=torch.full_like(base.seq_lens, length),
+        max_seq_len=length,
+        num_actual_tokens=count,
+        max_query_len=count,
+    )
+    # Host shadows/caches derived from the old lengths must not survive.
+    for stale in ("_seq_lens_cpu", "_num_computed_tokens_cpu", "_num_computed_tokens_cache"):
+        if hasattr(base, stale):
+            updates[stale] = None
+    return replace(base, **updates)
+
+
+def _draft_common_metadata(base: Any, query_start_loc: torch.Tensor,
+                           root_position: int, count: int) -> Any:
+    """Draft-tree metadata; ``REMTP_DRAFT_TREE_LEGACY_METADATA=1`` restores the
+    pre-2026-11-12 lengths (reads stale KV) only for A/B measurement."""
+    if os.getenv("REMTP_DRAFT_TREE_LEGACY_METADATA", "0") == "1":
+        return replace(
+            base,
+            query_start_loc=query_start_loc,
+            seq_lens=base.seq_lens + count,
+            num_actual_tokens=count,
+            max_query_len=count,
+        )
+    return _draft_tree_metadata(base, query_start_loc, root_position, count)
+
+
+def _compact_draft_tree_bias(bias: torch.Tensor) -> torch.Tensor:
+    """The kernel uses row stride as logical width; singleton slices lie.
+
+    Tensor.contiguous() preserves the parent's row stride for a 1x1 view.
+    A compact clone makes width equal row stride and excludes adjacent bytes.
+    """
+    if bias.numel() and (bias.stride(0) != bias.shape[1] or bias.stride(1) != 1):
+        return bias.clone(memory_format=torch.contiguous_format)
+    return bias
+
+
 def _run_draft_tree_nodes(
     self: Any,
     *,
@@ -257,20 +312,18 @@ def _run_draft_tree_nodes(
 
     # The physical cache slots are unique BFS offsets. Logical RoPE positions
     # are branch depths; these two notions must not be conflated.
-    common = replace(
-        base_common_metadata,
-        query_start_loc=count * self.arange[:2],
-        seq_lens=base_common_metadata.seq_lens + count,
-        num_actual_tokens=count,
-        max_query_len=count,
+    flat_root = int(root_positions.reshape(-1)[0].item())
+    common = _draft_common_metadata(
+        base_common_metadata, count * self.arange[:2], flat_root, count,
     )
     attn_metadata = builder.build_for_drafting(
         common_attn_metadata=common,
         draft_index=max(_RUNTIME.topology.nodes[index].depth for index in node_ids),
     )
     attn_metadata.max_seq_len = min(attn_metadata.max_seq_len, self.max_model_len)
+    if os.getenv("REMTP_DRAFT_TREE_LEGACY_METADATA", "0") != "1":
+        attn_metadata.tree_attn_bias = _compact_draft_tree_bias(attn_metadata.tree_attn_bias)
 
-    flat_root = int(root_positions.reshape(-1)[0].item())
     physical_positions = torch.arange(
         flat_root + 1,
         flat_root + count + 1,

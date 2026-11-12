@@ -3588,6 +3588,8 @@ HEAD 即上游 `3afafa1`，`git diff 3afafa1..HEAD` 为空，`remtp/` 无本地�
 这只影响草稿分布 Q 的质量（验证使用记录下来的 Q），Jetson 在 `0481325` 用
 `_draft_tree_metadata` 修过；本次按范围要求未移植，如需处理应单独做对照实验。
 
+> 后续注记（2026-11-12）：用户随后要求修复此问题，已在下一条记录中移植该修复，本段“未修改”仅描述当时状态。
+
 受影响文件：
 
 - `remtp/raven_fast_path.py`、`remtp/raven_fast_commit.py`：新增（来自 44dec73，按上面适配）；
@@ -3609,3 +3611,55 @@ token id 和轮数；(b) 两种设置的每轮耗时及 proposal/验证/cache �
 `raven_adaptive_n100` 协议（GSM8K 100 + HumanEval 100，temperature=0.6，seed=42）重跑基线与
 RAVEN uniform/adaptive 的开关全关、全开。在这些完成之前，不能说这些开关在 4090 上
 “更快”或与原实现“逐 token 相同”。
+
+### 2026-11-12：修复草稿树 forward 的注意力元数据（移植 Jetson 0481325 的 `_draft_tree_metadata`）
+
+状态：`代码修复完成并默认生效；CPU 测试通过；4090 GPU 未运行`
+
+用户要求修复上一条记录中“读代码时的附带发现”。`fixed6_vllm._run_draft_tree_nodes`（fixed6、
+MiMo 树和动态树 RAVEN 的全部草稿树 forward 都经过它）原来用
+`seq_lens = base.seq_lens + count`，`base` 来自 padded 首遍，长度包含上一步 target 的全部
+行。TreeAttention 把 `[0, seq_len - count)` 当作上下文、`[seq_len - count, seq_len)` 当作带
+树掩码的查询部分，而本次 forward 的节点写在 `root+1..root+count`，因此上下文里混入了被
+拒绝节点和本轮节点（无掩码），查询部分读的是本轮没有写过的槽位，结果依赖 KV 分配历史。
+Jetson 在 `0481325` 用真实 GPU 快照定位过同一问题（root=114、target `seq_lens=123`，多读 8 个
+旧 speculative 槽位），修复后前缀缓存开/关与重启的输出相同、提案 Q 的 TV=0；这些是
+Jetson 记录中的结果，本机没有重做。
+
+改动：
+
+- 新增 `_draft_tree_metadata`：`seq_lens = max_seq_len = root+1+count`，`query_start_loc_cpu`
+  改为 `[0, count]`，清除由旧长度派生的 `_seq_lens_cpu`、`_num_computed_tokens_cpu` 以及
+  vLLM 0.18 新增的 `_num_computed_tokens_cache`（Jetson 版没有最后这一项）；
+- 新增 `_compact_draft_tree_bias`：`build_for_drafting` 切出的 1×1 bias 经 `.contiguous()` 后
+  仍保留父张量行步长，kernel 会把步长当列宽；仅在步长不匹配时复制成紧凑张量；
+- 新增 `_draft_common_metadata` 与开关 `REMTP_DRAFT_TREE_LEGACY_METADATA=1`：只用于在 GPU
+  上 A/B 量化本修复的影响，恢复旧长度且不做 bias 压缩，默认关闭；
+- 物理写槽、RoPE 位置、首遍根分布、接受规则、RNG 顺序和树预算均未改。修复会改变深度
+  2~3 的草稿隐状态，从而改变提案分布 Q，因此输出不会与修复前逐 token 相同。2026-08-19
+  `raven_adaptive_n100` 及更早的树方法结果都是旧元数据下产生的。
+
+与已移植开关的关系：上一条对 3a（SKIP_DEAD_DRAFT_KV）的分析不依赖这里的长度；Jetson 验证
+44dec73 时运行的正是带本修复的代码，所以修复后本机与 Jetson 验证的配置更接近。
+
+仍未解决：上下文槽位 `S+1..S+a` 存的仍是 padded 首遍按 BFS 行 1..a 写入的草稿 KV，而不是
+接受路径节点；根行自身的草稿 KV 在 BFS 行号对应的槽位。只有已移植但默认关闭、会改变 Q
+且尚未验证的 `REMTP_DYNAMIC_TREE_PATH_ORDERED_FIRST_PASS=1` 处理这一点。
+
+受影响文件：
+
+- `remtp/fixed6_vllm.py`：草稿树元数据、bias 压缩和 A/B 开关；
+- `tests/test_draft_tree_metadata.py`：拷贝 Jetson 的 8 项回归（不同树大小、初次 prefill、
+  只改变被拒绝槽位内容时输出不变），新增 3 项（`_num_computed_tokens_cache` 清除、
+  legacy 开关、在真实 vLLM 0.18 `CommonAttentionMetadata` 上 `replace` 与派生长度正确）；
+- `docs/research_and_development_log.md`：本条记录及上一条的后续注记。
+
+验证：CPU 上新测试文件 11 项与三个 RAVEN 开关测试文件共 62 项通过；完整 `pytest -q` 402 项
+通过、2 项失败（仍是 `models/FastMTP` 不在仓库下导致的模板测试，与本次改动无关）；
+`compileall`、`git diff --check` 通过。
+
+限制与待办：4090 上没有运行任何 GPU 测试。迁移到新服务器后至少需要：(1) 短 GPU 冒烟，确认
+启动和草稿树 forward 正常；(2) 同 prompt/seed 的重复运行或前缀缓存开/关对照，确认输出
+不再依赖 KV 分配历史；(3) 用 `REMTP_DRAFT_TREE_LEGACY_METADATA=1` 做 A/B，量化对接受率/MAL
+的影响。上一条列出的开关等价性验证、耗时测量和数据集重测仍待完成；开关等价性对比应在
+同一份元数据代码下进行（两边同为修复后的默认）。
