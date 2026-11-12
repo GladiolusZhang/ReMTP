@@ -196,15 +196,32 @@ def _sample_rows(
     )
 
 
+_OFFSET_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
+
+
+def _offset_tensor(values: tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Small read-only device tensor; cached when FAST_METADATA is on."""
+    if os.getenv("REMTP_DYNAMIC_TREE_FAST_METADATA", "0") != "1":
+        return torch.tensor(values, dtype=dtype, device=device)
+    key = (values, dtype, str(device))
+    cached = _OFFSET_CACHE.get(key)
+    if cached is None:
+        if len(_OFFSET_CACHE) >= 4096:
+            _OFFSET_CACHE.clear()
+        cached = torch.tensor(values, dtype=dtype, device=device)
+        _OFFSET_CACHE[key] = cached
+    return cached
+
+
 def _tree_positions(
     root_positions: torch.Tensor,
     topology: Fixed6Topology,
     node_indices: list[int],
 ) -> torch.Tensor:
-    offsets = torch.tensor(
-        [topology.nodes[index].depth for index in node_indices],
-        device=root_positions.device,
-        dtype=root_positions.dtype,
+    offsets = _offset_tensor(
+        tuple(topology.nodes[index].depth for index in node_indices),
+        root_positions.dtype,
+        root_positions.device,
     )
     if root_positions.ndim == 1:
         root = root_positions.reshape(-1)[0]
@@ -433,10 +450,56 @@ def _propose_with_sampling_metadata(self: Any, *args: Any, **kwargs: Any) -> Any
     if sampling_metadata is None:
         raise RuntimeError("Fixed-6 requires keyword sampling_metadata")
     self._fixed6_sampling_metadata = sampling_metadata
+    if (
+        _RUNTIME.target_tree_active
+        and _RUNTIME.selected_nodes
+        and os.getenv("REMTP_DYNAMIC_TREE_PATH_ORDERED_FIRST_PASS", "0") == "1"
+    ):
+        kwargs = _path_ordered_first_pass(kwargs, _RUNTIME.selected_nodes)
     try:
         return original(self, *args, **kwargs)
     finally:
         del self._fixed6_sampling_metadata
+
+
+def path_first_row_order(selected: tuple[int, ...], rows: int) -> list[int]:
+    """Target-row order that puts the anchor and the accepted path first.
+
+    Target row zero is the anchor and node ``i`` is row ``i + 1``.  The rows
+    that were not accepted follow in their original order as padding.
+    """
+    head = [0] + [int(index) + 1 for index in selected]
+    if len(set(head)) != len(head) or max(head) >= rows:
+        raise RuntimeError(f"invalid selected path {selected} for {rows} target rows")
+    taken = set(head)
+    return head + [row for row in range(rows) if row not in taken]
+
+
+def _path_ordered_first_pass(kwargs: dict[str, Any], selected: tuple[int, ...]) -> dict[str, Any]:
+    """Feed the first MTP pass the accepted path instead of BFS rows.
+
+    vLLM's first pass writes draft KV for target row ``i`` at slot ``i`` of
+    the step and lets the sampled row attend to rows ``0..i``.  For a chain
+    those rows are exactly the accepted prefix.  For a BFS tree they include
+    rejected siblings, and the committed draft prefix keeps their KV.  Putting
+    the path rows first restores the chain invariant: slots ``0..a`` hold
+    (target hidden of path node ``j``, token of path node ``j + 1``) and the
+    sampled row ``a`` attends to the anchor and the accepted path only.  This
+    changes the proposal distribution Q, not the verification rule.
+    """
+    ids = kwargs["target_token_ids"]
+    order = path_first_row_order(selected, int(ids.shape[0]))
+    index = torch.tensor(order, device=ids.device, dtype=torch.int64)
+    positions = kwargs["target_positions"]
+    updated = dict(kwargs)
+    updated["target_token_ids"] = ids[index]
+    updated["target_positions"] = positions[index] if positions.ndim == 1 else positions[:, index]
+    updated["target_hidden_states"] = kwargs["target_hidden_states"][index]
+    sample = kwargs["token_indices_to_sample"]
+    if sample is None or sample.numel() != 1:
+        raise RuntimeError("path-ordered first pass requires one padded request")
+    updated["token_indices_to_sample"] = torch.full_like(sample, len(selected))
+    return updated
 
 
 def _selected_target_hidden_row() -> int:
@@ -485,10 +548,10 @@ def _prepare_target_tree_inputs(self: Any, *args: Any, **kwargs: Any) -> Any:
 
     input_count = node_budget + 1
     positions = self._get_positions(input_count)
-    offsets = torch.tensor(
-        (0,) + _RUNTIME.topology.node_position_offsets,
-        dtype=positions.dtype,
-        device=positions.device,
+    offsets = _offset_tensor(
+        (0,) + tuple(_RUNTIME.topology.node_position_offsets),
+        positions.dtype,
+        positions.device,
     )
     if positions.ndim == 1:
         positions[:input_count] = positions[0].clone() + offsets
@@ -818,7 +881,18 @@ def _compact_selected_path(self: Any, output_token_ids: torch.Tensor, scheduler_
         _RUNTIME.target_gdn_state_rows = None
         return original(self, output_token_ids, scheduler_output)
     selected = _RUNTIME.selected_nodes
-    if selected and _RUNTIME.target_slots is not None:
+    commit_mode = os.getenv("REMTP_DYNAMIC_TREE_FAST_COMMIT", "0")
+    if selected and _RUNTIME.target_slots is not None and commit_mode == "2":
+        # Same slot moves, one copy per layer and moved node, no scratch.
+        from remtp.raven_fast_commit import commit_selected_slots_inplace
+
+        commit_selected_slots_inplace(self, selected)
+    elif selected and _RUNTIME.target_slots is not None and commit_mode == "1":
+        # Same slot moves as below, fused across layers (see raven_fast_commit).
+        from remtp.raven_fast_commit import commit_selected_slots_fused
+
+        commit_selected_slots_fused(self, selected)
+    elif selected and _RUNTIME.target_slots is not None:
         from vllm.model_executor.layers.attention.attention import Attention
 
         source = torch.tensor(

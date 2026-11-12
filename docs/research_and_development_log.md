@@ -3527,3 +3527,85 @@ GSM8K/HumanEval 数据、Docker 镜像和 8000 端口检查通过；运行 `git 
 限制：FastMTP checkpoint、数据集、`results/`、`logs/` 和 `paper_zh/` 均保持本地，不纳入
 本次代码发布。当前推荐协议面向单 GPU、`max_num_seqs=1` 和 vLLM 0.18.0；自适应松弛的
 质量—MAL 权衡仍需使用 README 中的实际 benchmark 命令在目标 GPU 上复核。
+
+### 2026-11-12：移植 Jetson 提交 44dec73 的 RAVEN 每轮开销优化（开关默认关闭，GPU 验证未做）
+
+状态：`代码移植完成；CPU 单元测试通过；GPU 逐 token 等价性验证、每轮耗时测量和数据集重测均未运行`
+
+来源与范围：只移植 `origin/jetson-r39-residual-adapt` 上的提交 `44dec73`（Jetson Orin NX
+上的 RAVEN residual_hit_anchor D3/N9 每轮开销优化），说明见 Jetson 检出目录
+`doc/PORTING-RAVEN-OVERHEAD-OPTIMIZATIONS-2026-11-11.md`。未合入提交 `0481325` 的任何内容
+（FP4 数值补丁 `target_numerics`、`jetson_bf16_draft`、canonical tree attention、重复保护、
+决策追踪、anchor 剪枝、anchor-only proposal、Q 合法性检查、草稿树元数据修复等）。本机
+HEAD 即上游 `3afafa1`，`git diff 3afafa1..HEAD` 为空，`remtp/` 无本地改动。
+
+改动：
+
+- 直接拷贝 `remtp/raven_fast_path.py`、`remtp/raven_fast_commit.py` 和
+  `tests/test_raven_fast_path.py`、`tests/test_raven_fast_commit.py`、
+  `tests/test_raven_third_layer.py`；
+- 钩子补丁 `deploy/raven_overhead_port_20261111/raven_overhead_hooks.patch`：
+  `fixed6_vllm.py` 4 个 hunk 全部打上；`dynamic_tree_vllm.py` 7 个 hunk 打上 6 个，失败的
+  `_dynamic_verify_dispatch` 一处手工合并；`target_numerics.py` 一处跳过（本机没有该文件，
+  它只挂注意力探针）；
+- 按本机签名做的适配：
+  1. `dynamic_tree_vllm.py` 去掉对本机 `DynamicTreeConfig` 不存在的字段
+     `prune_anchor_descendants`（SKIP_DEAD_DRAFT_KV 条件和启动检查）与
+     `anchor_only_proposal`（FAST_SELECT 检查）的引用，否则开关一开就 AttributeError；
+  2. `_dynamic_verify_dispatch`：`REMTP_DYNAMIC_TREE_FAST_VERIFY=1` 时对四种 residual-hit
+     模式先试快速验证，返回 `None` 再走参考实现；本机没有决策追踪和保护节点参数；
+  3. `residual_hit_tree_verify_fast` 删去 `protected_node_indices` 参数、EOS 保护/风险策略/
+     概率上限的提前返回、`adaptive_risk_mode` 分支和 `relaxation_protected`/
+     `target_eos_probability` 诊断字段，与本机 `residual_hit_tree_verify` 一致；
+  4. 候选选择去掉 Jetson 版 `cactus_trunk_children_fast` 的 Q 合法性检查（抛错）及
+     `valid` 字段：本机 `_sample_q_token`/`_cactus_trunk_children` 没有
+     `_validate_proposal_probs`，保留抛错会让非法 Q 在快速路径报错、在参考路径继续；
+  5. `tests/test_raven_fast_path.py` 相应删去保护节点参数，把“非法 Q 抛错”改为“非法 Q
+     （全零、NaN）与参考实现结果相同”，删去 EOS 保护回退断言；另外两个测试文件未改。
+- 新开关全部默认关闭：`REMTP_DYNAMIC_TREE_FAST_SELECT`、`FAST_VERIFY`、
+  `FAST_COMMIT=1/2`、`FAST_METADATA`、`SKIP_DEAD_DRAFT_KV`，以及会改变 Q 的
+  `PATH_ORDERED_FIRST_PASS`（随 44dec73 移植，不在计划验证的开关组合内）。接受规则、
+  松弛参数、树预算未改。唯一无开关的改动是 `_dynamic_propose_tree` 中两处
+  `float(q[int(token)])` 循环改为一次 `q[ids].tolist()`；CPU 上随机 2000 组张量逐元素比较
+  0 处不同，GPU 上尚未对比。
+- 第 4 项 `REMTP_CANONICAL_TREE_ATTENTION=0`：本机没有 `canonical_tree_attention.py`，
+  `remtp/`、`scripts/` 中没有任何地方读取该变量，2026-08-19 `raven_adaptive_n100` 的服务
+  日志里没有 “canonical ancestor KV reads, zero KV copies”，target 使用 vLLM 原生
+  `TREE_ATTN`。判定该项在本机不相关，不设置；GPU 运行时需在新启动日志里再确认一次。
+- 3a（跳过最后一次草稿树 forward 与草稿 KV 路径提交）前提的读代码核对：本机脚本未设
+  `disable_padded_drafter_batch`，走 `prepare_inputs_padded`；target 第 t 步锚点在槽位
+  `S`、共 `n` 个树节点时，下一次 `EagleProposer.propose` 首遍 forward 写草稿 KV 到
+  `S..S+n`，覆盖上一轮最后一次树 forward 写的 `S..S+n-1` 和草稿路径提交的目的槽位
+  `S..S+a-1`；首遍之前没有其他读草稿层 KV 的操作。这一结论只来自读代码，必须由 GPU
+  逐 token 对比确认。
+
+读代码时的附带发现（未修改、未实验验证）：本机 `fixed6_vllm._run_draft_tree_nodes` 用
+`seq_lens = base.seq_lens + count`，`base` 是 padded 首遍的元数据（`S+n+1`，包含上一棵树
+全部 BFS 行）。vLLM 0.18 `triton_unified_attention` 以 `context_len = seq_len - query_len`
+划分前缀与查询，查询部分的 key 从位置 `S+n+1..S+n+count` 读取，而节点 KV 写在
+`root+1..root+count`（`root = S+a`）。两者在 `a < n` 时不对齐：草稿节点会在无掩码的前缀
+里看到本轮其他节点和上一棵树被拒绝行的草稿 KV，查询部分读到的是未写入本轮节点的槽位。
+这只影响草稿分布 Q 的质量（验证使用记录下来的 Q），Jetson 在 `0481325` 用
+`_draft_tree_metadata` 修过；本次按范围要求未移植，如需处理应单独做对照实验。
+
+受影响文件：
+
+- `remtp/raven_fast_path.py`、`remtp/raven_fast_commit.py`：新增（来自 44dec73，按上面适配）；
+- `remtp/dynamic_tree_vllm.py`、`remtp/fixed6_vllm.py`：开关钩子；
+- `tests/test_raven_fast_path.py`、`tests/test_raven_fast_commit.py`、
+  `tests/test_raven_third_layer.py`：新增等价性测试；
+- `docs/research_and_development_log.md`：本条记录。
+
+验证：在 CPU 上（`CUDA_VISIBLE_DEVICES=""`）运行三个新测试文件，51 项通过；
+`test_dynamic_mtp_tree.py`、`test_fixed6_microtree.py`、`test_cactus_mtp.py`、
+`test_tree_audit.py` 共 70 项通过；完整 `pytest -q` 391 项通过、2 项失败，失败的是
+`test_fastmtp_no_think_template.py` 的两项，原因是 `models/FastMTP` 目录已不在仓库下
+（模型现位于 `~/桌面/models/`），与本次改动无关。`compileall` 和 `git diff --check` 通过。
+
+限制与待办：RTX 4090 当时被另一个 sglang 进程占用 23.4/24.5 GB 显存，用户决定暂缓 GPU
+部分。因此尚未完成：(a) 用 2~3 个固定 prompt/seed 比较开关全关与
+`FAST_SELECT/FAST_VERIFY/FAST_COMMIT=2/FAST_METADATA/SKIP_DEAD_DRAFT_KV` 全开的输出
+token id 和轮数；(b) 两种设置的每轮耗时及 proposal/验证/cache 更新分段耗时；(c) 按
+`raven_adaptive_n100` 协议（GSM8K 100 + HumanEval 100，temperature=0.6，seed=42）重跑基线与
+RAVEN uniform/adaptive 的开关全关、全开。在这些完成之前，不能说这些开关在 4090 上
+“更快”或与原实现“逐 token 相同”。
