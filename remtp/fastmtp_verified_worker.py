@@ -10,6 +10,8 @@ from vllm.v1.worker.gpu_worker import Worker
 
 def _install_fastmtp_runtime() -> None:
     """Make the one physical trained head explicit and recursively reuse it."""
+    from remtp.cuda_spin_wait import install_cuda_spin_wait
+    install_cuda_spin_wait()
     from remtp.target_numerics import install_target_numerics
     install_target_numerics()
     from remtp.mimo_mtp import install_mimo_mtp_runtime
@@ -32,10 +34,29 @@ def _install_optional_profile() -> None:
         from remtp.runtime_profile import install_runtime_profile
 
         install_runtime_profile()
+    if os.environ.get("REMTP_GPU_EVENT_TIMING_JSONL"):
+        from remtp.gpu_event_timing import install_gpu_event_timing
+
+        install_gpu_event_timing()
+    if os.environ.get("REMTP_HOST_TIMELINE_JSONL"):
+        from remtp.host_timeline import install_host_timeline
+
+        install_host_timeline()
+    if os.environ.get("REMTP_TORCH_TRACE_JSON"):
+        from remtp.torch_trace import install_torch_trace
+
+        install_torch_trace()
+    if os.environ.get("REMTP_ROUND_LOG_JSONL"):
+        # Last install: its wrappers must be outermost around every method hook.
+        from remtp.round_logger import install_round_logger
+
+        install_round_logger()
 
 
 class FastMTPVerifiedTargetWorker(Worker):
     def init_device(self, *args: Any, **kwargs: Any) -> Any:
+        from remtp.cuda_spin_wait import install_cuda_spin_wait
+        install_cuda_spin_wait()
         from remtp.target_numerics import install_target_numerics
         install_target_numerics()
         from remtp.target_diagnostics import install_target_diagnostics

@@ -88,8 +88,19 @@ def test_candidate_selection_matches_reference(sharp: float, ratio: float) -> No
 def test_candidate_selection_defers_to_reference_on_ties() -> None:
     config = DynamicTreeConfig(max_depth=3, max_nodes=9, max_children_per_parent=3,
                                min_sibling_ratio=0.01, support_mode="residual_hit_anchor")
+    # Ties below min_draft_prob cannot change the decision (2026-11-13): no deferral,
+    # identical selection.
     probs = torch.full((500,), 1.0 / 500)
     probs[7] = 0.3
+    probs = probs / probs.sum()
+    reference = select_dynamic_candidates(probs, depth=1, config=config)
+    fast = select_dynamic_candidates_fast(probs, depth=1, config=config)
+    assert not fast.used_reference
+    _assert_same_selection(fast.selection, reference)
+    # A tie among choosable values still defers to the stable full sort.
+    probs = torch.full((500,), 1.0 / 500)
+    probs[7] = 0.3
+    probs[11] = probs[13] = 0.1
     probs = probs / probs.sum()
     reference = select_dynamic_candidates(probs, depth=1, config=config)
     fast = select_dynamic_candidates_fast(probs, depth=1, config=config)

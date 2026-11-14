@@ -240,7 +240,8 @@ def dynamic_tree_config_from_env() -> DynamicTreeConfig:
     return config
 
 
-def _set_builder_topology(builder: Any, topology: DynamicTreeTopology) -> None:
+def _set_builder_topology(builder: Any, topology: DynamicTreeTopology, *,
+                          persistent: bool = False) -> None:
     from vllm.v1.attention.backends.tree_attn import (
         TreeAttentionMetadataBuilder,
         _get_depth_counts,
@@ -267,6 +268,11 @@ def _set_builder_topology(builder: Any, topology: DynamicTreeTopology) -> None:
             device=device,
         )
     builder.reorder_batch_threshold = builder.tree_attn_bias.shape[0]
+    if persistent:
+        # CUDA graphs (2026-11-13): same mask values, in the captured buffer.
+        from remtp.tree_cudagraph import write_persistent_mask
+
+        write_persistent_mask(builder, builder.tree_attn_bias)
 
 
 _TREE_BIAS_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
@@ -296,10 +302,13 @@ def _cached_tree_attn_bias(
 def _set_target_tree_topology(runner: Any) -> None:
     from remtp import fixed6_vllm as fixed
 
+    from remtp.tree_cudagraph import tree_cudagraph_enabled
+
     topology = fixed._RUNTIME.topology
+    persistent = tree_cudagraph_enabled()
     for groups in runner.attn_groups:
         for group in groups:
-            _set_builder_topology(group.get_metadata_builder(), topology)
+            _set_builder_topology(group.get_metadata_builder(), topology, persistent=persistent)
 
 
 def _prepare_dynamic_target_inputs(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -611,19 +620,29 @@ def _dynamic_propose_tree(
             "sampled-primary tree modes need at least one node per trunk depth"
         )
     root_q = fixed._temperature_probs(logits[:1], sampling_metadata)[0]
+    # One host transfer per tree level instead of three per parent (2026-11-13).
+    batch_select = sampled_primary_mode and _BATCH_SELECT
+    batched_pending: list[tuple[dict[str, Any], Any]] = []
     if sampled_primary_mode:
         sampled_root = _sample_q_token(root_q, sampling_metadata)[0]
         root_backup_budget = min(
             config.max_children_per_parent - 1,
             max(config.max_nodes - config.max_depth, 0),
         )
-        root_ids, root_selection = _cactus_trunk_children(
-            root_q,
-            sampled_root,
-            depth=1,
-            backup_budget=root_backup_budget,
-            config=config,
-        )
+        if batch_select:
+            from remtp.raven_fast_path import batched_trunk_children
+            root_item = batched_trunk_children(
+                [root_q], [sampled_root], depth=1, backup_budget=root_backup_budget, config=config,
+            )[0]
+            root_ids, root_selection = root_item.candidate_ids, root_item
+        else:
+            root_ids, root_selection = _cactus_trunk_children(
+                root_q,
+                sampled_root,
+                depth=1,
+                backup_budget=root_backup_budget,
+                config=config,
+            )
         forced_root = False
     else:
         root_selection = select_dynamic_candidates(
@@ -658,7 +677,11 @@ def _dynamic_propose_tree(
     ]
     # One device transfer for all root candidates; the values are the same
     # float32 entries that float(root_q[int(token)]) read one by one.
-    root_probabilities = root_q[root_ids].tolist()
+    if batch_select:
+        batched_pending.append((construction[0], root_item))
+        root_probabilities = root_item.candidate_probs
+    else:
+        root_probabilities = root_q[root_ids].tolist()
     for rank, (token, probability) in enumerate(zip(root_ids, root_probabilities)):
         path = (rank,)
         token_by_path[path] = token
@@ -701,8 +724,33 @@ def _dynamic_propose_tree(
         proposed: list[tuple[float, tuple[int, ...], torch.Tensor, torch.Tensor, torch.Tensor, float]] = []
         level_entropies: list[float] = []
         trunk_proposal_path = (0,) * depth
+        if batch_select:
+            from remtp.raven_fast_path import batched_trunk_children
+            # Same draws in the same per-generator order as the per-parent loop.
+            sampled_tokens = [
+                _sample_q_token(parent_q[row], sampling_metadata)[0]
+                if parent_path == (0,) * (depth - 1)
+                else _sample_branch_q_token(
+                    parent_q[row], sampling_metadata,
+                    parent_path=parent_path, proposal_round=proposal_round,
+                )[0]
+                for row, parent_path in enumerate(parent_paths)
+            ]
+            level_items = batched_trunk_children(
+                [parent_q[row] for row in range(len(parent_paths))], sampled_tokens,
+                depth=depth, backup_budget=config.max_children_per_parent - 1, config=config,
+            )
         for row, parent_path in enumerate(parent_paths):
-            if sampled_primary_mode:
+            if batch_select:
+                is_primary_parent = parent_path == (0,) * (depth - 1)
+                selection = level_items[row]
+                candidate_ids = selection.candidate_ids
+                proposal_role = (
+                    "sampled-primary-with-backups"
+                    if is_primary_parent
+                    else "sampled-recovery-branch-with-backups"
+                )
+            elif sampled_primary_mode:
                 is_primary_parent = parent_path == (0,) * (depth - 1)
                 sampled_token = (
                     _sample_q_token(parent_q[row], sampling_metadata)[0]
@@ -749,7 +797,11 @@ def _dynamic_propose_tree(
                     "proposal_role": proposal_role,
                 }
             )
-            candidate_probabilities = parent_q[row, candidate_ids].tolist()
+            if batch_select:
+                batched_pending.append((construction[-1], selection))
+                candidate_probabilities = selection.candidate_probs
+            else:
+                candidate_probabilities = parent_q[row, candidate_ids].tolist()
             for local_rank, (token, probability) in enumerate(
                 zip(candidate_ids, candidate_probabilities)
             ):
@@ -822,6 +874,13 @@ def _dynamic_propose_tree(
         topology = DynamicTreeTopology.from_paths(tuple(token_by_path))
         fixed._RUNTIME.topology = topology
 
+    if batched_pending:
+        from remtp.raven_fast_path import resolve_batched_counts
+        resolve_batched_counts([item for _, item in batched_pending])
+        for row, item in batched_pending:
+            row["eligible"] = item.candidate_count_before_budget
+            row["threshold_eligible"] = item.threshold_candidate_count
+
     # Keep original proposal/budget decisions; rematerialize KV with new indices.
     unpruned_node_count = topology.node_count
     if config.prune_anchor_descendants:
@@ -873,11 +932,19 @@ def _dynamic_propose_tree(
         "branching": construction,
     }
 
-    return [
-        ids[list(topology.level_nodes(depth))].view(1, -1)
-        for depth in range(1, topology.max_depth + 1)
-        if topology.level_nodes(depth)
-    ]
+    from remtp import raven_fast_path as fast
+
+    levels = [topology.level_nodes(depth) for depth in range(1, topology.max_depth + 1)]
+    if fast.ASYNC_HOST and all(
+        nodes == tuple(range(nodes[0], nodes[-1] + 1)) for nodes in levels if nodes
+    ):
+        # BFS levels are contiguous: a slice copy instead of a host-list index
+        # (which copies the index to the device synchronously).
+        return [ids[nodes[0]:nodes[-1] + 1].clone().view(1, -1) for nodes in levels if nodes]
+    return [ids[list(nodes)].view(1, -1) for nodes in levels if nodes]
+
+
+_BATCH_SELECT = False
 
 
 def _dynamic_verify_dispatch(*args: Any, **kwargs: Any) -> Any:
@@ -978,7 +1045,7 @@ def _install_fast_select(config: Any) -> None:
 
 
 def install_mimo_dynamic_tree() -> None:
-    global _INSTALLED, _ORIGINAL_TREE_RUN
+    global _INSTALLED, _ORIGINAL_TREE_RUN, _BATCH_SELECT
     if _INSTALLED:
         return
     from remtp import fixed6_vllm as fixed
@@ -992,6 +1059,11 @@ def install_mimo_dynamic_tree() -> None:
     fixed._RUNTIME.dynamic_construction = None
     if os.getenv("REMTP_DYNAMIC_TREE_FAST_SELECT", "0") == "1":
         _install_fast_select(config)
+    if os.getenv("REMTP_DYNAMIC_TREE_BATCH_SELECT", "0") == "1":
+        if os.getenv("REMTP_DYNAMIC_TREE_FAST_SELECT", "0") != "1":
+            raise ValueError("REMTP_DYNAMIC_TREE_BATCH_SELECT requires REMTP_DYNAMIC_TREE_FAST_SELECT=1")
+        _BATCH_SELECT = True
+        print("[ReMTP][DynamicTree] batched candidate selection: one transfer per tree level", flush=True)
     if os.getenv("REMTP_DYNAMIC_TREE_FAST_VERIFY", "0") == "1":
         print("[ReMTP][DynamicTree] fast residual-hit verification: batched transfers", flush=True)
     if os.getenv("REMTP_DYNAMIC_TREE_FAST_COMMIT", "0") == "1":
@@ -1006,6 +1078,17 @@ def install_mimo_dynamic_tree() -> None:
         print("[ReMTP][DynamicTree] dead draft KV skipped: no final tree rematerialization, no draft KV commit", flush=True)
     if os.getenv("REMTP_DYNAMIC_TREE_PATH_ORDERED_FIRST_PASS", "0") == "1":
         print("[ReMTP][DynamicTree] first MTP pass reordered to the accepted path (changes proposals)", flush=True)
+    from remtp import raven_fast_path as _fast
+    if _fast.ASYNC_HOST:
+        print("[ReMTP][DynamicTree] async host reads: pinned non-blocking copies, no scalar read-backs", flush=True)
+    if os.getenv("REMTP_TREE_CUDAGRAPH", "0") == "1":
+        from remtp.tree_cudagraph import install_tree_cudagraph
+
+        install_tree_cudagraph()
+    elif os.getenv("REMTP_TREE_HOST_METADATA", "0") == "1":
+        from remtp.tree_cudagraph import install_tree_host_metadata
+
+        install_tree_host_metadata()
 
     eagle = importlib.import_module("vllm.v1.spec_decode.eagle")
     runner_module = importlib.import_module("vllm.v1.worker.gpu_model_runner")

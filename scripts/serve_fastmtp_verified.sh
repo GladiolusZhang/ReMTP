@@ -48,6 +48,11 @@ common=(
 [[ -n "$KV_CACHE_MEMORY_BYTES" ]] && common+=(--kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES")
 [[ "$ENFORCE_EAGER" == "1" ]] && common+=(--enforce-eager)
 [[ "$NO_ASYNC_SCHEDULING" == "1" ]] && common+=(--no-async-scheduling)
+if [[ -n "${REMTP_COMPILATION_CONFIG:-}" ]]; then
+  [[ "$ENFORCE_EAGER" == "1" ]] && { echo "REMTP_COMPILATION_CONFIG requires ENFORCE_EAGER=0" >&2; exit 2; }
+  common+=(--compilation-config "$REMTP_COMPILATION_CONFIG")
+  echo "[ReMTP][FastMTPVerified] compilation_config=$REMTP_COMPILATION_CONFIG"
+fi
 case "${ENABLE_PREFIX_CACHING:-}" in
   0) common+=(--no-enable-prefix-caching) ;;
   1) common+=(--enable-prefix-caching) ;;

@@ -1,7 +1,121 @@
 # ReMTP 研究与开发总日志
 
-最后更新：2026-11-11（UTC+8）
+最后更新：2026-11-14（UTC+8）
 当前工作分支：`jetson-r39-residual-adapt`；上游研究分支：`research/residual-aligned-tree-mtp`
+
+## 2026-11-14（凌晨）：CUDA graph、CPU 调频与去同步
+
+- 用户同意两条工程优化同时做；不改算法是为了避免影响精度。所有改动都验证了同种子输出逐 token 相同（GSM8K 3 题，`results/cudagraph_ab_20261113/`）。
+- CUDA graph：
+  - 链式方法用 vLLM 自带的 FULL_DECODE_ONLY（`mode=0`，不经过 torch.compile，内核与 eager 相同）。
+  - RAVEN 新增 `remtp/tree_cudagraph.py`：子元数据从主机标量构建，去掉每次前向的两次 `.item()`；目标树掩码放进固定缓冲区；TREE_ATTN 声明完整图支持。GPU 内核逐位测试通过。
+- 发现 CPU 调频问题：调频器 `schedutil`，图模式下线程睡眠等待，CPU 降到约 740 MHz，Python 变慢一倍。`remtp/cuda_spin_wait.py`（`REMTP_CUDA_SPIN_WAIT=1`）让 CUDA 等待时自旋，CPU 保持约 1984 MHz。
+- `REMTP_DYNAMIC_TREE_ASYNC_HOST=1`：去掉 RAVEN 每轮约 10 次不必要的同步（可分页内存的 H2D 拷贝、`float()` 读温度、0 维 CUDA 张量做下标等）。
+- 解码吞吐（eager → 图模式 + 自旋）：AR 14.8 → 16.7、Native 19.4 → 23.7、Cactus 22.1 → 26.8、RAVEN 19.5 → 24.5 tok/s。RAVEN 比 Cactus 低 8%（原来低 12%），每轮还差约 11 ms。
+- 新增分析工具：`remtp/gpu_event_timing.py`（CUDA event 计 GPU 时间）、`remtp/host_timeline.py` + `scripts/analyze_host_timeline.py`（主机时间线和同步位置）；A/B 脚本记录每个请求的 CPU/GPU 频率分布，新增 `+cg/+spin/+async/+hostmeta/+native/+target` 臂。
+- 测试：`tests/test_tree_cudagraph.py`、`tests/test_async_host.py`，相关 150 项全部通过。
+- 小规模公平对比（HumanEval 前 30 题，512 token，四种方法同一套工程配置，`results/engopt_suite_20261114/`）：decode tok/s AR 16.2、Native 23.3、Cactus 25.5、RAVEN v4-safe 23.0；MAL Cactus 3.131、RAVEN 3.320；pass@1 22/24/24/23。三种推测方法的输出与 11-13 的 eager 运行全部逐 token 相同。RAVEN 有两题首次判分为 Docker 超时，重判通过并记录。
+- 新增 `doc/PORTING-RAVEN-V4-2026-11-14.md`：给 4090 的 v4-safe 移植说明（算法改动与工程改动分开列出）。
+- 详见 `doc/RESULT-RAVEN-V4-TARGET-GATE-2026-11-13.md` 第 10 节。
+
+## 2026-11-13（晚）：只改实现的工程优化与 CPU 时间线
+
+- 用户要求：只做工程优化，不改算法（包括草稿分布和提议规则）；草稿词表裁剪和固定形状的树都不采用。
+- 主机端优化（输出逐 token 相同）：
+  - 候选选择每个父节点的设备运算从约 72 个减到约 22 个（`batched_trunk_children`，GPU 上 799 个父节点逐位一致）；
+  - `normalize_rows_nosync` 少发射运算，均匀分布改为标量；`_boost_known` 去掉 clone；
+  - 自适应规划拆成 `_plan_vectors`（同一运算序列）、`_plan_from_values` 和 `adaptive_trunk_relaxation_plan_host`（读回后在 CPU 张量上计算；GPU 上 300 次快速验证与参考实现逐位一致，含随机数状态）；
+  - 165 项测试通过。
+- 干净对比（旧代码 worktree `/home/apex/ReMTP-residual-base` = HEAD 44dec73；3 题，416 轮，不开计时器，`results/engopt_ab_20261113/`）：每轮 0.1813 → 0.1802 → 0.1792 s（加批量选择后 −1.1%），输出逐 token 相同。此前用 `AB_PROFILE=1` 做的对比被不断增加的计时钩子污染，作废。
+- 新增 `remtp/torch_trace.py`（`REMTP_TORCH_TRACE_JSON`，A/B 脚本里的 `AB_TORCH_TRACE=1`）：
+  - 驱动设置 `RmProfilingAdminOnly=1`，只能抓 CPU 事件。
+  - 目标前向的 CPU 发射：Cactus 100.7 ms、RAVEN 85.9 ms（开着 profiler）；每层约 30 个运算，Python 开销分散，没有单一热点。不开 profiler 约 72 ms，按带宽估算 GPU 计算约 44 ms，所有方法都卡在 eager 发射上。
+- 下一步：CUDA graph（`ENFORCE_EAGER=1` 目前对所有方法都开着）的可行性和兼容性；RAVEN 树提议元数据准备和验证前后处理的 Python 开销。详见 `doc/RESULT-RAVEN-V4-TARGET-GATE-2026-11-13.md` 第 9 节。
+
+## 2026-11-13（下午）：RAVEN v4 目标支持度门槛、GPTQ 校准模型、分段计时与主机端开销
+
+- 状态：完成，初步结果。详见 `doc/RESULT-RAVEN-V4-TARGET-GATE-2026-11-13.md`。
+- **RAVEN v4（由目标模型决定在哪里松弛）**：
+  - `DynamicTreeConfig` 新增三个字段：`relaxation_min_target_probability`、`relaxation_min_target_ratio`、`adaptive_relaxation_pool`（取值 nominal/gated）；对应环境变量 `REMTP_DYNAMIC_TREE_RELAX_MIN_TARGET_PROB`、`_MIN_TARGET_RATIO`、`_ADAPTIVE_RELAX_POOL`；默认值保持旧行为。
+  - v4-safe 配置：门槛 p≥0.01，自适应上限 1.0；每个位置的接受概率 ≤ Cactus，门槛以下完全精确。
+  - 修正了规划器 docstring 中"实际松弛总量不超过静态控制"的错误说法（原实现只对名义额度成立）。
+  - `tests/test_target_support_gate.py` 15 项通过，其中一项检查"门槛只由目标决定"。
+  - 离线（按记录的随机数重放）比较后选择绝对门槛 1%：MAL −1.4%，p<1e-2 的接受从每千 token 13 个降到 0.9 个。
+- **RTN 模型 A/B**（HumanEval-30，输出上限 512，`results/raven_v4_ab_20261113/`）：
+  - MAL：Native 2.608，Cactus 2.909，v3 3.214，v4-safe 3.128，v4-gated 3.131。
+  - p<1e-3 接受/千 token：Cactus 3.33，v3 5.19，v4 0.09（精确约 0.1）。
+  - 每位置多接受的质量：Cactus 0.058，v3 0.072，v4 0.049。
+  - 用本次 v3 日志重放 v4-safe，估计 MAL 3.167（3.149~3.186），实测 3.128，在采样波动内一致。
+  - gated 与 safe 几乎相同，采用 safe。
+- **分段计时**（`results/w4a16_profile_20261113/`、`v4_batch_profile_20261113/`、`v4_tiefix_profile_20261113/`）：
+  - 草稿 LM head 每次 13.6 ms（约 91 GB/s），每轮 3 次加目标 1 次，约占一轮的 36%。
+  - RAVEN 每轮的模型计算约 139 ms，不比 Cactus 的约 144 ms 多，但墙钟多约 38 ms，都是 GPU 空等 CPU（每层的树提议决策和约 9 ms 的验证 Python 逻辑）。
+  - `remtp/runtime_profile.py` 补充了动态树的细分钩子。
+- **主机端开销的两处修改**（输出均逐 token 相同）：
+  - 批量候选选择 `REMTP_DYNAMIC_TREE_BATCH_SELECT`（`batched_trunk_children`，11 项等价测试）：每轮 −1.1%。
+  - 并列修复 `_relevant_tie`：只在可选值（≥ min_draft_prob）之间检查并列。此前每轮平均有 0.94 次回退到全词表稳定排序；原测试已相应修改。每轮再 −0.6%。
+  - 合计 0.1801 → 0.1771 s/轮。剩余约 35 ms 需要结构性改动。
+- **GPTQ 校准模型**（`scripts/quantize_fastmtp_w4a16_gptq.py` → `models/FastMTP-W4A16-GPTQ`）：
+  - 本机逐层流式量化，38 分钟；校准数据取自 venv 里的源码和包说明文档，不含评测数据。
+  - 留出文本上相对 BF16 的 KL（T=1）：GPTQ 0.123，bnb NF4 0.136，RTN 0.260；top-1 一致率 88.6% / 88.1% / 84.4%。
+  - 更正：vLLM 现场量化的 bnb 实际是 NF4，不是 FP4，之前文档里的 FP4 标注已改正。
+- **GPTQ 公平对比**（HumanEval-30，输出上限 512，`results/gptq_ab_20261113/`）：
+  - pass@1：Native、Cactus、SpecCascade 均为 24/30，v4-safe 23/30；RTN 时 Native 只有 12/30。
+  - MAL：Native 2.883，Cactus 3.131，SpecCascade 3.001，v4-safe 3.320（比 Cactus 高 6.0%）。
+  - p<1e-3 接受/千 token：Cactus 2.46，v4-safe 0，SpecCascade 0，Native 0。
+  - 每轮：链式方法 0.150 s，v4-safe 0.176 s；decode 比 Cactus 低 9.5%。
+- 测试：165 项树、快速路径、门槛、批量、日志测试全部通过。
+- 限制：每组只有 30 题、512 上限，pass@1 没有统计意义；本条的结论只依据分布指标和 MAL。
+
+## 2026-11-13：W4A16 + MAXN 全方法 HumanEval-100 套件完成与逐轮日志分析
+
+- 状态：完成。套件 2026-11-12 16:57 至 2026-11-13 07:48（14.9 小时），9 个阶段全部完成，无失败。RAVEN run1 的 HumanEval/123 被判题器记为 container_error：候选 `n = 3n+1` 永不终止，在内存上限处被杀（exit 137）；人工判错，已追加到 evaluation.jsonl（`adjudicated: manual`）。
+- pass@1（run1 / run2，合计）：AR 40；Native 40/43（41.5%）；Cactus 38/42（40.0%）；SpecCascade 38/39（38.5%）；RAVEN v3 33/39（36.0%）。按题 bootstrap 95% 区间：RAVEN−Cactus −4.0（−10.5~+2.5）个百分点，Cactus−Native −1.5（−8.0~+5.0）个百分点；全部不显著。同方法换种子就有 30~38 题对错不同，本机样本只能分辨约 10 个百分点的差距。
+- 速度（decode tok/s，对 AR）：AR 14.66；Native 18.49（1.26×）；Cactus 21.20（1.45×）；SpecCascade 19.53（1.33×）；RAVEN v3 17.97（1.23×）。MAL：Native 2.768 / Cactus 3.173 / SpecCascade 2.936 / RAVEN 3.372。每轮：链式 0.150 s，RAVEN 0.188 s（+38 ms，其中日志约 3.5 ms）。
+- RTN 代理模型质量明显低于 bnb（vLLM 现场量化实际为 NF4，2026-11-13 核实）：同题同种子 Native 40% 对 62%，McNemar p=0.0009。截断 33~39 题对 18~22 题，几乎都是 "Wait, ..." 反复自我检查写满 2048 token。RTN 模型不能用于质量结论，需要校准的 4 位模型。
+- 新增 `scripts/analyze_suite_round_logs.py`：按时间把每轮对应到请求，计算参与判定位置的实测接受率、按规则计算的接受率、多接受质量、低支持度接受（每千 token）。
+  - 自检：Native 实测 0.7335 对 min(1,p/q) 0.7338；Cactus 实测对离线公式 0.8228/0.8236；RAVEN 实测对日志接受概率 0.8082/0.8084。
+- 逐轮结论：
+  - 每位置多接受的质量：Cactus 0.091~0.094，RAVEN v3 0.099~0.100，SpecCascade 0.030~0.032，Native 0。
+  - 目标概率 <1e-3 的 token 被接受次数（每千 token）：Cactus 3.7~4.5，RAVEN 4.9~5.3，精确采样约 0.1；<1e-2：Cactus 10~12，RAVEN 13，精确约 0.9。
+  - RAVEN v3 按实际接受计算比 Cactus 放宽得更多：自适应规则把 Cactus 在饱和位置用不满的名义额度回收后，再分给其他位置，最多 1.5 倍。
+  - 兄弟命中约 8000 次，没有一次 p<1e-2，是干净的。
+- 离线反事实（用日志里的 u 重放主干判定）："逐位接受概率 ≤ Cactus + p<1e-2 时用精确规则"估计 RAVEN 每轮 token 从 3.373 降到 3.315（3.291~3.339），仍比 Cactus 高约 4.5%，而低支持度接受降到精确水平。只靠树、完全不松弛时约 3.05。
+- 速度瓶颈（带宽估算，未实测）：BF16 共享 LM head（1.24 GB）每轮被读 4 次，加上 BF16 MTP 层，3 个草稿步约 65~70 ms，与目标 forward 相当。草稿用量化 LM head 副本有望把每轮降到约 90 ms。
+- 文档：`doc/RESULT-W4A16-MAXN-HUMANEVAL-SUITE-2026-11-13.md`。本条未改服务代码，未重跑测试。
+
+## 2026-11-12：逐轮日志记录器与 W4A16 + MAXN 全方法 HumanEval 套件（2026-11-13 完成，见上条）
+
+- 状态：代码与检查完成；套件 16:57 启动，2026-11-13 07:48 完成。用户决定后续实验统一使用 MAXN + W4A16。
+- 新增 `remtp/round_logger.py`（`REMTP_ROUND_LOG_JSONL` 开启，默认关闭）：链式方法包住最外层的 vLLM `rejection_sample`，每轮记录草稿 token、p(y)、q(y)、目标/草稿 top-1 及概率、输出 token、接受数；RAVEN 包住 `fixed6_vllm.strict_tree_verify`，记录节点路径与 token、每行目标 top-1，以及验证器已有的逐节点诊断（p、q、松弛后 h、均匀随机数、自适应额度、命中标记）。不抽随机数、不改任何输入输出；设备数据用非阻塞拷贝 + CUDA 事件，下一轮再写盘，不插入同步点；出错后自动停用。`remtp/fastmtp_verified_worker.py` 在 `_install_optional_profile` 最后安装它（所有方法钩子之后）。
+- `scripts/ab_canonical_tree_attention.py` 新增 `+roundlog` 臂；新增 `scripts/run_w4a16_maxn_suite.py`：复用 `run_day_20261111.Controller`，五种服务（native、cactus、spec_cascade、raven_v3、target=AR）均为冻结 100+100 环境 + W4A16 覆盖；HumanEval-100 冻结选题、2048 预算，run r 种子 = 冻结种子 + (r−1)；默认顺序 native/cactus/spec_cascade/raven_v3 run1 → 反序 run2 → target run1；要求 MAXN，记录 protocol.json（git HEAD、脏文件、设备温度）、每阶段 device.json、请求起止时间、rounds.jsonl、Docker 判分，输出 suite_report.md / suite_summary.json（每次运行、合并、配对 McNemar、同方法两次一致性、相对 AR 速度）。
+- 验证：`tests/test_round_logger.py` 5 项通过；GPU 上异步路径记录与直接计算逐位一致；MAXN W4A16 3 题实机：开启记录后 RAVEN 与 Cactus 输出均逐 token 相同、轮数相同；每轮开销 Cactus −0.1%（初版同步拷贝为 +4.9%，改为异步后消除），RAVEN +1.9%（节点诊断 JSON 序列化，只会使 RAVEN 速度偏低）。套件冒烟（5 种服务、2 题、64 token）全部启动、判分、出报告。
+- 限制：W4A16 为 RTN 未校准代理模型；RAVEN 有约 2% 记录开销而链式方法没有；最后一轮链式记录在进程被 SIGTERM 结束时可能丢失。
+
+## 2026-11-12：MAXN 功耗模式下 bnb / W4A16 × Cactus / RAVEN v3 四组实测
+
+- 状态：完成。用户执行 `sudo nvpmodel -m 0`（提示需重启并已重启），之后 `nvpmodel -q` 为 MAXN（8 核、GPU 上限 918 MHz）。机器目前仍为 MAXN。
+- 未改代码；用 `scripts/ab_canonical_tree_attention.py` 在 GSM8K 17/353/856 上顺序运行四组，输出 `results/maxn_ab_20261112/`（含 `thermal.log`，最高 70°C，负载时 GPU 918 MHz）。
+- 每轮秒 / decode tok/s：bnb Cactus 0.5404 / 6.038；bnb RAVEN v3 0.5963 / 5.432；W4A16 Cactus 0.1493 / 20.261；W4A16 RAVEN v3 0.1796 / 18.132。相对 15W 同组每轮快 1.67~2.11 倍；相对 15W bnb Cactus，MAXN W4A16 Cactus decode 7.2 倍。
+- RAVEN 每轮额外时间：15W 约 73 ms → MAXN W4A16 约 30 ms（+20%），仍高于 Spec-Bench 上约 10% 的 MAL 优势。
+- 限制：每组 3 题、文本和长度各不相同；RTN 模型质量未评测；MAXN 结果与既有 15W 结果不可混用。文档 `doc/RESULT-W4A16-MARLIN-MAXN-2026-11-12.md` 第 5 节。
+
+## 2026-11-12：W4A16 + Marlin 目标模型可行性与 15W 速度（MAXN 待测）
+
+- 状态：15W 部分完成；MAXN 需要重启，尚未测。
+- 动机：15W 分段计时中目标 forward 约 1.02 s/轮，其中 bnb 4 位反量化 CUDA 跨度约 0.70 s/轮、BF16 线性层约 0.41 s/轮（跨度重叠），注意力 5.5 ms；公共数值设置把 bnb 固定为逐层反量化 + BF16 GEMM。
+- 新增 `scripts/quantize_fastmtp_w4a16_rtn.py`：流式把 252 个目标线性层量化为 GPTQ v1 格式（4 位、对称、group 128、RTN、无校准），词嵌入/LM head/norm/bias/MTP 层保留 BF16；输出 `models/FastMTP-W4A16-RTN`（已忽略目录，5.9 GB）。
+- `scripts/ab_canonical_tree_attention.py` 新增臂标记 `+w4a16`（gptq_marlin 目标、MTP 层 BF16、仅去掉两个 bnb 专用开关）和 `+cactus`（冻结的 Cactus 服务环境）；原有臂行为不变。
+- 验证：打包往返逐位正确；Marlin 在 sm87 可用，4 种形状 × M=1/4/10/64 与反量化参考相对差 ≤3.5e-3；同一行在 M=1/4/10 中逐位相同（链/树数值一致）；RTN 权重误差 0.12~0.14，与 bnb FP4（0.12~0.13）相当（更正 2026-11-13：vLLM 现场量化实际是 NF4，权重误差 0.093~0.096，RTN 明显更差）；服务日志确认 `MarlinLinearKernel`，模型 5.83 GiB。
+- 15W 实测（GSM8K 17/353/856）：Cactus 每轮 1.1421 → 0.2498 s，decode 2.813 → 13.075 tok/s；RAVEN v3 每轮 1.2155 → 0.3225 s，decode 2.763 → 10.202 tok/s（RAVEN 3 题全对）。W4A16 下 RAVEN 每轮比 Cactus 多约 73 ms（+29%），decode 低 22%。
+- 限制：3 道题、文本不同；RTN 模型质量未评测，不能代表校准量化；未做逐 token 等价检查（换量化后输出本来就会不同）。详见 `doc/RESULT-W4A16-MARLIN-MAXN-2026-11-12.md`。
+
+## 2026-11-12：全天实验完成（Spec-Bench 四方法 + HumanEval-100）
+
+- `scripts/run_day_20261111.py` 于 2026-11-11 14:33 启动、2026-11-12 13:10 完成全部五个阶段（22.6 小时），无失败阶段；原始数据 `results/day_20261111/`，汇总 `day_report.md`。
+- Spec-Bench（种子 20261111，6 任务×15 条，multi_turn 两轮，105 次请求/方法，512 token，T=0.6，单次运行）：MAL native 2.441 / cactus 2.696 / raven_v3 2.972 / pathfirst 3.015；每轮秒 1.1431 / 1.1431 / 1.2237 / 1.2229；E2E 2.083 / 2.300 / 2.368 / 2.401。raven_v3 对 Cactus E2E +3.0%（按题 bootstrap 95% 区间 +1.5%~+4.6%），六个任务全部领先；pathfirst +4.4%（+2.7%~+6.2%），对 raven_v3 +1.4%，单次运行不作结论。
+- HumanEval-100（冻结协议，raven_v3）：pass@1 54/100，E2E 2.7336，MAL 3.377，每轮 1.2266 s，截断 19。对原 RAVEN（59%、2.5487、3.402、1.3260）速度 +7.3%；对 Cactus（65%、2.7573）速度 −0.9%。精确 McNemar：对原 RAVEN p=0.36，对 Cactus p=0.08；不解释为优化引入的质量变化（接受规则未变），但 RAVEN 在 HumanEval 上低于 Cactus 的现象需多种子重复确认。
+- 本条只更新文档：`doc/RESULT-RAVEN-OVERHEAD-OPTIMIZATION-2026-11-10.md` 新增 11.1 节；未改代码，未重跑测试。
 
 ## 2026-11-11：全天实验重复启动事故修复、代码推送到 GitHub
 

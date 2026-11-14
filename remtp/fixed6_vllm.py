@@ -181,6 +181,10 @@ def _is_greedy(sampling_metadata: Any) -> bool:
     temperatures = sampling_metadata.temperature
     if temperatures is None:
         return True
+    from remtp import raven_fast_path as fast
+    if fast.ASYNC_HOST:
+        # Read once per sampling-metadata object (per request batch), not per step.
+        return fast.cached_temperature(sampling_metadata) < 1e-5
     return float(temperatures[0].to(dtype=torch.float32)) < 1e-5
 
 
@@ -552,7 +556,11 @@ def _prepare_selected_path_inputs(self: Any, *args: Any, **kwargs: Any) -> Any:
                 f"selected target hidden row {row} exceeds "
                 f"{common.num_actual_tokens} inputs"
             )
-        token_indices[0] = row
+        from remtp import raven_fast_path as fast
+        if fast.ASYNC_HOST:
+            token_indices[0:1].fill_(row)   # no host-to-device scalar copy
+        else:
+            token_indices[0] = row
     return common, token_indices, rejected
 
 
@@ -823,8 +831,10 @@ def _strict_tree_sampler(self: Any, metadata: Any, draft_probs: Any, logits: tor
             f"tree expects {input_count} target logit rows, got {logits.shape[0]}"
         )
 
+    from remtp import raven_fast_path as fast
+
     target_logits = logits.to(torch.float32).clone()
-    cu = torch.tensor([input_count], dtype=torch.int32, device=logits.device)
+    cu = fast.to_device([input_count], torch.int32, logits.device)
     target_logits = apply_sampling_constraints(target_logits, cu, sampling_metadata)
     # ``apply_sampling_constraints`` already applied temperature/top-k/top-p.
     # Applying ``_temperature_probs`` here used to divide by temperature a
@@ -832,9 +842,13 @@ def _strict_tree_sampler(self: Any, metadata: Any, draft_probs: Any, logits: tor
     # spuriously sharp and incomparable with vLLM's chain rejection sampler.
     target_probs = _processed_target_probs(target_logits, sampling_metadata)
     _RUNTIME.target_probs_by_input = target_probs.detach()
-    _RUNTIME.target_top1_ids = tuple(
-        int(value) for value in target_probs.argmax(dim=-1).tolist()
-    )
+    if not fast.ASYNC_HOST or os.getenv("REMTP_TREE_AUDIT_JSONL") or os.getenv("REMTP_TREE_TRACE", "0") == "1":
+        # Only the round audit reads these; skip the extra device read otherwise.
+        _RUNTIME.target_top1_ids = tuple(
+            int(value) for value in target_probs.argmax(dim=-1).tolist()
+        )
+    else:
+        _RUNTIME.target_top1_ids = ()
     if os.getenv("REMTP_TREE_FORCE_ROOT_REJECT") == "1":
         correction = sample_categorical(target_probs[0], _generator(sampling_metadata))
         result = TreeVerifyResult(
@@ -881,8 +895,8 @@ def _strict_tree_sampler(self: Any, metadata: Any, draft_probs: Any, logits: tor
         dtype=torch.int32,
         device=logits.device,
     )
-    output[0, : len(result.output_token_ids)] = torch.tensor(
-        result.output_token_ids, dtype=torch.int32, device=logits.device
+    output[0, : len(result.output_token_ids)] = fast.to_device(
+        list(result.output_token_ids), torch.int32, logits.device
     )
     _append_round_audit(result)
     return SamplerOutput(sampled_token_ids=output, logprobs_tensors=None)

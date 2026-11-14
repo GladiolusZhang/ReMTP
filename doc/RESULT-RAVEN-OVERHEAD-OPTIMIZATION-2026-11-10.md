@@ -167,6 +167,35 @@ proposal 内部：MTP forward 从 4 次降到 3 次（47.6 → 36.6 ms），与�
 
 `scripts/run_day_20261111.py`，24 小时截止，可续跑，每完成一个阶段就重写 `day_report.md`：① HumanEval-100（冻结协议同题/同种子/2048 预算，Docker 判分），第三层配置的 RAVEN，与 10 月记录的四种方法并列；② Spec-Bench 新抽样（种子 20261111，6 任务各 15 条，512 token），第三层 RAVEN；③ 同抽样 Cactus；④ 同抽样 RAVEN + 首遍路径重排；⑤ 时间允许时 Native。
 
+### 11.1 结果（2026-11-11 14:33 至 2026-11-12 13:10，全部阶段完成，22.6 小时）
+
+实际顺序：Spec-Bench raven_v3 → cactus → raven_v3_pathfirst → HumanEval-100 raven_v3 → Spec-Bench native。完整表格见 `results/day_20261111/day_report.md`。
+
+Spec-Bench（105 次请求/方法，同题同种子，各方法单次运行，文本各不相同）：
+
+| 方法 | MAL | 每轮秒 | decode tok/s | E2E tok/s | E2E 对 Cactus（按题 bootstrap 95% 区间） |
+| --- | ---: | ---: | ---: | ---: | --- |
+| native | 2.441 | 1.1431 | 2.137 | 2.083 | −9.4% |
+| cactus | 2.696 | 1.1431 | 2.360 | 2.300 | — |
+| raven_v3 | 2.972 | 1.2237 | 2.430 | 2.368 | +3.0%（+1.5% ~ +4.6%） |
+| raven_v3_pathfirst | 3.015 | 1.2229 | 2.467 | 2.401 | +4.4%（+2.7% ~ +6.2%） |
+
+- raven_v3 六个任务 E2E 全部高于 Cactus（translation +10.1%、summarization +1.6%、math_reasoning +2.4%、rag +1.9%、qa +2.2%、multi_turn +2.8%）；通宵实验里落后的 summarization、math_reasoning 这次转为领先。每轮比 Cactus 多 80.6 ms。
+- bootstrap 只重抽题号，不包含同一方法重复运行的采样波动；两方法输出长度不同，上下文长度也不同。
+- pathfirst 对 raven_v3：MAL +1.4%、E2E +1.4%，每轮耗时相同。单次运行，不能据此说明它改善了提议分布。
+
+HumanEval-100（冻结协议，raven_v3 实跑并 Docker 判分；其余为 10 月同题记录）：
+
+| 方法 | pass@1 | E2E tok/s | MAL | 每轮秒 | 截断 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| native | 62% | 2.4701 | 2.855 | 1.1483 | 18 |
+| cactus | 65% | 2.7573 | 3.185 | 1.1472 | 20 |
+| 原 RAVEN（adaptive_original） | 59% | 2.5487 | 3.402 | 1.3260 | 22 |
+| raven_v3 | 54% | 2.7336 | 3.377 | 1.2266 | 19 |
+
+- 速度：对原 RAVEN E2E +7.3%、每轮 −99 ms，MAL 基本不变；对 Cactus E2E −0.9%。
+- 质量：判分状态 passed 54、failed 21、syntax_error 22、runtime_error 3，未出现判题环境错误。精确 McNemar 配对检验：对原 RAVEN 仅原对 12、仅新对 7，p=0.36；对 Cactus 仅 Cactus 对 22、仅新对 11，p=0.08；对 Native p=0.19。raven_v3 与原 RAVEN 接受规则相同，差异来自 1 ulp 注意力数值差后的不同采样轨迹，100 题无法区分；但 RAVEN 两次 HumanEval（59%、54%）都低于 Cactus（65%），需要多种子重复才能判断是否有系统性质量差。
+
 ## 7. 复现
 
 ```bash

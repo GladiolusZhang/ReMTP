@@ -175,6 +175,33 @@ def install_runtime_profile():
         (tree_attn, "unified_attention", "tree_attention", None),
         (triton_attn, "unified_attention", "triton_attention", None),
     ]
+    # Finer host-side spans of the dynamic tree (2026-11-13).  Rebound module
+    # globals are wrapped where they are looked up at call time.
+    import vllm.v1.sample.rejection_sampler as rejection_module
+    from remtp import fixed6_vllm as fixed, raven_fast_path as fast
+    hooks += [
+        (dynamic, "_dynamic_propose_tree", "dynamic_propose", None),
+        (dynamic, "_dynamic_verify_dispatch", "verify_dispatch", None),
+        (dynamic, "dynamic_tree_config_from_env", "config_from_env", None),
+        (dynamic, "_sample_q_token", "sample_q", None),
+        (dynamic, "_sample_branch_q_token", "sample_branch_q", None),
+        (dynamic, "_cactus_trunk_children", "trunk_children", None),
+        (dynamic, "_validate_proposal_probs", "validate_q", None),
+        (dynamic, "_set_target_tree_topology", "set_tree_topology", None),
+        (fast, "residual_hit_tree_verify_fast", "fast_verify", None),
+        (fast, "adaptive_trunk_relaxation_plan", "adaptive_plan_fast", None),
+        (fast, "select_dynamic_candidates_fast", "select_fast", None),
+        (fast, "batched_trunk_children", "batched_children", None),
+        (fast, "resolve_batched_counts", "batched_counts", None),
+        (fast, "_boost_known", "boost_row", None),
+        (fast, "residual_distribution_nosync", "residual_row", None),
+        (fast, "sample_categorical_nosync", "categorical_draw", None),
+        (fast, "normalize_rows_nosync", "normalize_rows", None),
+        (fixed, "_processed_target_probs", "target_probs", None),
+        (fixed, "_append_round_audit", "round_audit", None),
+        (rejection_module, "apply_sampling_constraints", "sampling_constraints", None),
+    ]
+    hooks = [hook for hook in hooks if hasattr(hook[0], hook[1])]
     originals = [(owner, name, component, extra, getattr(owner, name))
                  for owner,name,component,extra in hooks]
     prepare = GPUModelRunner._prepare_inputs

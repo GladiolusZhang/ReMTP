@@ -20,14 +20,45 @@ Flags (read by ``remtp.dynamic_tree_vllm``):
 ``REMTP_DYNAMIC_TREE_FAST_VERIFY=1``
     ``residual_hit_tree_verify`` with batched normalisation, one gather for all
     node probabilities, lazy residuals and one transfer per verified node.
+``REMTP_DYNAMIC_TREE_ASYNC_HOST=1`` (2026-11-14)
+    no blocking host/device round trip where the value is already on the
+    host: host lists reach the device through pinned non-blocking copies,
+    scalars are written with ``fill_``, a sampled token indexes through a
+    one-element index tensor (a 0-dim CUDA index is read back by PyTorch), and
+    the cached host temperature replaces ``float(temperature)``.  Device
+    values, kernels, their order and RNG use are unchanged; only the host
+    stops waiting, so later independent launches queue behind running GPU work.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from typing import Any
 
 import torch
+
+ASYNC_HOST = os.getenv("REMTP_DYNAMIC_TREE_ASYNC_HOST", "0") == "1"
+
+
+def to_device(values: Any, dtype: torch.dtype, device: torch.device | str) -> torch.Tensor:
+    """``torch.tensor(values, dtype=dtype, device=device)`` without a host wait.
+
+    A pageable host-to-device copy synchronises the stream; a pinned buffer
+    with ``non_blocking=True`` does not (PyTorch's caching host allocator keeps
+    the buffer alive until the copy has run).
+    """
+    device = torch.device(device)
+    if not ASYNC_HOST or device.type != "cuda":
+        return torch.tensor(values, dtype=dtype, device=device)
+    return torch.tensor(values, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
+
+
+def index_one(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """``values[index].reshape(1)`` for a scalar index tensor, without reading it back."""
+    if ASYNC_HOST:
+        return values[index.reshape(1)]
+    return values[index].reshape(1)
 
 from remtp.dynamic_mtp_tree import (
     CandidateSelection,
@@ -35,6 +66,7 @@ from remtp.dynamic_mtp_tree import (
     DynamicTreeTopology,
     _candidate_boost_distribution,
     adaptive_trunk_relaxation_plan,
+    adaptive_trunk_relaxation_plan_host,
     select_dynamic_candidates,
 )
 from remtp.cactus_mtp import cactus_target_distribution
@@ -59,15 +91,18 @@ def normalize_rows_nosync(values: torch.Tensor) -> torch.Tensor:
     bit-identical to the reference; the degenerate branch is selected with
     ``torch.where`` instead of a host round-trip.
     """
-    probs = values.to(torch.float32).clamp_min(0.0)
-    squeeze = probs.ndim == 1
-    if squeeze:
-        probs = probs.unsqueeze(0)
-    totals = torch.stack([row.sum() for row in probs])
-    ok = torch.isfinite(totals) & (totals > 1e-30)
-    uniform = torch.full_like(probs, 1.0 / probs.shape[-1])
-    out = torch.where(ok.unsqueeze(1), probs / totals.unsqueeze(1), uniform)
-    return out[0] if squeeze else out
+    # Fewer eager launches (2026-11-13), same values: a 1-D row needs no
+    # stack/unsqueeze, and the uniform fallback is a scalar operand of
+    # ``where`` instead of a materialised full-vocabulary tensor.
+    probs = values if values.dtype == torch.float32 else values.to(torch.float32)
+    probs = probs.clamp_min(0.0)
+    uniform = 1.0 / probs.shape[-1]
+    if probs.ndim == 1:
+        total = probs.sum()
+        return torch.where(torch.isfinite(total) & (total > 1e-30), probs / total, uniform)
+    totals = torch.stack([row.sum() for row in probs.unbind(0)])
+    ok = (torch.isfinite(totals) & (totals > 1e-30)).unsqueeze(1)
+    return torch.where(ok, probs / totals.unsqueeze(1), uniform)
 
 
 def residual_distribution_nosync(target_probs: torch.Tensor, draft_probs: torch.Tensor) -> torch.Tensor:
@@ -115,6 +150,22 @@ def _reference_selection(probs, *, depth, config, budget, trunk_token, valid) ->
     )
 
 
+def _relevant_tie(values: torch.Tensor, config: DynamicTreeConfig) -> torch.Tensor:
+    """Ties that could change the selection.
+
+    A rank below ``min_draft_prob`` can never be chosen: eligibility needs
+    ``q >= threshold >= min_draft_prob`` and a guarded sibling needs
+    ``q >= min_draft_prob``.  Equal values below it (typically underflowed
+    zeros of a peaked distribution) therefore cannot make the top-k prefix
+    ambiguous for the decision, and need not defer to the full stable sort.
+    The float32 comparison is conservative: float32(min_draft_prob) is at
+    most min_draft_prob.
+    """
+    if values.numel() <= 1:
+        return torch.zeros((), dtype=torch.bool, device=values.device)
+    return ((values[:-1] == values[1:]) & (values[1:] >= config.min_draft_prob)).any()
+
+
 def select_dynamic_candidates_fast(
     probs: torch.Tensor,
     *,
@@ -155,7 +206,7 @@ def select_dynamic_candidates_fast(
     guarded_limit = min(config.max_children_per_parent, vocabulary)
     k = min(guarded_limit + 1, vocabulary)
     values, indices = torch.topk(q, k, sorted=True)
-    tie = (values[:-1] == values[1:]).any() if k > 1 else torch.zeros((), dtype=torch.bool, device=q.device)
+    tie = _relevant_tie(values, config)
     eligible_mask = q >= threshold
     pieces = [
         eligible_mask.sum().to(torch.float64).reshape(1),
@@ -231,6 +282,127 @@ def cactus_trunk_children_fast(
     backups = [view for tid, view in zip(fast.token_ids, fast.token_views) if tid != fast.trunk_id]
     backups = backups[: max(backup_budget, 0)]
     return torch.stack([trunk_token.reshape(())] + backups), fast.selection
+
+
+# --------------------------------------------------------------------------
+# Batched trunk children (2026-11-13): every parent of one tree level in one
+# host transfer.  Decisions, RNG use and diagnostics equal the per-parent
+# ``cactus_trunk_children_fast``; only the diagnostic threshold counts are read
+# back later, in one transfer for the whole proposal (``resolve``).
+# --------------------------------------------------------------------------
+@dataclass
+class BatchedChildren:
+    candidate_ids: torch.Tensor           # sampled trunk first, then backups (device)
+    candidate_probs: list[float]          # == probs[candidate_ids].tolist()
+    entropy: float
+    threshold: float
+    q_max: float
+    sibling_added: bool
+    unchosen_backup_count: int            # chosen ranks that were not threshold-eligible
+    count_tensor: torch.Tensor | None     # deferred device count of q >= threshold
+    threshold_candidate_count: int | None = None
+    candidate_count_before_budget: int | None = None
+
+
+def resolve_batched_counts(items: list[BatchedChildren]) -> None:
+    """Fill the diagnostic counts of every pending item with one transfer."""
+    pending = [item for item in items if item.threshold_candidate_count is None]
+    if not pending:
+        return
+    counts = torch.stack([item.count_tensor.to(torch.int64) for item in pending]).tolist()
+    for item, count in zip(pending, counts):
+        item.threshold_candidate_count = int(count)
+        item.candidate_count_before_budget = int(count) + item.unchosen_backup_count if count else 0
+
+
+def batched_trunk_children(
+    rows: list[torch.Tensor],
+    trunk_tokens: list[torch.Tensor],
+    *,
+    depth: int,
+    backup_budget: int,
+    config: DynamicTreeConfig,
+) -> list[BatchedChildren]:
+    config.validate()
+    if depth <= 0 or depth > config.max_depth:
+        raise ValueError("candidate depth is outside the configured tree")
+    # Fewer device ops per parent (each eager op costs ~45 us of host time on
+    # Jetson), with the same values as the per-parent path:
+    #   * normalisation: for a valid row ``clamp / sum`` is exactly what
+    #     ``normalize_rows_nosync`` returns; its uniform fallback only applies
+    #     to invalid rows, which raise below before any decision is made;
+    #   * q2 = q / q.sum(): q is already non-negative, so clamping is a no-op;
+    #   * validity from the clamped total and the raw minimum (finite, positive
+    #     total and no negative entry is the same predicate as the original);
+    #   * q_max is the first top-k value; the decision-relevant tie test runs on
+    #     the transferred float32 values with float32 semantics;
+    #   * one float32 transfer (float32 -> Python float is exact; ids < 2**24).
+    min_draft_f32 = float(torch.tensor(config.min_draft_prob, dtype=torch.float32))
+    prepared, pieces = [], []
+    for probs, trunk in zip(rows, trunk_tokens):
+        vocabulary = probs.numel()
+        p32 = probs if probs.dtype == torch.float32 else probs.to(torch.float32)
+        clamped = p32.clamp_min(0.0)
+        total = clamped.sum()
+        q = clamped / total
+        q2 = q / q.sum()
+        entropy_t = -(q2 * q2.clamp_min(1e-30).log()).sum() / math.log(vocabulary)
+        guarded_limit = min(config.max_children_per_parent, vocabulary)
+        k = min(guarded_limit + 1, vocabulary)
+        values, indices = torch.topk(q, k, sorted=True)
+        trunk = trunk.reshape(())
+        pieces.append(torch.cat((
+            torch.stack((entropy_t, total, p32.min())), values, indices.to(torch.float32),
+            p32[indices], trunk.to(torch.float32).reshape(1), index_one(p32, trunk),
+        )))
+        prepared.append((probs, q, values, indices, trunk, vocabulary, guarded_limit, k))
+    flat = torch.cat(pieces).tolist() if pieces else []
+    results, offset = [], 0
+    for probs, q, values, indices, trunk, vocabulary, guarded_limit, k in prepared:
+        width = 3 + 3 * k + 2
+        row = flat[offset:offset + width]
+        offset += width
+        entropy, total_f, min_f = row[0], row[1], row[2]
+        if not (math.isfinite(total_f) and total_f > 0.0 and min_f >= 0.0):
+            raise ValueError("Invalid MTP proposal Q: nonfinite, negative, or zero mass; sampling aborted before RNG")
+        top_values = row[3:3 + k]
+        q_max = top_values[0]
+        if any(top_values[j] == top_values[j + 1] and top_values[j + 1] >= min_draft_f32 for j in range(k - 1)):
+            # Ambiguous top-k prefix: the per-parent path defers to the reference.
+            ids, selection = cactus_trunk_children_fast(probs, trunk, depth=depth, backup_budget=backup_budget, config=config)
+            item = BatchedChildren(ids, probs[ids].tolist(), selection.entropy, selection.threshold, selection.q_max,
+                                   selection.sibling_added, 0, None, selection.threshold_candidate_count,
+                                   selection.candidate_count_before_budget)
+            results.append(item)
+            continue
+        if vocabulary <= 1:
+            entropy = 0.0
+        top_ids = [int(x) for x in row[3 + k:3 + 2 * k]]
+        top_raw = row[3 + 2 * k:3 + 3 * k]
+        trunk_id, trunk_raw = int(row[3 + 3 * k]), row[3 + 3 * k + 1]
+        uncertainty = entropy + config.depth_exploration * (depth / config.max_depth)
+        threshold = max(config.min_draft_prob, q_max * math.exp(-config.threshold_sensitivity * uncertainty))
+        # Same comparison semantics as the device's ``q >= threshold`` (float32 tensor vs Python float).
+        top_eligible = (torch.tensor(top_values, dtype=torch.float32) >= threshold).tolist()
+        count_tensor = (q >= threshold).sum()
+        if not top_eligible[0]:          # no token reaches the threshold
+            results.append(BatchedChildren(trunk.reshape(1), [trunk_raw], entropy, threshold, q_max, False, 0,
+                                           count_tensor, 0, 0))
+            continue
+        chosen = [j for j in range(guarded_limit) if top_eligible[j]]
+        sibling_added = False
+        for j in range(1, guarded_limit):
+            if (not top_eligible[j] and top_values[j] >= config.min_draft_prob
+                    and top_values[j] >= q_max * config.min_sibling_ratio):
+                chosen.append(j)
+                sibling_added = True
+        unchosen = sum(1 for j in chosen if not top_eligible[j])
+        chosen = chosen[: config.max_children_per_parent]
+        backups = [j for j in chosen if top_ids[j] != trunk_id][: max(backup_budget, 0)]
+        ids = torch.stack([trunk] + [indices[j].reshape(()) for j in backups])
+        results.append(BatchedChildren(ids, [trunk_raw] + [top_raw[j] for j in backups], entropy, threshold, q_max,
+                                       sibling_added, unchosen, count_tensor))
+    return results
 
 
 # --------------------------------------------------------------------------
@@ -310,9 +482,11 @@ def _boost_known(target_probs: torch.Tensor, token_id: int, boosted_probability:
     if boosted <= original or original >= 1.0:
         return target_probs
     scale = (1.0 - boosted) / max(1.0 - original, 1e-30)
-    result = target_probs * scale
-    result = result.clone()
-    result[token_id] = boosted
+    result = target_probs * scale          # already a fresh tensor; no clone needed
+    if ASYNC_HOST:
+        result[token_id:token_id + 1].fill_(boosted)   # same float32 value, no host copy
+    else:
+        result[token_id] = boosted
     return result / result.sum().clamp_min(1e-30)
 
 
@@ -362,28 +536,34 @@ def residual_hit_tree_verify_fast(
         trunk.append(path_to_index[path])
 
     protected = set(protected_node_indices)
-    adaptive_plan = (
-        adaptive_trunk_relaxation_plan(
-            topology, ids, draft, target, config=config, protected_node_indices=frozenset(protected),
-        )
-        if config.adaptive_relaxation
-        else {}
-    )
 
-    # One transfer for every node: its token, p(token | parent row) and q(token).
-    parent_rows = torch.tensor(
+    # One float32 transfer for every node (float32 -> Python float is exact,
+    # ids < 2**24): its token, p(token | parent row), q(token), and every target
+    # row's maximum.  The adaptive plan is then built from these values with
+    # the planner's own op sequence on CPU tensors (identical plan, no extra
+    # device launches or sync).
+    parent_rows = to_device(
         [0 if node.parent is None else node.parent + 1 for node in topology.nodes],
-        dtype=torch.int64, device=device,
+        torch.int64, device,
     )
     node_rows = torch.arange(count, device=device)
     flat = torch.cat((
-        ids.to(torch.float64),
-        target[parent_rows, ids].to(torch.float64),
-        draft[node_rows, ids].to(torch.float64),
+        ids.to(torch.float32),
+        target[parent_rows, ids],
+        draft[node_rows, ids],
+        target.max(dim=-1).values,
     )).tolist()
     ids_list = [int(x) for x in flat[:count]]
     p_list = flat[count:2 * count]
     q_list = flat[2 * count:3 * count]
+    adaptive_plan = (
+        adaptive_trunk_relaxation_plan_host(
+            topology, p_list, q_list, flat[3 * count:4 * count + 1],
+            config=config, protected_node_indices=frozenset(protected),
+        )
+        if config.adaptive_relaxation
+        else {}
+    )
 
     statuses = {node.index: "NOT_VISITED" for node in topology.nodes}
     diagnostics: dict[int, dict[str, Any]] = {}
@@ -491,7 +671,7 @@ def residual_hit_tree_verify_fast(
         )
         hit_node = next((sibling for sibling in siblings if ids_list[sibling] == correction), None)
         residual_values = (
-            correction_probs[torch.tensor([ids_list[s] for s in siblings], device=device)].tolist()
+            correction_probs[to_device([ids_list[s] for s in siblings], torch.int64, device)].tolist()
             if siblings else []
         )
         for sibling, residual_value in zip(siblings, residual_values):
