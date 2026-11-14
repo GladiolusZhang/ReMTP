@@ -61,6 +61,17 @@ class DynamicTreeConfig:
     adaptive_relaxation_steps: int = 16
     # Opt-in, fixed target-odds guard; no task IDs, gold or forced stops.
     relaxation_risk_policy: str = "none"
+    # Target-support gate (2026-11-13): relax only toward drafted tokens the
+    # target itself supports, p(y) >= min_probability and p(y)/max p >=
+    # min_ratio; elsewhere H = P exactly.  0 disables each gate.
+    relaxation_min_target_probability: float = 0.0
+    relaxation_min_target_ratio: float = 0.0
+    # Source of the adaptive reallocation pool.  "nominal" (historical): the
+    # static allowance left unused at saturated positions, so realised block
+    # TV can exceed the static control's.  "gated": only the static control's
+    # realised TV at target-gated positions, so realised block TV never
+    # exceeds the static control's realised TV.
+    adaptive_relaxation_pool: str = "nominal"
     prune_anchor_descendants: bool = False
     exact_topk_candidates: bool = False
     anchor_only_proposal: bool = False
@@ -204,6 +215,14 @@ class DynamicTreeConfig:
             )
         if self.relaxation_risk_policy not in ("none", "target_odds"):
             raise ValueError("Unknown relaxation_risk_policy")
+        for name in ("relaxation_min_target_probability", "relaxation_min_target_ratio"):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and 0.0 <= value <= 1.0):
+                raise ValueError(f"{name} must be in [0,1]")
+        if self.adaptive_relaxation_pool not in ("nominal", "gated"):
+            raise ValueError("adaptive_relaxation_pool must be 'nominal' or 'gated'")
+        if (self.target_support_gate or self.adaptive_relaxation_pool != "nominal") and not self.adaptive_relaxation:
+            raise ValueError("the target-support gate and gated pool require adaptive relaxation")
         if self.relaxation_risk_policy != "none" and (
             not self.adaptive_relaxation or self.support_mode != "residual_hit_anchor"
         ):
@@ -276,6 +295,10 @@ class DynamicTreeConfig:
     def relaxation_delta(self, depth: int) -> float:
         """Return ``delta_i = delta * w_i`` for a native-MTP depth."""
         return self.cactus_delta * self.relaxation_weight(depth)
+
+    @property
+    def target_support_gate(self) -> bool:
+        return bool(self.relaxation_min_target_probability or self.relaxation_min_target_ratio)
 
 
 @dataclass(frozen=True)
@@ -1086,7 +1109,11 @@ def adaptive_trunk_relaxation_plan(
     ``reach * suffix_value / q(y)``, multiplied by a mild target-relative
     support term.  The planner therefore adapts to the current verified block
     instead of assigning a fixed reliability multiplier to every request.
-    Its total realized local TV never exceeds the static control's total.
+    Its total allocated TV never exceeds the static control's *nominal*
+    total.  With the historical "nominal" pool the realised TV can exceed the
+    static control's realised TV (Cactus cannot use its allowance at saturated
+    positions; this planner spends half of it elsewhere).  The "gated" pool
+    keeps realised block TV at or below the static control's realised TV.
     """
     config.validate()
     path_to_index = {node.path: node.index for node in topology.nodes}
@@ -1123,17 +1150,25 @@ def adaptive_trunk_relaxation_plan(
         dtype=p.dtype,
         device=device,
     )
-    baseline_tv = torch.minimum(
-        torch.sqrt((2.0 * base_delta * p * (1.0 - p)).clamp_min(0.0)),
-        1.0 - p,
-    )
+    protected = None
     if protected_node_indices:
-        # Remove protected positions before computing the recovered pool:
-        # their allowance must never be redistributed to other positions.
         protected = torch.tensor(
             [index in protected_node_indices for index in trunk],
             dtype=torch.bool, device=device,
         )
+    values = _plan_vectors(p, q, p_max, base_delta, protected, config)
+    return _plan_from_values(values, trunk, config)
+
+
+def _plan_vectors(p, q, p_max, base_delta, protected, config: DynamicTreeConfig) -> list[list[float]]:
+    """Per-trunk-position allowance vectors; one op sequence for device and host."""
+    baseline_tv = torch.minimum(
+        torch.sqrt((2.0 * base_delta * p * (1.0 - p)).clamp_min(0.0)),
+        1.0 - p,
+    )
+    if protected is not None:
+        # Remove protected positions before computing the recovered pool:
+        # their allowance must never be redistributed to other positions.
         baseline_tv = baseline_tv.masked_fill(protected, 0.0)
     saturation_tv = (q - p).clamp(min=0.0)
     floor_tv = torch.minimum(baseline_tv, saturation_tv)
@@ -1145,11 +1180,60 @@ def adaptive_trunk_relaxation_plan(
         probability_cap_tv = (config.relaxation_max_probability_ratio - 1.0) * p
         floor_tv = torch.minimum(floor_tv, probability_cap_tv)
         max_tv = torch.minimum(max_tv, probability_cap_tv)
-
-    values = torch.stack(
+    return torch.stack(
         (p, q, p_max, base_delta, baseline_tv, saturation_tv, floor_tv, max_tv),
         dim=-1,
     ).detach().cpu().tolist()
+
+
+def adaptive_trunk_relaxation_plan_host(
+    topology: DynamicTreeTopology,
+    p_by_node: list[float],
+    q_by_node: list[float],
+    p_max_by_row: list[float],
+    *,
+    config: DynamicTreeConfig,
+    protected_node_indices: frozenset[int] = frozenset(),
+) -> dict[int, dict[str, Any]]:
+    """``adaptive_trunk_relaxation_plan`` from already transferred float32 values.
+
+    ``p_by_node``/``q_by_node`` are p(token | parent row) and q(token) of every
+    node and ``p_max_by_row`` the maximum of every target row, all read from the
+    same (non-negative) rows the device planner would gather.  The allowance
+    vectors run through the same op sequence on float32 CPU tensors, so the
+    plan is identical while saving a few dozen device launches and a sync.
+    """
+    config.validate()
+    path_to_index = {node.path: node.index for node in topology.nodes}
+    trunk = []
+    for depth in range(1, topology.max_depth + 1):
+        path = (0,) * depth
+        if path not in path_to_index:
+            raise ValueError(
+                "adaptive relaxation requires a sampled primary trunk at "
+                f"depth {depth}"
+            )
+        trunk.append(path_to_index[path])
+    parent_rows = [
+        0 if topology.nodes[index].parent is None else int(topology.nodes[index].parent) + 1
+        for index in trunk
+    ]
+    f32 = torch.float32
+    p = torch.tensor([p_by_node[index] for index in trunk], dtype=f32).clamp_min(0.0)
+    q = torch.tensor([q_by_node[index] for index in trunk], dtype=f32).clamp_min(0.0)
+    p_max = torch.tensor([p_max_by_row[row] for row in parent_rows], dtype=f32)
+    base_delta = torch.tensor(
+        [config.relaxation_delta(topology.nodes[index].depth) for index in trunk], dtype=f32,
+    )
+    protected = (
+        torch.tensor([index in protected_node_indices for index in trunk], dtype=torch.bool)
+        if protected_node_indices else None
+    )
+    values = _plan_vectors(p, q, p_max, base_delta, protected, config)
+    return _plan_from_values(values, trunk, config)
+
+
+def _plan_from_values(values: list[list[float]], trunk: list[int], config: DynamicTreeConfig) -> dict[int, dict[str, Any]]:
     p_values = [float(row[0]) for row in values]
     q_values = [float(row[1]) for row in values]
     relative_values = [
@@ -1176,10 +1260,28 @@ def adaptive_trunk_relaxation_plan(
             elif relative < 0.1:
                 maximum[position] = min(maximum[position], baseline_values[position])
                 risk_modes[position] = "no_reallocation"
-    recovered = sum(
-        max(0.0, baseline - current)
-        for baseline, current in zip(baseline_values, allocated)
-    )
+    # Target-support gate: the target, not the draft, decides where relaxation
+    # is allowed.  A drafted token the target does not support is verified
+    # against P exactly; its allowance is never redistributed unless the
+    # "gated" pool explicitly moves the static control's realised TV there
+    # onto supported positions.
+    gated_realised = 0.0
+    if config.target_support_gate:
+        for position, (p_value, relative) in enumerate(zip(p_values, relative_values)):
+            if (p_value < config.relaxation_min_target_probability
+                    or relative < config.relaxation_min_target_ratio):
+                gated_realised += allocated[position]
+                baseline_values[position] = 0.0
+                allocated[position] = 0.0
+                maximum[position] = 0.0
+                risk_modes[position] = "target_gate"
+    if config.adaptive_relaxation_pool == "gated":
+        recovered = gated_realised
+    else:
+        recovered = sum(
+            max(0.0, baseline - current)
+            for baseline, current in zip(baseline_values, allocated)
+        )
     pool = config.adaptive_relaxation_mix * recovered
     initial_pool = pool
     initial_utility = [0.0] * len(trunk)
@@ -1257,6 +1359,13 @@ def adaptive_trunk_relaxation_plan(
                 adaptive_risk_policy=config.relaxation_risk_policy,
                 adaptive_risk_mode=risk_modes[position],
                 adaptive_target_support_ratio=relative_values[position],
+            )
+        if config.target_support_gate or config.adaptive_relaxation_pool != "nominal":
+            plan[node_index].update(
+                adaptive_target_gated=risk_modes[position] == "target_gate",
+                adaptive_target_support_ratio=relative_values[position],
+                adaptive_pool_mode=config.adaptive_relaxation_pool,
+                adaptive_block_gated_realised_tv=gated_realised,
             )
     return plan
 

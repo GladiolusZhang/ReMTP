@@ -166,6 +166,13 @@ def dynamic_tree_config_from_env() -> DynamicTreeConfig:
             os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_STEPS", "16")
         ),
         relaxation_risk_policy=os.getenv("REMTP_DYNAMIC_TREE_RELAX_RISK_POLICY", "none"),
+        relaxation_min_target_probability=float(
+            os.getenv("REMTP_DYNAMIC_TREE_RELAX_MIN_TARGET_PROB", "0")
+        ),
+        relaxation_min_target_ratio=float(
+            os.getenv("REMTP_DYNAMIC_TREE_RELAX_MIN_TARGET_RATIO", "0")
+        ),
+        adaptive_relaxation_pool=os.getenv("REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_POOL", "nominal"),
         prune_anchor_descendants=os.getenv(
             "REMTP_DYNAMIC_TREE_PRUNE_ANCHOR_DESCENDANTS", "0"
         ) == "1",
@@ -1089,6 +1096,9 @@ def install_mimo_dynamic_tree() -> None:
         f"adaptive_target_power={config.adaptive_relaxation_target_power:g} "
         f"adaptive_steps={config.adaptive_relaxation_steps} "
         f"risk_policy={config.relaxation_risk_policy} "
+        f"target_gate_min_p={config.relaxation_min_target_probability:g} "
+        f"target_gate_min_ratio={config.relaxation_min_target_ratio:g} "
+        f"adaptive_pool={config.adaptive_relaxation_pool} "
         f"cactus_target_weight={config.cactus_target_weight:g} "
         f"max_guided_rescues={config.max_guided_rescues_per_path} "
         f"rescue_score_threshold={config.rescue_score_threshold:g} "
