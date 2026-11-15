@@ -39,6 +39,13 @@ from typing import Any
 import torch
 
 ASYNC_HOST = os.getenv("REMTP_DYNAMIC_TREE_ASYNC_HOST", "0") == "1"
+# Trunk verification values launched before the first host read (2026-11-15):
+# boosted rows, verification probabilities and the request-RNG uniforms of every
+# trunk node are queued behind the target forward; the host reads them with p/q
+# and, after a rejection, resets the generator offset to where the per-node path
+# would be, so every later draw is unchanged.
+VERIFY_PRELAUNCH = os.getenv("REMTP_DYNAMIC_TREE_VERIFY_PRELAUNCH", "0") == "1"
+PRELAUNCH_STATS = {"used": 0, "fallback": 0}
 
 
 def to_device(values: Any, dtype: torch.dtype, device: torch.device | str) -> torch.Tensor:
@@ -490,6 +497,55 @@ def _boost_known(target_probs: torch.Tensor, token_id: int, boosted_probability:
     return result / result.sum().clamp_min(1e-30)
 
 
+def _prelaunch_trunk(topology: DynamicTreeTopology, trunk: list[int], ids: torch.Tensor, target: torch.Tensor,
+                     gathered: tuple[torch.Tensor, ...], generator: torch.Generator,
+                     config: DynamicTreeConfig) -> dict[str, Any]:
+    """Queue every trunk node's verification values before the first host read.
+
+    Valid when the adaptive planner allocates exactly its floor (maximum ratio
+    <= 1, no risk policy, no protected node): the per-node allowance is then
+    ``min(baseline, saturation)``, zero at target-gated positions, computed
+    with ``_plan_vectors``' op sequence.  The boosted rows are ``_boost_known``'s
+    op sequence; the uniforms are drawn in the per-node path's order and the
+    generator offsets after each are recorded for ``align_rng``.
+    """
+    device = target.device
+    trunk_index = to_device(trunk, torch.int64, device)
+    parent_index = to_device([0 if topology.nodes[n].parent is None else topology.nodes[n].parent + 1
+                              for n in trunk], torch.int64, device)
+    p = gathered[1].index_select(0, trunk_index).clamp_min(0.0)
+    q = gathered[2].index_select(0, trunk_index).clamp_min(0.0)
+    p_max = gathered[3].index_select(0, parent_index)
+    base_delta = to_device([config.relaxation_delta(topology.nodes[n].depth) for n in trunk], torch.float32, device)
+    baseline = torch.minimum(torch.sqrt((2.0 * base_delta * p * (1.0 - p)).clamp_min(0.0)), 1.0 - p)
+    floor = torch.minimum(baseline, (q - p).clamp(min=0.0))
+    p64 = p.double()
+    if config.target_support_gate:
+        relative = p64 / torch.clamp_min(p_max.double(), 1e-30)
+        gated = (p64 < config.relaxation_min_target_probability) | (relative < config.relaxation_min_target_ratio)
+        floor = torch.where(gated, torch.zeros_like(floor), floor)
+    boosted = torch.clamp(torch.maximum(p64 + floor.double(), p64), max=1.0)
+    boost = (boosted > p64) & (p64 < 1.0)
+    scale = ((1.0 - boosted) / torch.clamp_min(1.0 - p64, 1e-30)).to(torch.float32)
+    rows, verify_ys = [], []
+    tokens = ids.index_select(0, trunk_index)
+    for k in range(len(trunk)):
+        p_row = target[parent_index[k]]
+        result = p_row * scale[k]
+        result.index_put_((tokens[k].reshape(1),), boosted[k].to(torch.float32).reshape(1))
+        result = result / result.sum().clamp_min(1e-30)
+        row = torch.where(boost[k], result, p_row)
+        rows.append(row)
+        verify_ys.append(row[tokens[k].reshape(1)])
+    offsets = [generator.get_offset()]
+    uniforms = []
+    for _ in trunk:
+        uniforms.append(torch.rand((), device=device, generator=generator).reshape(1))
+        offsets.append(generator.get_offset())
+    values = torch.cat((floor, torch.cat(verify_ys), torch.cat(uniforms)))
+    return dict(rows=rows, values=values, offsets=offsets)
+
+
 def residual_hit_tree_verify_fast(
     topology: DynamicTreeTopology,
     draft_token_ids: torch.Tensor,
@@ -547,12 +603,14 @@ def residual_hit_tree_verify_fast(
         torch.int64, device,
     )
     node_rows = torch.arange(count, device=device)
-    flat = torch.cat((
-        ids.to(torch.float32),
-        target[parent_rows, ids],
-        draft[node_rows, ids],
-        target.max(dim=-1).values,
-    )).tolist()
+    gathered = (ids.to(torch.float32), target[parent_rows, ids], draft[node_rows, ids], target.max(dim=-1).values)
+    pre = None
+    if (VERIFY_PRELAUNCH and device.type == "cuda" and generator is not None and config.adaptive_relaxation
+            and not protected
+            and config.adaptive_relaxation_max_ratio <= 1.0 and config.relaxation_risk_policy == "none"):
+        pre = _prelaunch_trunk(topology, trunk, ids, target, gathered, generator, config)
+        gathered = gathered + (pre["values"],)
+    flat = torch.cat(gathered).tolist()
     ids_list = [int(x) for x in flat[:count]]
     p_list = flat[count:2 * count]
     q_list = flat[2 * count:3 * count]
@@ -565,12 +623,32 @@ def residual_hit_tree_verify_fast(
         else {}
     )
 
+    prelaunched: dict[int, tuple[torch.Tensor, float, float]] = {}
+    if pre is not None:
+        values = flat[4 * count + 1:]
+        length = len(trunk)
+        tvs, verify_ys, uniforms = values[:length], values[length:2 * length], values[2 * length:3 * length]
+        if all(float(adaptive_plan[node]["adaptive_relaxation_tv"]) == tv for node, tv in zip(trunk, tvs)):
+            prelaunched = {node: (pre["rows"][k], verify_ys[k], uniforms[k]) for k, node in enumerate(trunk)}
+            PRELAUNCH_STATS["used"] += 1
+        else:
+            PRELAUNCH_STATS["fallback"] += 1
+            # Never expected: fall back to the per-node path with the RNG rewound.
+            generator.set_offset(pre["offsets"][0])
+    trunk_draws = {node: k + 1 for k, node in enumerate(trunk)}
+
     statuses = {node.index: "NOT_VISITED" for node in topology.nodes}
     diagnostics: dict[int, dict[str, Any]] = {}
     accepted: list[int] = []
 
     def draw(probs):
         return sample_categorical_nosync(probs, generator)
+
+    def align_rng(rejected_node: int | None) -> None:
+        """Generator offset of the per-node path after the trunk uniforms it drew."""
+        if prelaunched:
+            drawn = trunk_draws[rejected_node] if rejected_node is not None else len(trunk)
+            generator.set_offset(pre["offsets"][drawn])
 
     def verify_q_candidate(node_index: int, *, use_cactus: bool):
         node = topology.nodes[node_index]
@@ -586,7 +664,11 @@ def residual_hit_tree_verify_fast(
         node_plan = adaptive_plan.get(node_index) if use_cactus else None
         if node_plan is not None and node_plan.get("adaptive_risk_mode") == "strict":
             is_protected = True
-        if node_plan is not None:
+        if node_plan is not None and node_index in prelaunched and use_cactus:
+            relaxation_weight = float(node_plan["adaptive_depth_weight"])
+            effective_delta = float(node_plan["adaptive_effective_delta"])
+            verify_row = prelaunched[node_index][0]
+        elif node_plan is not None:
             relaxation_weight = float(node_plan["adaptive_depth_weight"])
             effective_delta = float(node_plan["adaptive_effective_delta"])
             verify_row = _boost_known(p_row, token_id, p_y + float(node_plan["adaptive_relaxation_tv"]), p_y)
@@ -598,10 +680,13 @@ def residual_hit_tree_verify_fast(
                 if use_cactus
                 else p_row
             )
-        verify_y, random_value = torch.stack((
-            verify_row[token_id].to(torch.float32),
-            torch.rand((), device=device, generator=generator),
-        )).tolist()
+        if node_index in prelaunched and use_cactus:
+            _, verify_y, random_value = prelaunched[node_index]
+        else:
+            verify_y, random_value = torch.stack((
+                verify_row[token_id].to(torch.float32),
+                torch.rand((), device=device, generator=generator),
+            )).tolist()
         accept_probability = min(1.0, verify_y / max(q_y, 1e-30))
         keep = random_value <= accept_probability
         row = {
@@ -664,6 +749,7 @@ def residual_hit_tree_verify_fast(
                     statuses[sibling] = "BACKUP_UNUSED"
             continue
 
+        align_rng(trunk_node)
         correction = draw(correction_probs)
         siblings = tuple(
             sibling for sibling in topology.children_of(topology.nodes[trunk_node].parent)
@@ -741,5 +827,6 @@ def residual_hit_tree_verify_fast(
         )
 
     leaf = accepted[-1]
+    align_rng(None)
     bonus = draw(target[leaf + 1])
     return result((bonus,), "sampled-primary-full-cactus-bonus", 1, 1.0)

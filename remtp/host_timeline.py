@@ -38,6 +38,7 @@ _FUNCTIONS = (
     ("remtp.fixed6_vllm", ("strict_tree_verify",)),
     ("remtp.raven_fast_commit", ("commit_selected_slots_inplace",)),
     ("remtp.probabilistic_mtp", ("sample_mtp_logits",)),
+    ("remtp.gpu_tree", ("propose_tree", "select_children", "retain_level", "run_pass", "branch_noise")),
 )
 # REMTP_HOST_TIMELINE_FINE=1: helpers, wrapped in the namespace that calls them.
 _FINE = (

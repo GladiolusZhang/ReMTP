@@ -172,6 +172,15 @@ def start_server(arm: str, directory: Path):
     # "+async" (2026-11-14): no blocking host reads where the value is on the host already.
     if "async" in parts:
         env["REMTP_DYNAMIC_TREE_ASYNC_HOST"] = "1"
+    # "+gpubuild" (2026-11-15): device-side tree construction; "+gpucheck" recomputes
+    # every level on the host and logs differences.
+    if "gpubuild" in parts:
+        env["REMTP_DYNAMIC_TREE_GPU_BUILD"] = "1"
+    if "gpucheck" in parts:
+        env["REMTP_DYNAMIC_TREE_GPU_BUILD_CHECK"] = str(directory / "gpu_build_check.jsonl")
+    # "+prelaunch" (2026-11-15): trunk verification values queued before the first host read.
+    if "prelaunch" in parts:
+        env["REMTP_DYNAMIC_TREE_VERIFY_PRELAUNCH"] = "1"
     if os.environ.get("AB_GPU_EVENTS") == "1":
         # CUDA-event GPU time per model component (2026-11-13); no added syncs.
         env["REMTP_GPU_EVENT_TIMING_JSONL"] = str(directory / "gpu_events.jsonl")
@@ -254,6 +263,10 @@ def start_server(arm: str, directory: Path):
         markers += ["[ReMTP][CudaSpinWait] primary context sched=SPIN"]
     if "async" in parts:
         markers += ["[ReMTP][DynamicTree] async host reads"]
+    if "gpubuild" in parts:
+        markers += ["[ReMTP][DynamicTree] device-side tree construction"]
+    if "prelaunch" in parts:
+        markers += ["[ReMTP][DynamicTree] trunk verification prelaunched"]
     missing = [m for m in markers if m not in text]
     canon_marker = "[ReMTP][TargetNumerics] canonical ancestor KV reads, zero KV copies" in text
     if missing or canon_marker != (canonical == "1"):

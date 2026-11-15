@@ -4,6 +4,7 @@
 
 - `451e3c2`：**只含算法改动**（v4-safe 目标支持度门槛及其测试）。`git show 451e3c2` 即可看到完整的算法差异；只想对齐算法时只合并这一个提交即可，它单独通过测试。
 - 紧随其后的提交：工程优化（输出逐 token 不变）、分析工具、文档。
+- 2026-11-15 的提交：GPU 建树（`remtp/gpu_tree.py`）和在 4090 上直接运行本分支的脚本。**直接在 4090 上跑本分支请看 `doc/RUN-ON-4090-2026-11-15.md`。**
 
 改动分两类，移植时请分开对待：
 
@@ -129,6 +130,7 @@ v4-gated：`ADAPTIVE_RELAX_POOL=gated`、`ADAPTIVE_RELAX_MIX=1.0`、`ADAPTIVE_RE
 | `REMTP_TREE_CUDAGRAPH=1` + `ENFORCE_EAGER=0` + `REMTP_COMPILATION_CONFIG` | `remtp/tree_cudagraph.py`、`scripts/serve_fastmtp_verified.sh` | 树注意力支持完整 CUDA graph：目标掩码放进固定缓冲区，TREE_ATTN 声明完整图支持（要求 `max_num_seqs=1`）。RAVEN 用 `{"mode":0,"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,...,10]}` | 可选；若开，所有方法都要开 |
 | 链式方法 CUDA graph | 同上 | Cactus/Native 用 `{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4]}`，AR 用 `[1]`；不经过 torch.compile，内核与 eager 相同 | 与上一行一起 |
 | `REMTP_DYNAMIC_TREE_ASYNC_HOST=1` | `remtp/raven_fast_path.py`、`remtp/fixed6_vllm.py`、`remtp/dynamic_tree_vllm.py` | 去掉每轮约 10 次不必要的同步：可分页内存 H2D 拷贝改为固定内存 `non_blocking`、0 维 CUDA 张量下标改为单元素下标、Python 标量赋值改 `fill_`、缓存主机温度、审计关闭时不算 top1 | 建议移植 |
+| `REMTP_DYNAMIC_TREE_GPU_BUILD=1`（2026-11-15） | `remtp/gpu_tree.py`、`remtp/dynamic_tree_vllm.py` | 候选选择、保留和下一层输入都在 GPU 上完成，每层"选择 + 保留"是一个 CUDA graph，提议阶段只读回一次。决策与主机路径相同（校验模式 `REMTP_DYNAMIC_TREE_GPU_BUILD_CHECK=<jsonl>`），但固定行数的 GEMM 与 1 行 GEMM 最后一位不同，约 18% 的题会在较后的位置分开。Jetson 上每轮快 3% | 可选；只支持 D3/N9/每父 3 子、`residual_coverage` |
 | `REMTP_CUDA_SPIN_WAIT=1` | `remtp/cuda_spin_wait.py` | 主上下文设 `CU_CTX_SCHED_SPIN`，等待 GPU 时自旋而不是睡眠 | **Jetson 专用**：解决 `schedutil` 在线程睡眠时把 CPU 降到最低档的问题。4090 主机先查 `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`，若是 `performance` 就不需要 |
 
 Jetson 上的效果（GSM8K 3 题，解码 tok/s，eager → 图模式 + 自旋，RAVEN 另加异步主机读）：AR 14.8 → 16.7，Native 19.4 → 23.7，Cactus 22.1 → 26.8，RAVEN v4-safe 19.5 → 24.5。4090 的 CPU 发射比 Jetson 快得多，收益会小很多，需要实测。

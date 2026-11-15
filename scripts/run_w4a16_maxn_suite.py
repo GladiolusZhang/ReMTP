@@ -52,7 +52,8 @@ DROP = ("REMTP_TARGET_BNB_ROW_BLOCK", "REMTP_TARGET_BNB_UNIFORM_GEMM")
 MARLIN = "Using MarlinLinearKernel for GPTQMarlinLinearMethod"
 DRAFT_BF16 = "[ReMTP][Jetson] MiMo draft BF16 constructor installed"
 ROUNDLOG = "[ReMTP][RoundLog] per-round JSONL enabled"
-SD = ("native", "cactus", "spec_cascade", "raven_v3", "raven_v4safe", "raven_v4gated")
+SD = ("native", "cactus", "spec_cascade", "raven_v3", "raven_v4safe", "raven_v4safe_gpu", "raven_v4safe_gpu_pre",
+      "raven_v4gated")
 # RAVEN v4 (2026-11-13): target-anchored relaxation.  Relaxation only toward drafted
 # tokens with target probability >= 1%; elsewhere exact.  "safe": acceptance never
 # above Cactus's on the same token (max ratio 1).  "gated": Cactus's realised TV at
@@ -61,6 +62,9 @@ V4_GATE = {"REMTP_DYNAMIC_TREE_RELAX_MIN_TARGET_PROB": "0.01"}
 # Batched per-level candidate selection: token-identical outputs, fewer host transfers.
 V4SAFE_FLAGS = {**day.V3_FLAGS, **V4_GATE, "REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MAX_RATIO": "1.0",
                 "REMTP_DYNAMIC_TREE_BATCH_SELECT": "1"}
+# Device-side tree construction (2026-11-15): same rule, one host read per proposal.
+V4SAFE_GPU_FLAGS = {**V4SAFE_FLAGS, "REMTP_DYNAMIC_TREE_GPU_BUILD": "1"}
+V4SAFE_GPU_PRE_FLAGS = {**V4SAFE_GPU_FLAGS, "REMTP_DYNAMIC_TREE_VERIFY_PRELAUNCH": "1"}
 V4GATED_FLAGS = {**day.V3_FLAGS, **V4_GATE, "REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_POOL": "gated",
                  "REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MIX": "1.0", "REMTP_DYNAMIC_TREE_ADAPTIVE_RELAX_MAX_RATIO": "1.5"}
 KINDS = {
@@ -75,6 +79,13 @@ KINDS = {
                          markers=list(day.V3_MARKERS) + ["target_gate_min_p=0.01 ", "adaptive_max_ratio=1 ",
                                                          "adaptive_pool=nominal ",
                                                          "[ReMTP][DynamicTree] batched candidate selection"]),
+    "raven_v4safe_gpu": dict(env="adaptive_original/attempt_2", flags=V4SAFE_GPU_FLAGS,
+                             markers=list(day.V3_MARKERS) + ["target_gate_min_p=0.01 ", "adaptive_max_ratio=1 ",
+                                                             "[ReMTP][DynamicTree] device-side tree construction"]),
+    "raven_v4safe_gpu_pre": dict(env="adaptive_original/attempt_2", flags=V4SAFE_GPU_PRE_FLAGS,
+                                 markers=list(day.V3_MARKERS) + ["target_gate_min_p=0.01 ", "adaptive_max_ratio=1 ",
+                                                                 "[ReMTP][DynamicTree] device-side tree construction",
+                                                                 "[ReMTP][DynamicTree] trunk verification prelaunched"]),
     "raven_v4gated": dict(env="adaptive_original/attempt_2", flags=V4GATED_FLAGS,
                           markers=list(day.V3_MARKERS) + ["target_gate_min_p=0.01 ", "adaptive_max_ratio=1.5 ",
                                                           "adaptive_pool=gated ", "adaptive_mix=1 "]),
@@ -82,7 +93,9 @@ KINDS = {
                    markers=["[ReMTP][FastMTPVerified] method=target speculative_decoding=off", day.NUMERICS]),
 }
 LABEL = {"native": "Native", "cactus": "Cactus", "spec_cascade": "SpecCascade", "raven_v3": "RAVEN v3",
-         "raven_v4safe": "RAVEN v4-safe", "raven_v4gated": "RAVEN v4-gated",
+         "raven_v4safe": "RAVEN v4-safe", "raven_v4safe_gpu": "RAVEN v4-safe（GPU 建树）",
+         "raven_v4safe_gpu_pre": "RAVEN v4-safe（GPU 建树 + 验证预发射）",
+         "raven_v4gated": "RAVEN v4-gated",
          "target": "AR（无推测）"}
 
 
@@ -306,7 +319,9 @@ class Suite(day.Controller):
         # paired comparisons per run (same task, same seed)
         lines += ["", "## 配对比较（同题同种子，精确 McNemar）", "",
                   "| 比较 | run | 仅前者对 | 仅后者对 | p 值 |", "| --- | ---: | ---: | ---: | ---: |"]
-        pairs = [("raven_v4safe", "cactus"), ("raven_v4gated", "cactus"), ("raven_v4safe", "raven_v3"),
+        pairs = [("raven_v4safe_gpu_pre", "raven_v4safe_gpu"), ("raven_v4safe_gpu_pre", "cactus"),
+                 ("raven_v4safe_gpu", "raven_v4safe"), ("raven_v4safe_gpu", "cactus"),
+                 ("raven_v4safe", "cactus"), ("raven_v4gated", "cactus"), ("raven_v4safe", "raven_v3"),
                  ("raven_v4gated", "raven_v3"),
                  ("raven_v3", "cactus"), ("raven_v3", "native"), ("cactus", "native"), ("spec_cascade", "native"),
                  ("raven_v3", "spec_cascade"), ("native", "target"), ("cactus", "target")]

@@ -1,7 +1,19 @@
 # ReMTP 研究与开发总日志
 
-最后更新：2026-11-14（UTC+8）
+最后更新：2026-11-15（UTC+8）
 当前工作分支：`jetson-r39-residual-adapt`；上游研究分支：`research/residual-aligned-tree-mtp`
+
+## 2026-11-15（凌晨）：建树搬到 GPU（通宵试做）
+
+- 用户同意用一晚在 Jetson 上试做"把建树搬到 GPU"。只做第一步：根节点和各层的候选选择、保留、下一层输入准备都在 GPU 上完成，提议阶段只读回一次；验证仍在主机上，随机数流不变。
+- `remtp/gpu_tree.py`（`REMTP_DYNAMIC_TREE_GPU_BUILD=1`）：固定形状（第 2/3 层 MTP 前向 3/7 行）、逐个运算复现 `batched_trunk_children`、并列按稳定顺序、两两比较实现 `residual_coverage` 保留、分支噪声按路径预生成；每层"选择 + 保留"捕获为 CUDA graph（eager 版本每轮要发射几百个小运算，主机时间约 70 ms，反而比主机建树慢 9.5%）。
+- 校验模式 `REMTP_DYNAMIC_TREE_GPU_BUILD_CHECK`：每层用主机参考实现在相同张量上重算，GSM8K 3 题 0 处差异。输出逐 token 相同率：GSM8K 2/3、HumanEval-30 29/30；不同的题来自 1 行与多行 GEMM 的最后一位差异。
+- 速度：GSM8K 3 题每轮 0.1397 → 0.1358 s（−2.8%）；HumanEval-30 每轮 0.1414 → 0.1367 s，decode 23.5 → 24.3 tok/s，相对 Cactus 从 −7.2% 缩到 −4.1%，MAL 与 pass@1 不变。
+- HumanEval-100（三组同一时段）：Cactus 55/100、MAL 3.090、24.68 tok/s；RAVEN 主机建树 57/100、3.246、22.82（−7.5%）；RAVEN GPU 建树 57/100、3.252、23.59（−4.4%）；两种 RAVEN 82/100 题输出逐 token 相同。
+- 验证预发射（`REMTP_DYNAMIC_TREE_VERIFY_PRELAUNCH`，随机数偏移重新对齐，逐 token 相同）没有提速，保持关闭。
+- GPU 事件计时：模型部分的 GPU 时间 RAVEN 与 Cactus 基本相同（117.4 vs 116.7 ms/轮），剩余约 11 ms 是 GPU 空闲和建树/验证的小运算。
+- 03:32 用户的 SSH 连接断开（机器未重启，与 11-14 15:27 相同），最后一组计时的数据已采完，分析在次日补做。
+- 详见 `doc/RESULT-RAVEN-V4-TARGET-GATE-2026-11-13.md` 第 11 节；测试 `tests/test_gpu_tree.py`。
 
 ## 2026-11-14（凌晨）：CUDA graph、CPU 调频与去同步
 

@@ -619,6 +619,17 @@ def _dynamic_propose_tree(
         raise ValueError(
             "sampled-primary tree modes need at least one node per trunk depth"
         )
+    if _GPU_BUILD and sampled_primary_mode:
+        from remtp import raven_fast_path as fast
+        temperature = fast.cached_temperature(sampling_metadata)
+        if temperature is not None and temperature >= 1e-5:
+            # Device-side construction, one host read per proposal (2026-11-15).
+            from remtp import gpu_tree
+            return gpu_tree.propose_tree(
+                self, logits=logits, positions=positions, hidden_states=hidden_states,
+                common_attn_metadata=common_attn_metadata, sampling_metadata=sampling_metadata,
+                config=config, proposal_round=proposal_round,
+            )
     root_q = fixed._temperature_probs(logits[:1], sampling_metadata)[0]
     # One host transfer per tree level instead of three per parent (2026-11-13).
     batch_select = sampled_primary_mode and _BATCH_SELECT
@@ -945,6 +956,7 @@ def _dynamic_propose_tree(
 
 
 _BATCH_SELECT = False
+_GPU_BUILD = False
 
 
 def _dynamic_verify_dispatch(*args: Any, **kwargs: Any) -> Any:
@@ -1045,7 +1057,7 @@ def _install_fast_select(config: Any) -> None:
 
 
 def install_mimo_dynamic_tree() -> None:
-    global _INSTALLED, _ORIGINAL_TREE_RUN, _BATCH_SELECT
+    global _INSTALLED, _ORIGINAL_TREE_RUN, _BATCH_SELECT, _GPU_BUILD
     if _INSTALLED:
         return
     from remtp import fixed6_vllm as fixed
@@ -1078,7 +1090,18 @@ def install_mimo_dynamic_tree() -> None:
         print("[ReMTP][DynamicTree] dead draft KV skipped: no final tree rematerialization, no draft KV commit", flush=True)
     if os.getenv("REMTP_DYNAMIC_TREE_PATH_ORDERED_FIRST_PASS", "0") == "1":
         print("[ReMTP][DynamicTree] first MTP pass reordered to the accepted path (changes proposals)", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD", "0") == "1":
+        from remtp import gpu_tree
+        ok, reason = gpu_tree.supported(config)
+        if not ok:
+            raise ValueError(f"REMTP_DYNAMIC_TREE_GPU_BUILD does not support this configuration ({reason})")
+        _GPU_BUILD = True
+        check = os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD_CHECK", "")
+        print("[ReMTP][DynamicTree] device-side tree construction: one host read per proposal"
+              + (f" + host check -> {check}" if check else ""), flush=True)
     from remtp import raven_fast_path as _fast
+    if _fast.VERIFY_PRELAUNCH:
+        print("[ReMTP][DynamicTree] trunk verification prelaunched: one host read, RNG offsets realigned", flush=True)
     if _fast.ASYNC_HOST:
         print("[ReMTP][DynamicTree] async host reads: pinned non-blocking copies, no scalar read-backs", flush=True)
     if os.getenv("REMTP_TREE_CUDAGRAPH", "0") == "1":

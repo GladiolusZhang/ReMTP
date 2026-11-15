@@ -92,3 +92,39 @@ def test_fast_verify_identical(device: str, adaptive: bool, monkeypatch) -> None
         (reference, state_a), (fast_result, state_b) = _both(monkeypatch, run)
         assert reference == fast_result, case
         assert torch.equal(state_a, state_b), case
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="prelaunch is a CUDA path")
+@pytest.mark.parametrize("gate", [0.0, 0.01])
+@pytest.mark.parametrize("mode", ["residual_hit_anchor", "residual_hit_strict", "residual_hit_cactus"])
+def test_trunk_prelaunch_identical_results_and_rng(gate: float, mode: str, monkeypatch) -> None:
+    config = _residual_hit_config(mode, max_nodes=9, max_children_per_parent=3, cactus_delta=1.0,
+                                  adaptive_relaxation=True, adaptive_relaxation_mix=0.5,
+                                  adaptive_relaxation_max_ratio=1.0, relaxation_min_target_probability=gate)
+    paths = [(0,), (1,), (2,), (0, 0), (0, 1), (1, 0), (0, 0, 0), (0, 0, 1), (0, 1, 0)]
+    topology = DynamicTreeTopology.from_paths(paths)
+    data = torch.Generator(device="cuda").manual_seed(13)
+    terminals = set()
+    for case in range(60):
+        sharp = 1.0 + (case % 6)
+        draft = _rows(data, "cuda", 9, 2048, sharp)
+        target = 0.6 * _rows(data, "cuda", 10, 2048, sharp)
+        target[1:] += 0.4 * draft                      # correlated, so trunk nodes are often accepted
+        target = target / target.sum(-1, keepdim=True)
+        ids = torch.multinomial(draft, 1, generator=data).flatten()
+
+        def run(flag: bool):
+            monkeypatch.setattr(fast, "VERIFY_PRELAUNCH", flag)
+            generator = torch.Generator(device="cuda").manual_seed(900 + case)
+            generator.set_offset(4 * (case % 7))
+            result = fast.residual_hit_tree_verify_fast(topology, ids, draft, target, generator, config=config)
+            return result, generator.get_state()
+
+        before = dict(fast.PRELAUNCH_STATS)
+        (reference, state_a), (pre, state_b) = run(False), run(True)
+        assert fast.PRELAUNCH_STATS["used"] == before["used"] + 1, case
+        assert fast.PRELAUNCH_STATS["fallback"] == before["fallback"], case
+        assert pre == reference, case
+        assert torch.equal(state_a, state_b), case
+        terminals.add(reference.terminal)
+    assert len(terminals) >= 2, terminals
