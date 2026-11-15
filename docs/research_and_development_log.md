@@ -5038,3 +5038,54 @@ HumanEval 仍待 Docker 访问条件，当前验收范围为 GSM8K。
 - 限制：阈值0.01尚未GPU验证，可能影响答案或吞吐；CPU测试不构成GPU质量成功。
   新阶段最多104请求、无自动重试、72小时上限；训练通过后仍需要独立留出和三个基线正式对照，
   本轮不会自动采用或声称达到论文目标。旧代码/失败结果/量化与环境保持可追溯。
+
+### 2026-11-15：在 RTX 4090 上运行 `jetson-r39-residual-adapt`（ab82919）并拆分每轮耗时
+
+状态：`已验证（GPU 运行与测量）；未修改代码`
+
+环境：RTX 4090，驱动 535.261.03，vLLM 0.18.0，torch 2.10.0+cu129，BF16 `models/FastMTP`；本地分支
+`jetson-r39-residual-adapt` 跟踪 `origin/jetson-r39-residual-adapt`（ab82919）。
+
+测试：`python -m pytest -q tests/` 703 项通过、1 项跳过（缺 `datasketch`）；其中
+`test_tree_cudagraph.py`、`test_gpu_tree.py`、`test_async_host.py` 的 37 项在 GPU 上运行并通过。
+
+四方法对比：`OUT=results/compare_4090_20261115 scripts/run_compare.sh`（HumanEval 100 题，抽样 seed
+20260802，生成 seed 42，输出上限 512，T=0.6，`ENGINE_OPT=1`：所有方法完整 CUDA graph 与自旋等待，
+RAVEN 另加可捕获树注意力、异步主机读、GPU 建树；RAVEN 为 v4-safe）。结果在本地，未提交。
+
+| 方法 | pass@1 | MAL | ms/轮 | decode tok/s | 相对 AR | 截断 |
+|---|---:|---:|---:|---:|---:|---:|
+| AR | 59/100 | — | 16.5 | 60.61 | 1.00× | 35 |
+| Native | 60/100 | 3.157 | 23.7 | 133.09 | 2.20× | 35 |
+| Cactus | 53/100 | 3.339 | 23.8 | 140.35 | 2.32× | 42 |
+| RAVEN v4-safe | 57/100 | 3.506 | 26.1 | 134.43 | 2.22× | 37 |
+
+- RAVEN 的 MAL 比 Cactus 高 5.0%，每轮多 2.3 ms，decode 吞吐低 4.2%（Jetson HumanEval-100 为 −4.4%）。
+- 配对 pass@1：Native 对/Cactus 错 12 题、反之 5 题；Cactus 对/RAVEN 错 10、反之 14；Native 对/RAVEN 错
+  10、反之 7；均不显著。512 输出上限下截断 35–42 题且 Cactus 输出更长（平均 344 对 331 token），
+  这一设置不适合比较准确率。
+
+每轮耗时拆分（`results/profile_4090_20261115`，本地）：每种方法 HumanEval 10 题，开
+`REMTP_GPU_EVENT_TIMING_JSONL` 与 `REMTP_HOST_TIMELINE_JSONL`（不加同步）；另各 3 题开
+`REMTP_TORCH_TRACE_JSON` 录 29 轮带 CUDA kernel 的时间线（profiler 会拉长主机时间，只用于归因）。
+时间线由会话草稿目录中的两个临时脚本分析：GPU 忙/闲按轮合并 kernel 区间，并按发起 kernel 的
+Python 帧归因。
+
+| 每轮（ms） | Cactus | RAVEN | 差 |
+|---|---:|---:|---:|
+| 墙钟（无 profiler） | 24.40 | 26.35 | +1.95 |
+| 模型 GPU 时间（目标前向、LM head、MTP 层，CUDA event） | 22.62 | 22.73 | +0.11 |
+| 模型以外的 GPU kernel（profiler） | ≈0.45 | ≈1.90 | +1.45 |
+| 其中 GPU 建树（`gpu_tree.propose_tree`） | — | 1.52 | |
+| 其中验证/拒绝采样 | ≈0.13 | ≈0.29 | |
+| GPU 空闲（墙钟 − 上两项） | ≈1.33 | ≈1.72 | +0.39 |
+
+- GPU 建树每轮约 973 个 kernel（其中约 795 个在 CUDA graph 内），平均 1.56 µs：逐元素 kernel 约 485 个、
+  归约 62 个、top-k 与排序约 100 个；单个 kernel 的固定开销占主导。
+- RAVEN 的 GPU 空闲主要在：KV 提交前每轮重新遍历注意力模块列表（`raven_fast_commit.py` 第 128、134
+  行，约 0.3 ms，profiler 下）、验证的 `_plan_vectors`（约 0.2 ms）、草稿 token 拷回主机与拓扑构建
+  （`_get_variable_drafts_cpu`、`from_paths`、树掩码，合计约 0.4 ms）。
+- 结论：在 4090 上，RAVEN 相对 Cactus 剩余的约 2 ms/轮中，约 1.45 ms 是 GPU 建树和验证的小 kernel，
+  主机造成的额外 GPU 空闲只有约 0.4 ms。以上为测量结果；任何优化方案的收益尚未实测。
+
+限制：profile 只覆盖 10/3 题；profiler 下的空闲时间被放大，表中“GPU 空闲”行用无 profiler 的墙钟推算。
