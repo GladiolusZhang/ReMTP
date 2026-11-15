@@ -44,6 +44,27 @@ def _move_slots_kernel(base_ptr, kv_stride_ptr, slot_stride_ptr, src_ptr, dst_pt
         tl.store(plane + dst * slot_stride + offs, values, mask=mask)
 
 
+@triton.jit
+def _move_slots_count_kernel(base_ptr, kv_stride_ptr, slot_stride_ptr, src_ptr, dst_ptr, count_ptr,
+                             MAX_MOVES: tl.constexpr, WORDS: tl.constexpr, BLOCK: tl.constexpr):
+    """``_move_slots_kernel`` with the number of moves read on the device (async mode)."""
+    pid = tl.program_id(0)
+    layer = pid // 2
+    kv = pid % 2
+    base = tl.load(base_ptr + layer).to(tl.pointer_type(tl.int32))
+    kv_stride = tl.load(kv_stride_ptr + layer)
+    slot_stride = tl.load(slot_stride_ptr + layer)
+    plane = base + kv * kv_stride
+    offs = tl.arange(0, BLOCK)
+    count = tl.load(count_ptr)
+    for m in tl.static_range(MAX_MOVES):
+        live = (offs < WORDS) & (m < count)
+        src = tl.load(src_ptr + m).to(tl.int64)
+        dst = tl.load(dst_ptr + m).to(tl.int64)
+        values = tl.load(plane + src * slot_stride + offs, mask=live)
+        tl.store(plane + dst * slot_stride + offs, values, mask=live)
+
+
 class LayerTable:
     """Base pointers and int32-word strides of each layer's [2, slots, ...] KV cache."""
 
@@ -89,6 +110,12 @@ class LayerTable:
         _move_slots_kernel[(self.layers * 2,)](
             self.bases, self.kv_strides, self.slot_strides, sources, destinations, moves,
             WORDS=self.words, BLOCK=self.block, num_warps=4)
+
+    def move_counted(self, sources: torch.Tensor, destinations: torch.Tensor, count: torch.Tensor) -> None:
+        """The first ``count`` (device scalar) moves of ``sources``/``destinations``, in order."""
+        _move_slots_count_kernel[(self.layers * 2,)](
+            self.bases, self.kv_strides, self.slot_strides, sources, destinations, count,
+            MAX_MOVES=int(sources.numel()), WORDS=self.words, BLOCK=self.block, num_warps=4)
 
 
 def attention_caches(modules: Any) -> list[torch.Tensor]:
@@ -147,3 +174,16 @@ def commit_selected_slots_kernel(runner: Any, selected: tuple[int, ...]) -> None
     sources = slots.index_select(0, index + 1).to(torch.int64)
     destinations = slots[1: 1 + len(selected)].to(torch.int64)
     target_table(runner).move(sources, destinations)
+
+
+def commit_async(runner: Any) -> None:
+    """Async mode: accepted slots and their number come from ``async_tree.STATE`` (no host values)."""
+    from remtp import async_tree
+    from remtp.fixed6_vllm import _RUNTIME
+
+    state = async_tree.STATE
+    slots = _RUNTIME.target_slots
+    moves = state.accepted.shape[0]
+    sources = slots.index_select(0, state.accepted + 1).to(torch.int64)
+    destinations = slots[1: 1 + moves].to(torch.int64)
+    target_table(runner).move_counted(sources, destinations, state.moves)

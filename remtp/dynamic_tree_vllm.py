@@ -53,7 +53,8 @@ def _copy_variable_drafts_to_cpu(
 ) -> None:
     """Copy the real dynamic width into vLLM's maximum-width CPU buffer."""
     draft = self._draft_token_ids
-    if not torch.is_tensor(draft):
+    from remtp import async_tree
+    if not torch.is_tensor(draft) or async_tree.enabled():
         original = getattr(_copy_variable_drafts_to_cpu, "_dynamic_original")
         return original(self, scheduler_output, zeros_only=zeros_only)
     if zeros_only:
@@ -77,7 +78,8 @@ def _copy_variable_drafts_to_cpu(
 
 def _get_variable_drafts_cpu(self: Any) -> tuple[list[list[int]], list[str]]:
     width = getattr(self, "_dynamic_draft_width", None)
-    if width is None:
+    from remtp import async_tree
+    if width is None or async_tree.enabled():
         original = getattr(_get_variable_drafts_cpu, "_dynamic_original")
         return original(self)
     req_ids = self._draft_token_req_ids or []
@@ -312,9 +314,15 @@ def _set_target_tree_topology(runner: Any) -> None:
 
 
 def _prepare_dynamic_target_inputs(self: Any, *args: Any, **kwargs: Any) -> Any:
+    from remtp import async_tree
     from remtp import fixed6_vllm as fixed
 
-    _set_target_tree_topology(self)
+    if async_tree.enabled():
+        # The mask of the device-built tree, written on the device (2026-11-15).
+        if async_tree.STATE.ready:
+            async_tree.write_target_mask(self)
+    else:
+        _set_target_tree_topology(self)
     return fixed._prepare_target_tree_inputs(self, *args, **kwargs)
 
 
@@ -1111,6 +1119,17 @@ def install_mimo_dynamic_tree() -> None:
         print("[ReMTP][DynamicTree] trunk verification prelaunched: one host read, RNG offsets realigned", flush=True)
     if _fast.ASYNC_HOST:
         print("[ReMTP][DynamicTree] async host reads: pinned non-blocking copies, no scalar read-backs", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED", "0") in {"exact", "fast"}:
+        print("[ReMTP][DynamicTree] fused device tree decisions: "
+              f"{os.getenv('REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED')} row statistics, one Triton kernel per level", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_FAST_COMMIT", "0") == "3":
+        print("[ReMTP][DynamicTree] one-launch Triton KV path commit, device slot indices", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_DEVICE_VERIFY", "0") == "1":
+        print("[ReMTP][DynamicTree] device residual-hit verification: one host read, fixed randomness per round "
+              "(changes samples, not the distribution)", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_ASYNC", "0") == "1":
+        print("[ReMTP][DynamicTree] async scheduling: rounds stay on the device, fixed 9-slot capacity, "
+              "padded slots masked", flush=True)
     if os.getenv("REMTP_TREE_CUDAGRAPH", "0") == "1":
         from remtp.tree_cudagraph import install_tree_cudagraph
 

@@ -596,6 +596,19 @@ def propose_tree(proposer: Any, *, logits: torch.Tensor, positions: torch.Tensor
     bank_bfs = pack(bank_all)
     q_bank = torch.cat((root_q, q2, q3))                       # [1 + 3 + 4, V]
     probs_bfs = q_bank.index_select(0, bank_bfs)               # [9, V]
+    from remtp import async_tree
+    if async_tree.enabled():
+        # No host read: the tree stays in fixed-capacity device tensors (2026-11-15).
+        parent_all = torch.cat((torch.full((D1,), -1, dtype=torch.int64, device=device), ret2["parent"],
+                                n1 + ret3["parent"]))
+        ids = async_tree.publish_tree(n1=n1, n2=n2, n3=n3, tokens_bfs=tokens_bfs, codes_bfs=pack(codes_all),
+                                      parent_all=parent_all, target_for_pack=pack, probs_bfs=probs_bfs)
+        fixed._RUNTIME.topology = async_tree.capacity_topology()
+        fixed._RUNTIME.draft_slots = None
+        fixed._RUNTIME.draft_token_ids = async_tree.STATE.tokens
+        fixed._RUNTIME.draft_probs = async_tree.STATE.probs
+        fixed._RUNTIME.dynamic_construction = None
+        return [ids]
     invalid = torch.cat((sel1["invalid"][:1], sel2["invalid"] & valid1, sel3["invalid"] & valid2)).any()
     tie_risk = torch.cat((sel1["tie_risk"][:1], sel2["tie_risk"] & valid1, sel3["tie_risk"] & valid2)).any()
     header = torch.stack((n1, n2, n3, invalid.to(torch.int64), tie_risk.to(torch.int64)))

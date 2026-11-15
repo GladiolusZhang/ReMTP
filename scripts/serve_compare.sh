@@ -14,7 +14,7 @@
 #
 # Override with environment variables: MODEL_PATH, QUANTIZATION, LOAD_FORMAT,
 # PORT, MAX_MODEL_LEN, GPU_MEMORY_UTILIZATION, ENGINE_OPT, SPIN_WAIT, GPU_BUILD,
-# GPU_BUILD_FUSED (exact|fast), FAST_COMMIT (2|3).
+# GPU_BUILD_FUSED (exact|fast), FAST_COMMIT (2|3), ASYNC_SCHED (0|1).
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,7 +31,15 @@ export PORT="${PORT:-8000}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 export ENABLE_PREFIX_CACHING=0
-export NO_ASYNC_SCHEDULING=1
+# ASYNC_SCHED=1 (2026-11-15): vLLM async scheduling for every method, sync-free
+# draft sampling; RAVEN additionally keeps each round on the device.
+ASYNC_SCHED="${ASYNC_SCHED:-0}"
+if [[ "$ASYNC_SCHED" == "1" ]]; then
+  export NO_ASYNC_SCHEDULING=0
+  export REMTP_SYNC_FREE_SAMPLING=1
+else
+  export NO_ASYNC_SCHEDULING=1
+fi
 export FAST_MTP_NO_THINK="${FAST_MTP_NO_THINK:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export MTP_TOKENS=3
@@ -125,6 +133,11 @@ case "$name" in
       export REMTP_DYNAMIC_TREE_ASYNC_HOST=1
       export REMTP_DYNAMIC_TREE_GPU_BUILD="${GPU_BUILD:-1}"
       export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-0}"   # exact|fast (2026-11-15)
+      if [[ "$ASYNC_SCHED" == "1" ]]; then
+        export REMTP_DYNAMIC_TREE_ASYNC=1 REMTP_DYNAMIC_TREE_DEVICE_VERIFY=1
+        export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-exact}"
+        export REMTP_DYNAMIC_TREE_FAST_COMMIT=3
+      fi
       graph_config FULL "[1,2,3,4,5,6,7,8,9,10]"
     fi
     ;;

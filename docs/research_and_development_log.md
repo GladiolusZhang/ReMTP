@@ -5141,3 +5141,58 @@ Python 帧归因。
 
 限制：`fast` 统计模式与 `exact` 速度无差别，保留 `exact` 为推荐值；第 3 阶段需要固定 9 节点容量、GPU 端的
 目标掩码/位置与验证输出、vLLM 异步调度接入，尚未实现。
+
+### 2026-11-15：异步化第 3 阶段——RAVEN 接入 vLLM 异步调度
+
+状态：`代码已验证（GPU 单元测试 + HumanEval-100 四方法端到端）`
+
+修改（默认关闭；`scripts/serve_compare.sh` 的 `ASYNC_SCHED=1` 一次打开）：
+
+- `remtp/async_tree.py`（新）：`REMTP_DYNAMIC_TREE_ASYNC=1`。GPU 建树结束不再读回，树保存在固定容量的设备
+  张量里（9 个槽位、有效标记、深度、父槽位、主干槽位、主干兄弟）；目标树掩码在 GPU 上由父指针生成并写入
+  CUDA graph 的持久缓冲区，目标位置为 `anchor + depth`；空槽位只看锚点和自己，真实节点看不到空槽位，空槽位
+  的 KV 写在已提交长度之后。树的内容（节点数、分支、保留节点、松弛额度）每轮照旧自适应，只有目标看到的形状
+  固定为 10 行。
+- `remtp/gpu_tree.py`：异步模式下由 `async_tree.publish_tree` 发布树并返回 `[1, 9]` 草稿 id。
+- `remtp/device_verify.py`：新增 `verify_async`，在设备树上做与 `residual_hit_tree_verify_device` 相同的规则
+  与随机数预算，直接写出 vLLM 的 `sampled_token_ids`（其后填 -1）、接受槽位、接受个数和叶子行，不读回；
+  所有下标用 1 元素张量（0 维张量下标会触发读回）。`residual_hit_tree_verify_device` 增加 `noise_rows` 参数
+  以便与异步路径逐项对照。
+- `remtp/raven_commit_kernel.py`：`move_counted`/`commit_async`，搬移个数在设备上读取。
+- `remtp/fixed6_vllm.py`、`remtp/dynamic_tree_vllm.py`：采样器、KV 提交、首遍采样行、目标位置/掩码、草稿拷回
+  在异步模式下走上述设备路径；启动横幅标出各开关。
+- `remtp/probabilistic_mtp.py`：`REMTP_SYNC_FREE_SAMPLING=1` 去掉链式草稿采样里 `greedy.any()` 的主机读
+  （`where` 结果相同），使 Native/Cactus 在异步调度下同样无同步。
+- `scripts/serve_compare.sh`：`ASYNC_SCHED=1` 对所有方法关闭 `NO_ASYNC_SCHEDULING` 并开启无同步采样；RAVEN 另加
+  `ASYNC`、`DEVICE_VERIFY`、`GPU_BUILD_FUSED=exact`、`FAST_COMMIT=3`。默认 0，行为不变。
+
+验证：
+
+- `tests/test_async_tree.py` 3 项：设备树的有效位/深度/父节点/主干/兄弟与主机拓扑一致；掩码前 count+1 行
+  与 vLLM `_prepare_tree_attn_bias` 逐位相同，空槽位行只允许锚点和自身，真实行看不到空槽位（5 种拓扑）；
+  `verify_async` 与 `residual_hit_tree_verify_device(noise_rows=9)` 在 60 例上输出 token、接受槽位、个数、叶子
+  行全部一致；计数提交与参考搬移一致。完整 `pytest -q tests/` 716 项通过、1 项跳过。
+- 同步调试（`REMTP_HOST_TIMELINE_SYNC=1`）：异步 RAVEN 与异步 Cactus 每轮都没有同步调用（只剩每请求一次的温度
+  缓存）；主机只在 vLLM 自身等待上一步接受个数的事件处等待。
+- HumanEval-100（输出上限 512，T=0.6，`ENGINE_OPT=1`；结果在本地 `results/compare_4090_async_20261115`、
+  `results/compare_4090_sync_20261115b`，同一时段）：
+
+| 方法 | 调度 | pass@1 | MAL | ms/轮 | decode tok/s | 相对 AR |
+|---|---|---:|---:|---:|---:|---:|
+| AR | 异步 | 59/100 | — | 16.2 | 61.79 | 1.00× |
+| Native | 异步 | 60/100 | 3.157 | 22.8 | 138.59 | 2.24× |
+| Cactus | 异步 | 53/100 | 3.339 | 22.9 | 146.05 | 2.36× |
+| RAVEN v4-safe | 异步 | 55/100 | 3.508 | 24.3 | 144.55 | 2.34× |
+| Cactus | 同步 | 53/100 | 3.339 | 23.8 | 140.15 | — |
+| RAVEN v4-safe（第 1 阶段开关） | 同步 | 57/100 | 3.506 | 25.3 | 138.54 | — |
+
+- AR、Native、Cactus 的异步输出与同步运行在 100/100 题上逐 token 相同：异步调度本身不改变输出，对比公平。
+- 异步调度让 Cactus 快 4.2%、RAVEN 快 4.3%；RAVEN 相对 Cactus 仍低 1.0%（同步同一时段为 −1.1%）。RAVEN 的异步
+  输出与同步设备验证只有 9/100 题相同（随机数行数与目标/首遍的 GEMM 行数不同），MAL 3.508 对 3.510，pass@1
+  差异在单样本噪声内。
+- 异步下的耗时构成（10 题 CUDA event + 3 题 profiler）：RAVEN 墙钟 24.26 ms/轮、模型 GPU 22.62、其余 1.64，
+  profiler 下 GPU 空闲 0.66 ms/轮（几乎全是 <20 µs 的 kernel 间隙）；Cactus 墙钟 22.81、模型 22.30、其余 0.52。
+  主机已不是瓶颈，RAVEN 剩余约 1.45 ms/轮的差距是 GPU 时间：建树/验证/发布树的小 kernel 约 1.1 ms，目标前向与
+  首遍行数更多约 0.3 ms。
+
+限制：异步模式不做 Q 非有限值检查和逐轮审计（同步路径会在 Q 非法时报错）；不支持 checker 模式与其他树配置。

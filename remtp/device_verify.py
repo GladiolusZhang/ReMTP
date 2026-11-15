@@ -83,7 +83,10 @@ def residual_hit_tree_verify_device(
     *,
     config: Any,
     protected_node_indices: frozenset[int] = frozenset(),
+    noise_rows: int | None = None,
 ) -> TreeVerifyResult | None:
+    """``noise_rows``: anchor noise rows to draw (default: one per node; the async
+    path draws the full capacity, and a test passes it to compare the two)."""
     if not supported(config, protected_node_indices) or generator is None:
         return None
     config.validate()
@@ -141,10 +144,11 @@ def residual_hit_tree_verify_device(
 
     # Fixed randomness per round: uniforms, then exponential-race noise rows.
     uniforms = torch.rand(length, device=device, generator=generator)
-    noise = torch.empty(length + count, vocabulary, device=device, dtype=torch.float32)
+    rows = count if noise_rows is None else max(int(noise_rows), count)
+    noise = torch.empty(length + rows, vocabulary, device=device, dtype=torch.float32)
     noise.exponential_(generator=generator)
     corrections = (residual / noise[:length]).argmax(dim=-1)                       # [L]
-    anchors = (target[1:count + 1] / noise[length:]).argmax(dim=-1)                 # [count]
+    anchors = (target[1:count + 1] / noise[length:length + count]).argmax(dim=-1)   # [count]
 
     ratio = torch.clamp(verify_y.double() / torch.clamp_min(q.double(), 1e-30), max=1.0)
     accept = uniforms.double() <= ratio
@@ -227,3 +231,97 @@ def residual_hit_tree_verify_device(
     diagnostics[hit_h].update(rescue_extension_tokens=1, rescue_unlocked_tokens=1,
                               rescue_decision_mode="exact-residual-token-hit")
     return result((correction_h, anchor_h), "residual-hit-target-anchor", 1, 1.0)
+
+
+def verify_async(state: Any, target_probs_by_input: torch.Tensor, output_width: int,
+                 generator: torch.Generator, *, config: Any) -> torch.Tensor:
+    """``residual_hit_tree_verify_device`` on the fixed-capacity device tree, no host read.
+
+    ``state`` is ``async_tree.STATE``.  Returns vLLM's padded ``sampled_token_ids``
+    row ``[1, output_width]`` (-1 after the round's tokens) and stores the
+    accepted slots, their number and the accepted leaf's target row in
+    ``state`` for the KV commit and the next MTP first pass.  The rule and the
+    randomness budget are those of ``residual_hit_tree_verify_device``.
+    """
+    if not supported(config, frozenset()):
+        raise RuntimeError("async RAVEN verification needs the v4-safe residual_hit_anchor configuration")
+    device = target_probs_by_input.device
+    count = state.tokens.shape[0]
+    length = state.trunk.shape[0]
+    ids = state.tokens
+    draft = normalize_rows_nosync(state.probs)
+    target = normalize_rows_nosync(target_probs_by_input)
+    vocabulary = target.shape[1]
+    trunk = state.trunk
+    parent_rows = torch.cat((torch.zeros(1, dtype=torch.int64, device=device), trunk[:-1] + 1))
+    key = ("deltas", length, str(device))
+    deltas = _CACHE.get(key)
+    if deltas is None:
+        deltas = torch.tensor([config.relaxation_delta(d) for d in range(1, length + 1)],
+                              dtype=torch.float32).to(device)
+        _CACHE[key] = deltas
+
+    tokens = ids.index_select(0, trunk)
+    p_rows = target.index_select(0, parent_rows)
+    q_rows = draft.index_select(0, trunk)
+    p = p_rows.gather(1, tokens[:, None])[:, 0]
+    q = q_rows.gather(1, tokens[:, None])[:, 0]
+    p_max = target.max(dim=-1).values.index_select(0, parent_rows)
+    floor = _trunk_floor(p.clamp_min(0.0), q.clamp_min(0.0), p_max, deltas, config)
+    p64 = p.double()
+    boosted = torch.clamp(torch.maximum(p64 + floor.double(), p64), max=1.0)
+    boost = (boosted > p64) & (p64 < 1.0)
+    scale = ((1.0 - boosted) / torch.clamp_min(1.0 - p64, 1e-30)).to(torch.float32)
+    verify_rows, residual_rows = [], []
+    for k in range(length):
+        row = p_rows[k] * scale[k]
+        row.index_put_((tokens[k].reshape(1),), boosted[k].to(torch.float32).reshape(1))
+        row = row / row.sum().clamp_min(1e-30)
+        row = torch.where(boost[k], row, p_rows[k])
+        verify_rows.append(row)
+        residual_rows.append(residual_distribution_nosync(row, q_rows[k]))
+    verify = torch.stack(verify_rows)
+    residual = torch.stack(residual_rows)
+    verify_y = verify.gather(1, tokens[:, None])[:, 0]
+
+    uniforms = torch.rand(length, device=device, generator=generator)
+    noise = torch.empty(length + count, vocabulary, device=device, dtype=torch.float32)
+    noise.exponential_(generator=generator)
+    corrections = (residual / noise[:length]).argmax(dim=-1)
+    anchors = (target[1:count + 1] / noise[length:]).argmax(dim=-1)
+
+    ratio = torch.clamp(verify_y.double() / torch.clamp_min(q.double(), 1e-30), max=1.0)
+    reject = ~(uniforms.double() <= ratio)
+    first = torch.where(reject.any(), reject.to(torch.int64).argmax(),
+                        torch.full((), length, device=device, dtype=torch.int64))
+    full = first >= length
+    # 1-element index tensors throughout: a 0-d tensor index would read it back to the host.
+    at = torch.clamp(first, max=length - 1).reshape(1)
+    correction = corrections.index_select(0, at)[0]
+    candidates = state.siblings.index_select(0, at)[0]
+    hits = (candidates >= 0) & (ids.index_select(0, candidates.clamp_min(0)) == correction)
+    first_hit = hits.to(torch.int64).argmax().reshape(1)
+    hit_node = torch.where(hits.any(), candidates.index_select(0, first_hit)[0], torch.full_like(correction, -1))
+    has_hit = (~full) & (hit_node >= 0)
+    leaf_bonus = anchors.index_select(0, trunk[-1:])[0]
+    hit_anchor = anchors.index_select(0, hit_node.clamp_min(0).reshape(1))[0]
+
+    position = torch.arange(output_width, device=device)
+    out = torch.where(position < first, tokens[position.clamp(max=length - 1)], torch.full_like(position, -1))
+    out = torch.where(full & (position == length), leaf_bonus, out)
+    out = torch.where((~full) & (position == first), correction, out)
+    out = torch.where(has_hit & (position == first + 1), hit_anchor, out)
+
+    slot = torch.arange(length, device=device)
+    accepted = torch.where(slot < first, trunk, torch.where(has_hit & (slot == first), hit_node,
+                                                            torch.zeros_like(trunk)))
+    moves = first.clamp(max=length) + has_hit.to(torch.int64)
+    leaf = accepted.index_select(0, (moves - 1).clamp_min(0).reshape(1))[0]
+    state.accepted.copy_(accepted)
+    state.moves.copy_(moves)
+    state.leaf_row.copy_(torch.where(moves > 0, leaf + 1, torch.zeros_like(leaf)))
+    STATS["rounds"] += 1
+    return out.to(torch.int32).view(1, output_width)
+
+
+_CACHE: dict[Any, torch.Tensor] = {}

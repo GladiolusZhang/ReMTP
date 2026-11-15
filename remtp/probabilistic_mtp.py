@@ -36,6 +36,8 @@ _DRAFT_PROBS_HOOK: Any | None = None
 _DRAFT_TEMPERATURE_HOOK: Any | None = None
 
 
+_SYNC_FREE = os.getenv("REMTP_SYNC_FREE_SAMPLING", "0") == "1"
+
 def sample_mtp_logits(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -96,7 +98,9 @@ def sample_mtp_logits(
             exponential_noise[row].exponential_(generator=generator)
 
     sampled = (probs / exponential_noise).argmax(dim=-1)
-    if greedy.any():
+    if _SYNC_FREE or greedy.any():
+        # REMTP_SYNC_FREE_SAMPLING=1 (2026-11-15): same values without the host
+        # read of ``greedy.any()`` (``where`` keeps ``sampled`` on stochastic rows).
         sampled = torch.where(
             greedy,
             raw_logits.argmax(dim=-1),

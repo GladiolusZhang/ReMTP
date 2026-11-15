@@ -547,6 +547,12 @@ def _prepare_selected_path_inputs(self: Any, *args: Any, **kwargs: Any) -> Any:
     """Make the next MTP root consume the selected tree leaf hidden state."""
     original = getattr(_prepare_selected_path_inputs, "_fixed6_original")
     common, token_indices, rejected = original(self, *args, **kwargs)
+    from remtp import async_tree
+    if _RUNTIME.target_tree_active and async_tree.enabled():
+        if token_indices.numel() != 1:
+            raise RuntimeError("dynamic MTP tree requires one request")
+        token_indices[0:1].copy_(async_tree.STATE.leaf_row.view(1).to(token_indices.dtype))
+        return common, token_indices, rejected
     if _RUNTIME.target_tree_active:
         if token_indices.numel() != 1:
             raise RuntimeError("dynamic MTP tree requires one request")
@@ -582,6 +588,12 @@ def _prepare_target_tree_inputs(self: Any, *args: Any, **kwargs: Any) -> Any:
 
     input_count = node_budget + 1
     positions = self._get_positions(input_count)
+    from remtp import async_tree
+    if async_tree.enabled():
+        async_tree.set_target_positions(positions)
+        metadata.fixed6_topology = _RUNTIME.topology.name
+        metadata.fixed6_parent_logit_rows = _RUNTIME.topology.parent_logit_rows
+        return result
     offsets = _offset_tensor(
         (0,) + tuple(_RUNTIME.topology.node_position_offsets),
         positions.dtype,
@@ -849,6 +861,20 @@ def _strict_tree_sampler(self: Any, metadata: Any, draft_probs: Any, logits: tor
         )
     else:
         _RUNTIME.target_top1_ids = ()
+    from remtp import async_tree
+    if async_tree.enabled():
+        # Async scheduling (2026-11-15): verification output stays on the device.
+        from remtp import device_verify
+        from remtp.dynamic_tree_vllm import dynamic_tree_config_from_env
+
+        output = device_verify.verify_async(
+            async_tree.STATE, target_probs, metadata.max_spec_len + 1, _generator(sampling_metadata),
+            config=dynamic_tree_config_from_env())
+        _RUNTIME.selected_nodes = ()
+        _RUNTIME.rounds += 1
+        _RUNTIME.target_calls += 1
+        _RUNTIME.target_nodes += node_budget
+        return SamplerOutput(sampled_token_ids=output, logprobs_tensors=None)
     if os.getenv("REMTP_TREE_FORCE_ROOT_REJECT") == "1":
         correction = sample_categorical(target_probs[0], _generator(sampling_metadata))
         result = TreeVerifyResult(
@@ -920,6 +946,13 @@ def _compact_selected_path(self: Any, output_token_ids: torch.Tensor, scheduler_
     if _RUNTIME.topology.name == "6-chain":
         _RUNTIME.target_gdn_state_rows = None
         return original(self, output_token_ids, scheduler_output)
+    from remtp import async_tree
+    if async_tree.enabled():
+        from remtp.raven_commit_kernel import commit_async
+
+        commit_async(self)
+        _RUNTIME.target_gdn_state_rows = None
+        return original(self, output_token_ids[:, :1], scheduler_output)
     selected = _RUNTIME.selected_nodes
     commit_mode = os.getenv("REMTP_DYNAMIC_TREE_FAST_COMMIT", "0")
     if selected and _RUNTIME.target_slots is not None and commit_mode == "3":
