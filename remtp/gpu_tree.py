@@ -299,6 +299,23 @@ def branch_noise(paths: list[tuple[int, ...]], initial_seed: int, proposal_round
     return noise
 
 
+_BATCHED_GENERATORS: dict[str, torch.Generator] = {}
+
+
+def batched_branch_noise(initial_seed: int, proposal_round: int, vocabulary: int,
+                         device: torch.device) -> torch.Tensor:
+    """All branch noise rows of a round from one generator seeded with ``branch_seed(seed, round, ())``."""
+    key = str(device)
+    generator = _BATCHED_GENERATORS.get(key)
+    if generator is None:
+        generator = _BATCHED_GENERATORS[key] = torch.Generator(device=device)
+    generator.manual_seed(branch_seed(initial_seed, proposal_round, ()))
+    noise = torch.empty(len(DEPTH2_BRANCH_PATHS) + len(DEPTH3_BRANCH_PATHS), vocabulary, dtype=torch.float32,
+                        device=device)
+    noise.exponential_(generator=generator)
+    return noise
+
+
 DEPTH2_BRANCH_PATHS = [(1,), (2,)]
 DEPTH3_BRANCH_PATHS = [(a, b) for a in range(3) for b in range(3) if (a, b) != (0, 0)]
 # depth-2 path code (4a + b) -> row of the depth-3 branch noise bank
@@ -511,8 +528,14 @@ def propose_tree(proposer: Any, *, logits: torch.Tensor, positions: torch.Tensor
                     config=config, sampling_metadata=sampling_metadata, proposal_round=proposal_round)
     root_hidden = hidden_states.reshape(1, -1)[0]
     # Branch noise for both levels (independent generators; no request-RNG use).
-    noise2 = branch_noise(DEPTH2_BRANCH_PATHS, initial_seed, proposal_round, vocabulary, device)
-    noise3 = branch_noise(DEPTH3_BRANCH_PATHS, initial_seed, proposal_round, vocabulary, device)
+    if os.getenv("REMTP_DYNAMIC_TREE_BATCHED_BRANCH_NOISE", "0") == "1":
+        # One generator per round seeded from (request seed, round), all 10 branch rows in one
+        # draw (2026-11-15): independent rows as before, different samples.
+        noise = batched_branch_noise(initial_seed, proposal_round, vocabulary, device)
+        noise2, noise3 = noise[:len(DEPTH2_BRANCH_PATHS)], noise[len(DEPTH2_BRANCH_PATHS):]
+    else:
+        noise2 = branch_noise(DEPTH2_BRANCH_PATHS, initial_seed, proposal_round, vocabulary, device)
+        noise3 = branch_noise(DEPTH3_BRANCH_PATHS, initial_seed, proposal_round, vocabulary, device)
 
     # ---- depth 2 --------------------------------------------------------------------
     with force_mimo_mtp_layer(mtp_layer_for_tree_depth(2, route)):
@@ -580,6 +603,17 @@ def propose_tree(proposer: Any, *, logits: torch.Tensor, positions: torch.Tensor
                     backup_budget=config.max_children_per_parent - 1, config=config,
                     sampling_metadata=sampling_metadata, proposal_round=proposal_round)
 
+    from remtp import async_tree
+    if async_tree.enabled():
+        # No host read: the tree stays in fixed-capacity device tensors (2026-11-15).
+        ids = async_tree.publish_levels(n1=n1, n2=n2, n3=n3, tok1=tok1, ret2=ret2, ret3=ret3,
+                                        q_bank=torch.cat((root_q, q2, q3)))
+        fixed._RUNTIME.topology = async_tree.capacity_topology()
+        fixed._RUNTIME.draft_slots = None
+        fixed._RUNTIME.draft_token_ids = async_tree.STATE.tokens
+        fixed._RUNTIME.draft_probs = async_tree.STATE.probs
+        fixed._RUNTIME.dynamic_construction = None
+        return [ids]
     # ---- assemble in BFS order and read the tree once --------------------------------
     level_valid = torch.cat((valid1, valid2, torch.arange(D3, device=device) < n3))
     tokens_all = torch.cat((tok1, ret2["token"], ret3["token"]))
@@ -596,19 +630,6 @@ def propose_tree(proposer: Any, *, logits: torch.Tensor, positions: torch.Tensor
     bank_bfs = pack(bank_all)
     q_bank = torch.cat((root_q, q2, q3))                       # [1 + 3 + 4, V]
     probs_bfs = q_bank.index_select(0, bank_bfs)               # [9, V]
-    from remtp import async_tree
-    if async_tree.enabled():
-        # No host read: the tree stays in fixed-capacity device tensors (2026-11-15).
-        parent_all = torch.cat((torch.full((D1,), -1, dtype=torch.int64, device=device), ret2["parent"],
-                                n1 + ret3["parent"]))
-        ids = async_tree.publish_tree(n1=n1, n2=n2, n3=n3, tokens_bfs=tokens_bfs, codes_bfs=pack(codes_all),
-                                      parent_all=parent_all, target_for_pack=pack, probs_bfs=probs_bfs)
-        fixed._RUNTIME.topology = async_tree.capacity_topology()
-        fixed._RUNTIME.draft_slots = None
-        fixed._RUNTIME.draft_token_ids = async_tree.STATE.tokens
-        fixed._RUNTIME.draft_probs = async_tree.STATE.probs
-        fixed._RUNTIME.dynamic_construction = None
-        return [ids]
     invalid = torch.cat((sel1["invalid"][:1], sel2["invalid"] & valid1, sel3["invalid"] & valid2)).any()
     tie_risk = torch.cat((sel1["tie_risk"][:1], sel2["tie_risk"] & valid1, sel3["tie_risk"] & valid2)).any()
     header = torch.stack((n1, n2, n3, invalid.to(torch.int64), tie_risk.to(torch.int64)))

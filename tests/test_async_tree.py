@@ -136,3 +136,72 @@ def test_async_commit_moves_the_first_count_pairs():
         copy_cache_slots_inplace(reference, list(zip(sources.tolist(), destinations.tolist()))[:moves])
         for a, b in zip(reference, candidate):
             assert torch.equal(a.kv_cache[0], b.kv_cache[0]), moves
+
+
+def test_fused_async_verification_equals_async_verification():
+    from remtp import device_verify_fused
+
+    config = _config()
+    generator = torch.Generator(device=DEVICE).manual_seed(8)
+    same = 0
+    cases = 80
+    for case in range(cases):
+        paths = TOPOLOGIES[case % len(TOPOLOGIES)]
+        topology = DynamicTreeTopology.from_paths(paths)
+        count = topology.node_count
+        vocab = 40 if case % 3 == 0 else (3000 if case % 3 == 1 else 151680)
+        _publish(topology, vocab, generator)
+        target = torch.softmax(torch.randn(async_tree.CAPACITY + 1, vocab, device=DEVICE, generator=generator)
+                               * (1.0 + case % 4), dim=-1)
+        seed = 300 + case
+        reference = device_verify.verify_async(async_tree.STATE, target, 10,
+                                               torch.Generator(device=DEVICE).manual_seed(seed), config=config)
+        ref_state = (async_tree.STATE.accepted.clone(), async_tree.STATE.moves.clone(),
+                     async_tree.STATE.leaf_row.clone())
+        fused = device_verify_fused.verify_async_fused(async_tree.STATE, target, 10,
+                                                       torch.Generator(device=DEVICE).manual_seed(seed), config=config)
+        match = (torch.equal(fused, reference) and torch.equal(async_tree.STATE.accepted, ref_state[0])
+                 and torch.equal(async_tree.STATE.moves, ref_state[1])
+                 and torch.equal(async_tree.STATE.leaf_row, ref_state[2]))
+        same += int(match)
+        produced = [x for x in fused[0].tolist() if x >= 0]
+        assert 1 <= len(produced) <= 4 and fused[0, len(produced):].eq(-1).all()
+    # Row sums are reduced in another order (last-bit differences); decisions agree except at a cut.
+    print(f"fused == torch async verification on {same}/{cases} cases")
+    assert same >= cases - 2, same
+
+
+def test_publish_kernel_equals_reference_publish():
+    generator = torch.Generator(device=DEVICE).manual_seed(12)
+    vocab = 700
+    for paths in TOPOLOGIES:
+        topology = DynamicTreeTopology.from_paths(paths)
+        nodes = topology.nodes
+        d1 = [n for n in nodes if n.depth == 1]
+        d2 = [n for n in nodes if n.depth == 2]
+        d3 = [n for n in nodes if n.depth == 3]
+        tokens = torch.randint(0, vocab, (len(nodes),), device=DEVICE, generator=generator)
+        q_bank = torch.softmax(torch.randn(8, vocab, device=DEVICE, generator=generator), dim=-1)
+        pad = lambda values, size: torch.tensor(values + [0] * (size - len(values)), dtype=torch.int64, device=DEVICE)
+        d2_slot = {n.path: k for k, n in enumerate(d2)}
+        ret2 = dict(token=pad([int(tokens[n.index]) for n in d2], 4), code=pad([_code(n.path) for n in d2], 4),
+                    parent=pad([n.path[0] for n in d2], 4))
+        ret3 = dict(token=pad([int(tokens[n.index]) for n in d3], 7), code=pad([_code(n.path) for n in d3], 7),
+                    parent=pad([d2_slot[n.path[:2]] for n in d3], 7))
+        tok1 = pad([int(tokens[n.index]) for n in d1], 3)
+        t = lambda x: torch.tensor(x, dtype=torch.int64, device=DEVICE)
+        ids = async_tree.publish_levels(n1=t(len(d1)), n2=t(len(d2)), n3=t(len(d3)), tok1=tok1, ret2=ret2, ret3=ret3,
+                                        q_bank=q_bank)
+        state = async_tree.STATE
+        count = len(nodes)
+        assert ids[0, :count].tolist() == tokens.tolist()
+        assert state.valid.tolist() == [i < count for i in range(9)]
+        assert state.depth[:count].tolist() == [n.depth for n in nodes]
+        assert state.parent[:count].tolist() == [-1 if n.parent is None else n.parent for n in nodes]
+        assert state.trunk.tolist() == [n.index for n in nodes if n.path == (0,) * n.depth]
+        for k, node in enumerate(state.trunk.tolist()):
+            expected = [s for s in topology.children_of(nodes[node].parent) if s != node]
+            assert [s for s in state.siblings[k].tolist() if s >= 0] == expected, (paths, k)
+        bank = [0 if n.depth == 1 else (1 + n.path[0] if n.depth == 2 else 4 + d2_slot[n.path[:2]]) for n in nodes]
+        assert torch.equal(state.probs[:count], q_bank[bank])
+        assert torch.equal(state.mask, async_tree.tree_mask(state.valid, state.parent)), paths

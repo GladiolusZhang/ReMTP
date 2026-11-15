@@ -135,7 +135,9 @@ case "$name" in
       export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-0}"   # exact|fast (2026-11-15)
       if [[ "$ASYNC_SCHED" == "1" ]]; then
         export REMTP_DYNAMIC_TREE_ASYNC=1 REMTP_DYNAMIC_TREE_DEVICE_VERIFY=1
-        export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-exact}"
+        export REMTP_DYNAMIC_TREE_VERIFY_FUSED="${VERIFY_FUSED:-1}"
+        export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-fast}"
+        export REMTP_DYNAMIC_TREE_BATCHED_BRANCH_NOISE="${BATCHED_BRANCH_NOISE:-1}"
         export REMTP_DYNAMIC_TREE_FAST_COMMIT=3
       fi
       graph_config FULL "[1,2,3,4,5,6,7,8,9,10]"

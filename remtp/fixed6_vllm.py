@@ -867,7 +867,10 @@ def _strict_tree_sampler(self: Any, metadata: Any, draft_probs: Any, logits: tor
         from remtp import device_verify
         from remtp.dynamic_tree_vllm import dynamic_tree_config_from_env
 
-        output = device_verify.verify_async(
+        from remtp import device_verify_fused
+        verify = (device_verify_fused.verify_async_fused if device_verify_fused.enabled()
+                  else device_verify.verify_async)
+        output = verify(
             async_tree.STATE, target_probs, metadata.max_spec_len + 1, _generator(sampling_metadata),
             config=dynamic_tree_config_from_env())
         _RUNTIME.selected_nodes = ()

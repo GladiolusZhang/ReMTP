@@ -5196,3 +5196,39 @@ Python 帧归因。
   首遍行数更多约 0.3 ms。
 
 限制：异步模式不做 Q 非有限值检查和逐轮审计（同步路径会在 Q 非法时报错）；不支持 checker 模式与其他树配置。
+
+### 2026-11-15：异步模式下的 kernel 融合（验证、建树统计/top-4、发布树、分支噪声）
+
+状态：`代码已验证（GPU 单元测试与微基准）；端到端测速被其他用户的 GPU 任务干扰，需重测`
+
+动机：异步调度后主机已不是瓶颈，RAVEN 比 Cactus 每轮多的约 1.45 ms 是 GPU 时间，其中验证约 0.48 ms（265 个
+kernel/轮）、建树约 0.79 ms（约 450 个 kernel/轮）。
+
+修改（`ASYNC_SCHED=1` 时由 `scripts/serve_compare.sh` 默认打开，均可单独关闭）：
+
+- `remtp/device_verify_fused.py`（新，`REMTP_DYNAMIC_TREE_VERIFY_FUSED=1`）：异步验证改为 4 个 Triton kernel 加两次
+  随机数调用。每次词表遍历按行切成 32 段并以固定顺序归约（确定性）；argmax 取最大键、并列取最小下标（同
+  `torch.argmax`）。与 `verify_async` 的差别只在最后一位：行和归约顺序不同、加成行不再除以自身的和（按缩放
+  系数的构造它等于 1）、指数竞赛用未归一化的残差（正比例缩放）。随机数预算不变。
+- `remtp/gpu_tree_fused.py`：`fast` 模式改用两个分段 kernel 计算行统计（熵用 `log T - Σ c·log c / T`）和精确
+  top-4（值降序、下标升序），替代逐行 torch 统计与 `torch.topk`；`exact` 模式不变。
+- `remtp/async_tree.py`：`publish_levels` 用一个 Triton kernel 由各层输出生成槽位、深度、父节点、主干、兄弟、
+  Q 行号与目标掩码，Q 用一次 `index_select` 写入；保留 torch 版 `publish_tree` 作参照。
+- `remtp/gpu_tree.py`：`REMTP_DYNAMIC_TREE_BATCHED_BRANCH_NOISE=1` 时一轮的 10 行分支噪声由一个按
+  `branch_seed(seed, round, ())` 重新播种的生成器一次生成（行间独立，具体样本改变）；异步发布移到通用组装之前。
+  注：在 residual_hit_anchor 中分支采样出的节点（非主干父节点的子节点）不会被验证使用，只影响保留预算的排序。
+- `scripts/serve_compare.sh`：异步时 `GPU_BUILD_FUSED` 默认 `fast`，新增 `VERIFY_FUSED`、`BATCHED_BRANCH_NOISE`（默认 1）。
+
+验证：
+
+- `tests/test_async_tree.py` 新增 2 项（共 5 项）：融合验证与 `verify_async` 在 80 例（vocab 40/3000/151680）上
+  输出、接受槽位、个数、叶子行全部一致；发布 kernel 与 torch 版发布在 5 种拓扑上逐项一致（含 Q 行与掩码）。
+  `tests/test_gpu_tree_fused.py` 4 项通过（`fast` 模式在 36 例上决策与 `gpu_tree._level` 相同）。
+  CPU 下完整 `pytest -q tests/`：679 通过、35 跳过（GPU 测试在无 GPU 时跳过）。
+- 微基准（4090，eager 循环，含主机启动开销）：验证 torch 版 1.11 ms → 融合 0.145 ms；4 行统计 + top-k
+  0.302 ms → 0.079 ms。
+- HumanEval-100 异步对比（`results/compare_4090_async_fused_20261115`）：Cactus 27.7 ms/轮、120.50 tok/s，RAVEN
+  28.4 ms/轮、123.52 tok/s，MAL 3.506。两者都比 1 小时前慢约 20%：运行期间另一用户的进程
+  （`run_oned_v25.py`，约 16:09 开始）在同一 GPU 上运行，这组吞吐不能作为结论，需在 GPU 独占时重测。
+  Cactus 的输出与上一轮异步运行 100/100 相同；融合后的 RAVEN 与未融合的异步 RAVEN 78/100 题相同
+  （其余因统计量最后一位与分支噪声改变而在后段分开）。

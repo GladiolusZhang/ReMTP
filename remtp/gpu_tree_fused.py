@@ -92,6 +92,110 @@ def row_stats_fast(q_rows: torch.Tensor) -> torch.Tensor:
     return out
 
 
+SPLITS = 32
+PART = 11   # per (row, split): sum, sum c*log c, min, then 4 x (value, index)
+
+
+@triton.jit
+def _level_partial_kernel(rows_ptr, row_stride, part_ptr, V, CHUNK, S: tl.constexpr, BLOCK: tl.constexpr):
+    """Per (row, split): clamped mass, sum of c*log(c), raw minimum and the split's top 4 (value desc, index asc)."""
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    base = rows_ptr + row.to(tl.int64) * row_stride
+    lo = split * CHUNK
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    acc_log = tl.zeros([BLOCK], dtype=tl.float32)
+    low = tl.full([BLOCK], float("inf"), dtype=tl.float32)
+    for start in range(0, CHUNK, BLOCK):
+        local = start + tl.arange(0, BLOCK)
+        offs = lo + local
+        m = (offs < V) & (local < CHUNK)
+        x = tl.load(base + offs, mask=m, other=0.0)
+        c = tl.where(x < 0.0, 0.0, x)
+        acc += c
+        acc_log += tl.where(m, c * libdevice.log(tl.where(c < 1e-30, 1e-30, c)), 0.0)
+        low = tl.minimum(low, tl.where(m, x, float("inf")))
+    out = part_ptr + (row * S + split) * 11
+    tl.store(out + 0, tl.sum(acc, axis=0))
+    tl.store(out + 1, tl.sum(acc_log, axis=0))
+    tl.store(out + 2, tl.min(low, axis=0))
+    s0 = -1
+    s1 = -1
+    s2 = -1
+    for t in tl.static_range(4):
+        best = tl.full([BLOCK], -1.0, dtype=tl.float32)
+        best_idx = tl.full([BLOCK], 2147483647, dtype=tl.int32)
+        for start in range(0, CHUNK, BLOCK):
+            local = start + tl.arange(0, BLOCK)
+            offs = lo + local
+            m = (offs < V) & (local < CHUNK) & (offs != s0) & (offs != s1) & (offs != s2)
+            x = tl.load(base + offs, mask=m, other=0.0)
+            c = tl.where(m, tl.where(x < 0.0, 0.0, x), -1.0)
+            better = c > best
+            best_idx = tl.where(better, offs, best_idx)
+            best = tl.where(better, c, best)
+        top = tl.max(best, axis=0)
+        idx = tl.min(tl.where(best == top, best_idx, 2147483647), axis=0)
+        tl.store(out + 3 + 2 * t, top)
+        tl.store(out + 4 + 2 * t, idx.to(tl.float32))
+        if t == 0:
+            s0 = idx
+        if t == 1:
+            s1 = idx
+        if t == 2:
+            s2 = idx
+
+
+@triton.jit
+def _merge_kernel(part_ptr, rows_ptr, row_stride, stats_ptr, topv_ptr, topi_ptr, P, V, inv_log_v,
+                  S: tl.constexpr, PB: tl.constexpr, W: tl.constexpr):
+    """Fixed-order reduction of the partials into ``row_stats``/``topk`` layout (top 4 first, then padding)."""
+    r = tl.arange(0, PB)
+    rm = r < P
+    sp = tl.arange(0, S)
+    base = part_ptr + (r[:, None] * S + sp[None, :]) * 11
+    total = tl.sum(tl.load(base + 0, mask=rm[:, None], other=0.0), axis=1)
+    clogc = tl.sum(tl.load(base + 1, mask=rm[:, None], other=0.0), axis=1)
+    minimum = tl.min(tl.load(base + 2, mask=rm[:, None], other=float("inf")), axis=1)
+    safe = tl.where(total > 0.0, total, 1.0)
+    entropy = (libdevice.log(safe) - clogc / safe) * inv_log_v
+    tl.store(stats_ptr + r * 3 + 0, total, mask=rm)
+    tl.store(stats_ptr + r * 3 + 1, minimum, mask=rm)
+    tl.store(stats_ptr + r * 3 + 2, entropy, mask=rm)
+    c = tl.arange(0, S * 4)
+    vals = tl.load(part_ptr + (r[:, None] * S + c[None, :] // 4) * 11 + 3 + 2 * (c[None, :] % 4),
+                   mask=rm[:, None], other=-1.0)
+    ids = tl.load(part_ptr + (r[:, None] * S + c[None, :] // 4) * 11 + 4 + 2 * (c[None, :] % 4),
+                  mask=rm[:, None], other=0.0).to(tl.int32)
+    for t in tl.static_range(4):
+        top = tl.max(vals, axis=1)
+        idx = tl.min(tl.where(vals == top[:, None], ids, 2147483647), axis=1)
+        tl.store(topv_ptr + r * W + t, top, mask=rm)
+        tl.store(topi_ptr + r * W + t, idx.to(tl.int64), mask=rm)
+        vals = tl.where(ids == idx[:, None], -2.0, vals)
+    j = tl.arange(0, W)
+    pad = (j >= 4)[None, :] & rm[:, None]
+    tl.store(topv_ptr + r[:, None] * W + j[None, :], tl.full([PB, W], -1.0, dtype=tl.float32), mask=pad)
+    tl.store(topi_ptr + r[:, None] * W + j[None, :], (V + j[None, :] + r[:, None] * 0).to(tl.int64), mask=pad)
+
+
+def partial_stats_topk(p32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``fast`` mode: row statistics and the exact top 4 in two kernels (split over the vocabulary)."""
+    rows, vocabulary = p32.shape
+    device = p32.device
+    chunk = triton.cdiv(vocabulary, SPLITS)
+    part = torch.empty(rows * SPLITS * PART, dtype=torch.float32, device=device)
+    _level_partial_kernel[(rows, SPLITS)](p32, p32.stride(0), part, vocabulary, chunk, S=SPLITS, BLOCK=1024,
+                                          num_warps=4)
+    stats = torch.empty(rows, 3, dtype=torch.float32, device=device)
+    top_values = torch.empty(rows, WIDTH, dtype=torch.float32, device=device)
+    top_ids = torch.empty(rows, WIDTH, dtype=torch.int64, device=device)
+    inv = float(np.float32(1.0) / np.float32(math.log(vocabulary)))
+    _merge_kernel[(1,)](part, p32, p32.stride(0), stats, top_values, top_ids, rows, vocabulary, inv,
+                        S=SPLITS, PB=PARENT_BLOCK, W=WIDTH, num_warps=4)
+    return stats, top_values, top_ids
+
+
 def row_stats_exact(q_rows: torch.Tensor) -> torch.Tensor:
     """The per-row op sequence of ``gpu_tree.select_children`` (bitwise-equal scalars)."""
     rows, vocabulary = q_rows.shape
@@ -319,13 +423,16 @@ def fused_level(q: torch.Tensor, sampled: torch.Tensor, parent_valid: torch.Tens
     device = q.device
     p32 = q if q.dtype == torch.float32 else q.to(torch.float32)
     p32 = p32.contiguous()
-    stats = row_stats_exact(p32) if mode == "exact" else row_stats_fast(p32)
     width = min(WIDTH, vocabulary)
     if width != WIDTH:
         raise ValueError("fused level needs a vocabulary of at least 32 tokens")
-    top_values, top_ids = torch.topk(p32, width, dim=-1, sorted=True)
-    top_values = top_values.contiguous()
-    top_ids = top_ids.contiguous()
+    if mode == "exact":
+        stats = row_stats_exact(p32)
+        top_values, top_ids = torch.topk(p32, width, dim=-1, sorted=True)
+        top_values = top_values.contiguous()
+        top_ids = top_ids.contiguous()
+    else:
+        stats, top_values, top_ids = partial_stats_topk(p32)
     i64, f32, f64 = torch.int64, torch.float32, torch.float64
     sel_tokens = torch.empty(rows, 3, dtype=i64, device=device)
     sel_raw = torch.empty(rows, 3, dtype=f32, device=device)

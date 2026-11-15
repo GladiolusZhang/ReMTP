@@ -1127,6 +1127,10 @@ def install_mimo_dynamic_tree() -> None:
     if os.getenv("REMTP_DYNAMIC_TREE_DEVICE_VERIFY", "0") == "1":
         print("[ReMTP][DynamicTree] device residual-hit verification: one host read, fixed randomness per round "
               "(changes samples, not the distribution)", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_VERIFY_FUSED", "0") == "1":
+        print("[ReMTP][DynamicTree] fused async verification: 4 Triton kernels per round", flush=True)
+    if os.getenv("REMTP_DYNAMIC_TREE_BATCHED_BRANCH_NOISE", "0") == "1":
+        print("[ReMTP][DynamicTree] batched branch noise: one generator per round (changes branch samples)", flush=True)
     if os.getenv("REMTP_DYNAMIC_TREE_ASYNC", "0") == "1":
         print("[ReMTP][DynamicTree] async scheduling: rounds stay on the device, fixed 9-slot capacity, "
               "padded slots masked", flush=True)
