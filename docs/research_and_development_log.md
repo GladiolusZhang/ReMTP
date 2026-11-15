@@ -3,6 +3,23 @@
 最后更新：2026-11-15（UTC+8）
 当前工作分支：`jetson-r39-residual-adapt`；上游研究分支：`research/residual-aligned-tree-mtp`
 
+## 2026-11-15（下午）：融合建树的小 kernel、KV 提交与拓扑缓存
+
+- 依据 4090 的分析：剩余差距主要是 GPU 建树每轮约 973 个小 kernel 的固定开销。Jetson 上用 CUDA event 确认：三层图重放每轮 3.8 ms。
+- 改动（输出逐 token 不变）：
+  - `remtp/gpu_tree_fused.py`：每层一个 Triton kernel 完成排序、阈值、兄弟规则、备选和保留，熵项也合成一个 kernel；求和、除法、min、topk 仍用 PyTorch，所有输出与原实现逐位相同；
+  - KV 提交缓存注意力层；
+  - `DynamicTreeTopology` 缓存。
+- 4090 运行说明新增 `ASYNC_SCHEDULING=1`，只用于基线；三种基线在 Jetson 上开异步后输出与同步逐 token 相同。
+- HumanEval-100 五组（同一时段）：
+  - AR 61/100、16.17 tok/s；
+  - Native 56/100、MAL 2.852、23.01；
+  - Cactus 55/100、3.092、24.85；
+  - RAVEN 主机建树 57/100、3.246、22.75（−8.5%）；
+  - RAVEN GPU 建树 + 融合 57/100、3.253、23.91（−3.8%）。
+- 融合版本与前一晚的 GPU 建树 100/100 题逐 token 相同。
+- 详见 `doc/RESULT-RAVEN-V4-TARGET-GATE-2026-11-13.md` 第 12 节。
+
 ## 2026-11-15（凌晨）：建树搬到 GPU（通宵试做）
 
 - 用户同意用一晚在 Jetson 上试做"把建树搬到 GPU"。只做第一步：根节点和各层的候选选择、保留、下一层输入准备都在 GPU 上完成，提议阶段只读回一次；验证仍在主机上，随机数流不变。
