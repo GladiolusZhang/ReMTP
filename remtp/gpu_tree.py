@@ -214,6 +214,14 @@ def _level(q: torch.Tensor, sampled: torch.Tensor, parent_valid: torch.Tensor, p
     return out
 
 
+def _level_impl():
+    """The fused Triton decision step (default) or the op-by-op reference."""
+    if os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED", "1") == "1":
+        from remtp.gpu_tree_fused import fused_level
+        return fused_level
+    return _level
+
+
 class _GraphedLevels:
     """Capture ``_level`` once per (depth, rows); replay with inputs copied into static buffers.
 
@@ -225,7 +233,8 @@ class _GraphedLevels:
         self.entries: dict[tuple[Any, ...], tuple[Any, dict[str, torch.Tensor], dict[str, torch.Tensor]]] = {}
 
     def __call__(self, inputs: dict[str, torch.Tensor], **options: Any) -> dict[str, torch.Tensor]:
-        key = (options["depth"], options["slots"], options["backup_budget"], tuple(inputs["q"].shape))
+        impl = _level_impl()
+        key = (impl.__name__, options["depth"], options["slots"], options["backup_budget"], tuple(inputs["q"].shape))
         entry = self.entries.get(key)
         if entry is None:
             static = {name: value.clone() for name, value in inputs.items()}
@@ -233,11 +242,11 @@ class _GraphedLevels:
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
                 for _ in range(2):
-                    _level(**static, **options)
+                    impl(**static, **options)
             torch.cuda.current_stream().wait_stream(side)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                outputs = _level(**static, **options)
+                outputs = impl(**static, **options)
             entry = (graph, static, outputs)
             self.entries[key] = entry
         graph, static, outputs = entry
@@ -253,7 +262,7 @@ _GRAPHS = _GraphedLevels()
 def run_level(inputs: dict[str, torch.Tensor], **options: Any) -> dict[str, torch.Tensor]:
     if os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD_GRAPHS", "1") == "1":
         return _GRAPHS(inputs, **options)
-    return _level(**inputs, **options)
+    return _level_impl()(**inputs, **options)
 
 
 def _split(outputs: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:

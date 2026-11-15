@@ -145,3 +145,51 @@ def test_graphed_levels_equal_eager_across_replays() -> None:
         for name in eager:
             assert torch.equal(eager[name], graphed[name]), (case, name)
     assert len(graphs.entries) == 1
+
+
+@pytest.mark.parametrize("rows,depth,slots", [(1, 1, 0), (3, 2, gpu_tree.D2), (4, 3, gpu_tree.D3)])
+def test_fused_level_bit_identical_to_reference(rows: int, depth: int, slots: int) -> None:
+    from remtp.gpu_tree_fused import fused_level
+
+    generator = torch.Generator(device=DEVICE).manual_seed(31 + rows)
+    rng = random.Random(rows)
+    config = _config()
+    choices = [4 * a + b for a in range(3) for b in range(3) if (a, b) != (0, 0)]
+    for case in range(60):
+        vocab = 151680 if case % 6 == 0 else 3000
+        q = _rows(generator, rows, vocab, case)
+        sampled = torch.multinomial(q, 1, generator=generator).flatten()
+        if case % 5 == 0:
+            sampled[0] = q[0].argmax()
+        codes = list(range(rows)) if depth <= 2 else [0] + sorted(rng.sample(choices, rows - 1))
+        inputs = dict(q=q, sampled=sampled,
+                      parent_valid=torch.arange(rows, device=DEVICE) < rng.randint(1, rows),
+                      parent_code=torch.tensor(codes, device=DEVICE),
+                      parent_logq=torch.tensor([math.log(rng.uniform(1e-5, 1.0)) for _ in range(rows)],
+                                               dtype=torch.float64, device=DEVICE),
+                      n_current=torch.tensor(rng.randint(1, 7), device=DEVICE))
+        options = dict(depth=depth, slots=slots, backup_budget=2, config=config)
+        reference = gpu_tree._level(**inputs, **options)
+        fused = fused_level(**inputs, **options)
+        assert reference.keys() == fused.keys(), (case, reference.keys() ^ fused.keys())
+        for name in reference:
+            assert reference[name].dtype == fused[name].dtype, (case, name)
+            assert torch.equal(reference[name], fused[name]), (case, name, reference[name], fused[name])
+
+
+def test_fused_level_inside_graphs() -> None:
+    generator = torch.Generator(device=DEVICE).manual_seed(41)
+    config = _config()
+    graphs = gpu_tree._GraphedLevels()
+    for case in range(10):
+        q = _rows(generator, 3, 151680, case)
+        inputs = dict(q=q, sampled=torch.multinomial(q, 1, generator=generator).flatten(),
+                      parent_valid=torch.arange(3, device=DEVICE) < 1 + case % 3,
+                      parent_code=torch.arange(3, device=DEVICE),
+                      parent_logq=torch.rand(3, dtype=torch.float64, device=DEVICE, generator=generator).log(),
+                      n_current=torch.tensor(1 + case % 3, device=DEVICE))
+        options = dict(depth=2, slots=gpu_tree.D2, backup_budget=2, config=config)
+        reference = gpu_tree._level(**inputs, **options)
+        graphed = graphs(inputs, **options)
+        for name in reference:
+            assert torch.equal(reference[name], graphed[name]), (case, name)

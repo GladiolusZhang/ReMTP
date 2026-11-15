@@ -85,6 +85,54 @@ def inplace_order_is_safe(pairs: list[tuple[int, int]]) -> bool:
     return True
 
 
+_MODULE_CACHE: dict[tuple[int, str], tuple[list[Any], list[torch.Tensor], int]] = {}
+
+
+def _attention_layers(runner: Any, kind: str) -> tuple[list[Any], list[torch.Tensor]]:
+    """Attention modules and their flattened KV views, found once per runner (2026-11-15).
+
+    The per-round scans of ``static_forward_context`` / ``drafter.model.modules()``
+    are replaced by a cache, revalidated against the first cache tensor's address.
+    """
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    key = (id(runner), kind)
+    entry = _MODULE_CACHE.get(key)
+    if entry is not None and entry[0] and entry[0][0].kv_cache[0].data_ptr() == entry[2]:
+        return entry[0], entry[1]
+    if kind == "target":
+        modules = [m for m in runner.compilation_config.static_forward_context.values() if isinstance(m, Attention)]
+    else:
+        modules = [m for m in runner.drafter.model.modules() if isinstance(m, Attention) and m.kv_cache]
+    flats = []
+    for module in modules:
+        cache = module.kv_cache[0]
+        if cache.numel() == 0:
+            continue
+        if cache.ndim < 3 or cache.shape[0] != 2:
+            raise RuntimeError(f"unexpected attention KV cache shape {tuple(cache.shape)}")
+        flats.append(cache.flatten(1, 2))
+    address = modules[0].kv_cache[0].data_ptr() if modules else 0
+    _MODULE_CACHE[key] = (modules, flats, address)
+    return modules, flats
+
+
+def _copy_moves(modules: list[Any], flats: list[torch.Tensor], pairs: list[tuple[int, int]]) -> int:
+    """``copy_cache_slots_inplace`` with precomputed flattened views."""
+    moves = [(source, destination) for source, destination in pairs if source != destination]
+    if not moves:
+        return 0
+    if not inplace_order_is_safe(moves):
+        return copy_cache_slots_fused(modules, moves)
+    moved = 0
+    for source, destination in moves:
+        sources = [flat[kv, source] for flat in flats for kv in range(2)]
+        destinations = [flat[kv, destination] for flat in flats for kv in range(2)]
+        torch._foreach_copy_(destinations, sources)
+        moved += len(sources)
+    return moved
+
+
 def copy_cache_slots_inplace(modules: Iterable[Any], pairs: list[tuple[int, int]]) -> int:
     """Move ``source -> destination`` slots without a scratch buffer.
 
@@ -125,11 +173,11 @@ def commit_selected_slots_inplace(runner: Any, selected: tuple[int, ...]) -> Non
 
     target_slots = _RUNTIME.target_slots.tolist()
     pairs = [(int(target_slots[index + 1]), int(target_slots[1 + offset])) for offset, index in enumerate(selected)]
-    modules = [m for m in runner.compilation_config.static_forward_context.values() if isinstance(m, Attention)]
-    copy_cache_slots_inplace(modules, pairs)
+    modules, flats = _attention_layers(runner, "target")
+    _copy_moves(modules, flats, pairs)
 
     if _RUNTIME.draft_slots is not None and hasattr(runner, "drafter"):
         draft_slots = _RUNTIME.draft_slots.tolist()
         draft_pairs = [(int(draft_slots[index]), int(draft_slots[offset])) for offset, index in enumerate(selected)]
-        draft_modules = [m for m in runner.drafter.model.modules() if isinstance(m, Attention) and m.kv_cache]
-        copy_cache_slots_inplace(draft_modules, draft_pairs)
+        draft_modules, draft_flats = _attention_layers(runner, "draft")
+        _copy_moves(draft_modules, draft_flats, draft_pairs)

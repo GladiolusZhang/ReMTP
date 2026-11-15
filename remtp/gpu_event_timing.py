@@ -82,6 +82,13 @@ def install_gpu_event_timing() -> None:
     MiMoMTP.forward = timed("mtp_forward", first_rows, MiMoMTP.forward)
     MiMoMTP.compute_logits = timed("mtp_lm_head", lambda a, k: a[1].shape[0], MiMoMTP.compute_logits)
 
+    # Device-side tree construction pieces (2026-11-15), wrapped where propose_tree looks them up.
+    from remtp import gpu_tree
+    gpu_tree.run_level = timed("tree_level", lambda a, k: a[0]["q"].shape[0], gpu_tree.run_level)
+    gpu_tree.branch_noise = timed("tree_branch_noise", lambda a, k: len(a[0]), gpu_tree.branch_noise)
+    gpu_tree.run_pass = timed("tree_pass_incl_mtp", lambda a, k: k["tokens"].shape[0], gpu_tree.run_pass)
+    gpu_tree.propose_tree = timed("tree_proposal_total", lambda a, k: 0, gpu_tree.propose_tree)
+
     original_execute = GPUModelRunner.execute_model
 
     @functools.wraps(original_execute)

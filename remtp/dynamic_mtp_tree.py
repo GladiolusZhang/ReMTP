@@ -13,6 +13,8 @@ starts from a target-produced anchor.
 
 from __future__ import annotations
 
+import functools
+
 from dataclasses import dataclass
 import math
 from typing import Any, Sequence
@@ -312,6 +314,9 @@ class CandidateSelection:
     sibling_added: bool
 
 
+_TOPOLOGY_CACHE: dict[tuple[Any, ...], "DynamicTreeTopology"] = {}
+
+
 @dataclass(frozen=True)
 class DynamicTreeTopology:
     name: str
@@ -324,6 +329,20 @@ class DynamicTreeTopology:
         *,
         name: str = "dynamic-mtp",
     ) -> "DynamicTreeTopology":
+        # Topologies are immutable: reuse the validated object for a repeated
+        # path set (2026-11-15; a D3/N9 tree has a few hundred distinct shapes).
+        key = (tuple(tuple(path) for path in paths), name)
+        cached = _TOPOLOGY_CACHE.get(key)
+        if cached is not None:
+            return cached
+        result = cls._build(key[0], name=name)
+        if len(_TOPOLOGY_CACHE) >= 8192:
+            _TOPOLOGY_CACHE.clear()
+        _TOPOLOGY_CACHE[key] = result
+        return result
+
+    @classmethod
+    def _build(cls, paths: Sequence[tuple[int, ...]], *, name: str) -> "DynamicTreeTopology":
         ordered = tuple(sorted((tuple(path) for path in paths), key=lambda p: (len(p), p)))
         if not ordered:
             raise ValueError("dynamic tree must contain at least one node")
@@ -365,32 +384,32 @@ class DynamicTreeTopology:
                 if self.nodes[node.parent].path != node.path[:-1]:
                     raise ValueError("dynamic parent/path relation is invalid")
 
-    @property
+    @functools.cached_property
     def choices(self) -> tuple[tuple[int, ...], ...]:
         return tuple(node.path for node in self.nodes)
 
-    @property
+    @functools.cached_property
     def roots(self) -> tuple[int, ...]:
         return self.children_of(None)
 
-    @property
+    @functools.cached_property
     def leaves(self) -> tuple[int, ...]:
         parents = {node.parent for node in self.nodes if node.parent is not None}
         return tuple(node.index for node in self.nodes if node.index not in parents)
 
-    @property
+    @functools.cached_property
     def node_count(self) -> int:
         return len(self.nodes)
 
-    @property
+    @functools.cached_property
     def max_depth(self) -> int:
         return max(node.depth for node in self.nodes)
 
-    @property
+    @functools.cached_property
     def node_position_offsets(self) -> tuple[int, ...]:
         return tuple(node.depth for node in self.nodes)
 
-    @property
+    @functools.cached_property
     def parent_logit_rows(self) -> tuple[int, ...]:
         return tuple(0 if node.parent is None else node.parent + 1 for node in self.nodes)
 

@@ -178,6 +178,9 @@ def start_server(arm: str, directory: Path):
         env["REMTP_DYNAMIC_TREE_GPU_BUILD"] = "1"
     if "gpucheck" in parts:
         env["REMTP_DYNAMIC_TREE_GPU_BUILD_CHECK"] = str(directory / "gpu_build_check.jsonl")
+    # "+unfused" (2026-11-15): device tree with the op-by-op decision step instead of the Triton one.
+    if "unfused" in parts:
+        env["REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED"] = "0"
     # "+prelaunch" (2026-11-15): trunk verification values queued before the first host read.
     if "prelaunch" in parts:
         env["REMTP_DYNAMIC_TREE_VERIFY_PRELAUNCH"] = "1"
