@@ -922,7 +922,12 @@ def _compact_selected_path(self: Any, output_token_ids: torch.Tensor, scheduler_
         return original(self, output_token_ids, scheduler_output)
     selected = _RUNTIME.selected_nodes
     commit_mode = os.getenv("REMTP_DYNAMIC_TREE_FAST_COMMIT", "0")
-    if selected and _RUNTIME.target_slots is not None and commit_mode == "2":
+    if selected and _RUNTIME.target_slots is not None and commit_mode == "3":
+        # Same slot moves as mode 2 in one Triton launch, indices on the device.
+        from remtp.raven_commit_kernel import commit_selected_slots_kernel
+
+        commit_selected_slots_kernel(self, selected)
+    elif selected and _RUNTIME.target_slots is not None and commit_mode == "2":
         # Same slot moves, one copy per layer and moved node, no scratch.
         from remtp.raven_fast_commit import commit_selected_slots_inplace
 
@@ -957,7 +962,7 @@ def _compact_selected_path(self: Any, output_token_ids: torch.Tensor, scheduler_
     # The correctness-reference path stores a complete compact conv/SSM state
     # at every node. Commit only the selected leaf into row zero.
     state_rows = _RUNTIME.target_gdn_state_rows or {}
-    if selected:
+    if selected and state_rows:  # no hybrid-state layers: nothing to scan
         assert _RUNTIME.selected_branch is not None
         for module in self.compilation_config.static_forward_context.values():
             prefix = getattr(module, "prefix", None)

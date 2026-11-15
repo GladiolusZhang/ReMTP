@@ -13,7 +13,8 @@
 # device-side tree construction.  ENGINE_OPT=0 runs everything eagerly.
 #
 # Override with environment variables: MODEL_PATH, QUANTIZATION, LOAD_FORMAT,
-# PORT, MAX_MODEL_LEN, GPU_MEMORY_UTILIZATION, ENGINE_OPT, SPIN_WAIT, GPU_BUILD.
+# PORT, MAX_MODEL_LEN, GPU_MEMORY_UTILIZATION, ENGINE_OPT, SPIN_WAIT, GPU_BUILD,
+# GPU_BUILD_FUSED (exact|fast), FAST_COMMIT (2|3).
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -115,7 +116,7 @@ case "$name" in
     # Overhead switches, all token-identical (see doc/PORTING-RAVEN-V4-2026-11-14.md).
     export REMTP_DYNAMIC_TREE_FAST_SELECT=1
     export REMTP_DYNAMIC_TREE_FAST_VERIFY=1
-    export REMTP_DYNAMIC_TREE_FAST_COMMIT=2
+    export REMTP_DYNAMIC_TREE_FAST_COMMIT="${FAST_COMMIT:-2}"   # 3: one-launch Triton commit (2026-11-15)
     export REMTP_DYNAMIC_TREE_FAST_METADATA=1
     export REMTP_DYNAMIC_TREE_SKIP_DEAD_DRAFT_KV=1
     export REMTP_DYNAMIC_TREE_BATCH_SELECT=1
@@ -123,6 +124,7 @@ case "$name" in
       export REMTP_TREE_CUDAGRAPH=1
       export REMTP_DYNAMIC_TREE_ASYNC_HOST=1
       export REMTP_DYNAMIC_TREE_GPU_BUILD="${GPU_BUILD:-1}"
+      export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-0}"   # exact|fast (2026-11-15)
       graph_config FULL "[1,2,3,4,5,6,7,8,9,10]"
     fi
     ;;

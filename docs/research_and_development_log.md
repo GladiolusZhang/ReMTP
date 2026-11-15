@@ -5089,3 +5089,55 @@ Python 帧归因。
   主机造成的额外 GPU 空闲只有约 0.4 ms。以上为测量结果；任何优化方案的收益尚未实测。
 
 限制：profile 只覆盖 10/3 题；profiler 下的空闲时间被放大，表中“GPU 空闲”行用无 profiler 的墙钟推算。
+
+### 2026-11-15：异步化第 1、2 阶段——单次启动的 KV 提交、融合建树决策、验证搬到 GPU
+
+状态：`代码已验证（GPU 单元测试 + HumanEval-100 端到端）；第 3 阶段（vLLM 异步调度）未开始`
+
+动机：4090 上 RAVEN 比 Cactus 每轮多约 2 ms，其中约 1.45 ms 是 GPU 建树/验证的小 kernel，约 0.4 ms 是
+主机造成的 GPU 空闲（见上一条）。用户同意按“先做同步模式下的前置条件，再接入 vLLM 异步调度”的顺序推进，
+并接受验证随机数改为固定消耗（分布不变、具体样本改变）。
+
+新增（全部默认关闭）：
+
+- `REMTP_DYNAMIC_TREE_FAST_COMMIT=3`（`remtp/raven_commit_kernel.py`）：一个 Triton kernel 在所有注意力层里
+  按顺序完成接受路径的 KV 槽位搬移，槽位下标留在 GPU；层表（基址、步长）每次 KV 分配只建一次。与模式 2 的
+  搬移完全相同；去掉了每轮扫描 `static_forward_context`、逐层 flatten/切片视图、读回目标槽位列表。
+  `_compact_selected_path` 在没有混合状态层时不再遍历所有模块。
+- `REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED=exact|fast`（`remtp/gpu_tree_fused.py`，接入 `gpu_tree.run_level`）：每层
+  “候选选择 + residual_coverage 保留”由约 250 个小 kernel 变为：行统计（`exact` 保持原逐行 torch 运算序列，
+  `fast` 用一个 Triton kernel）、一次批量 `topk`、一个 Triton kernel 完成稳定排序、阈值、兄弟规则、每父上限
+  与保留排序。浮点运算逐项对应（float32 `div_rn`、libdevice float64 exp/log、Python 侧同样方式构造的常量）。
+- `REMTP_DYNAMIC_TREE_DEVICE_VERIFY=1`（`remtp/device_verify.py`，接入 `_dynamic_verify_dispatch`）：
+  residual_hit_anchor 验证在 GPU 上完成、每轮一次读回。规则不变：v4-safe 额度（`adaptive_relaxation_max_ratio
+  <= 1` 时规划器等价于 floor 闭式，门槛位置为 0）、`_boost_known` 运算序列、float64 的 `u <= min(1, h/q)`、
+  首次拒绝从精确残差采修正、兄弟 token 命中则复用并接一个未松弛目标 token、全接受则接目标 bonus。
+  随机数改为每轮固定消耗：每个主干位置一个均匀数、每个可能的类别抽样一行指数噪声（argmax(p/E) 为精确类别
+  抽样），两次调用请求生成器。仅支持上述配置，其余返回 None 回退到原路径。
+- `scripts/serve_compare.sh`：`FAST_COMMIT`、`GPU_BUILD_FUSED` 可由环境变量覆盖，默认值不变。
+
+验证：
+
+- 新 GPU 单元测试 10 项：提交 kernel 与 `copy_cache_slots_inplace` 逐位相同（bf16/fp16/fp32、乱序槽位）；
+  融合层在 `exact` 模式下与 `gpu_tree._level` 全部输出逐位相同（vocab 3000 的 90 例、151680 的 24 例，含
+  bf16 并列、平顶并列、单一主导、双主导），`fast` 模式决策相同，CUDA graph 重放与 eager 相同；设备验证的
+  p、q、额度、验证概率与快速路径逐位相同，判定符合规则，3000 个种子下前两个输出 token 的分布与原路径一致
+  （TV 低于两独立样本的 3 倍期望），不支持的配置回退。完整 `pytest -q tests/` 713 项通过、1 项跳过。
+- HumanEval-100 端到端（输出上限 512，T=0.6，`ENGINE_OPT=1`，仅 RAVEN v4-safe，结果在本地
+  `results/stage1_*_20261115`、`results/stage2_devverify_20261115`）：
+
+| 配置 | 与原 RAVEN 输出逐 token 相同 | MAL | ms/轮 | decode tok/s |
+|---|---:|---:|---:|---:|
+| 原配置（同时段重跑） | 100/100 | 3.506 | 26.0 | 134.57 |
+| + 融合建树 `exact` + 提交模式 3 | 100/100 | 3.506 | 25.3 | 138.82 |
+| + 融合建树 `fast` + 提交模式 3 | 100/100 | 3.506 | 25.3 | 138.36 |
+| + 设备验证（`exact` + 模式 3） | — | 3.510 | 25.5 | 137.75 |
+
+- 第 1 阶段每轮省约 0.7 ms（+3.2%），输出 100/100 题逐 token 不变。CUDA event 计时：墙钟 26.35 → 25.51 ms，
+  模型 GPU 时间不变（22.74 ms）；建树在 graph 内的 kernel 由约 795 个/轮降到约 226 个/轮。
+- 设备验证改变具体样本，pass@1 60/100（原 57/100）、MAL 3.510，在噪声范围内；同步模式下没有提速（读回次数
+  从约 7 次/轮降到 1 次，但多了噪声行与残差行的计算），与 Jetson 上验证预发射的结论一致。它的作用是为第 3
+  阶段提供不依赖主机的验证。
+
+限制：`fast` 统计模式与 `exact` 速度无差别，保留 `exact` 为推荐值；第 3 阶段需要固定 9 节点容量、GPU 端的
+目标掩码/位置与验证输出、vLLM 异步调度接入，尚未实现。

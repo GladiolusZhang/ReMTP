@@ -987,6 +987,13 @@ def _dynamic_verify_dispatch(*args: Any, **kwargs: Any) -> Any:
                               if n.path == (0,) * n.depth) if repetition else frozenset()
         from remtp.decision_trace import active_trace
         trace = active_trace()
+        from remtp import device_verify
+        if device_verify.enabled() and trace is None:
+            # Same rule, one host read per round, fixed randomness (2026-11-15).
+            device_result = device_verify.residual_hit_tree_verify_device(
+                *args, **kwargs, config=config, protected_node_indices=protected)
+            if device_result is not None:
+                return device_result
         if os.getenv("REMTP_DYNAMIC_TREE_FAST_VERIFY", "0") == "1" and trace is None:
             from remtp.raven_fast_path import residual_hit_tree_verify_fast
             fast_result = residual_hit_tree_verify_fast(

@@ -221,11 +221,13 @@ class _GraphedLevels:
     same kernels on the same values as the eager call.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, fn: Any = None) -> None:
+        self.fn = _level if fn is None else fn
         self.entries: dict[tuple[Any, ...], tuple[Any, dict[str, torch.Tensor], dict[str, torch.Tensor]]] = {}
 
     def __call__(self, inputs: dict[str, torch.Tensor], **options: Any) -> dict[str, torch.Tensor]:
-        key = (options["depth"], options["slots"], options["backup_budget"], tuple(inputs["q"].shape))
+        key = (options["depth"], options["slots"], options["backup_budget"], options.get("mode"),
+               tuple(inputs["q"].shape))
         entry = self.entries.get(key)
         if entry is None:
             static = {name: value.clone() for name, value in inputs.items()}
@@ -233,11 +235,11 @@ class _GraphedLevels:
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
                 for _ in range(2):
-                    _level(**static, **options)
+                    self.fn(**static, **options)
             torch.cuda.current_stream().wait_stream(side)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                outputs = _level(**static, **options)
+                outputs = self.fn(**static, **options)
             entry = (graph, static, outputs)
             self.entries[key] = entry
         graph, static, outputs = entry
@@ -248,10 +250,23 @@ class _GraphedLevels:
 
 
 _GRAPHS = _GraphedLevels()
+_FUSED_GRAPHS: _GraphedLevels | None = None
 
 
 def run_level(inputs: dict[str, torch.Tensor], **options: Any) -> dict[str, torch.Tensor]:
-    if os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD_GRAPHS", "1") == "1":
+    global _FUSED_GRAPHS
+    from remtp import gpu_tree_fused as fused
+
+    graphs = os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD_GRAPHS", "1") == "1"
+    mode = fused.stats_mode()
+    if mode:
+        # REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED=exact|fast: same outputs, a few kernels.
+        if not graphs:
+            return fused.fused_level(**inputs, **options, mode=mode)
+        if _FUSED_GRAPHS is None:
+            _FUSED_GRAPHS = _GraphedLevels(fn=fused.fused_level)
+        return _FUSED_GRAPHS(inputs, **options, mode=mode)
+    if graphs:
         return _GRAPHS(inputs, **options)
     return _level(**inputs, **options)
 
