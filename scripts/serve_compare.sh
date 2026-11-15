@@ -30,7 +30,18 @@ export PORT="${PORT:-8000}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 export ENABLE_PREFIX_CACHING=0
-export NO_ASYNC_SCHEDULING=1
+# ASYNC_SCHEDULING=1 (2026-11-15): vLLM async scheduling, baselines only.  RAVEN's
+# tree, verification and KV commit are decided on the host between steps, so it
+# must run synchronously until verification moves to the GPU.
+if [[ "${ASYNC_SCHEDULING:-0}" == "1" ]]; then
+  if [[ "$name" == "raven" ]]; then
+    echo "ASYNC_SCHEDULING=1 is not supported for raven yet (host-side tree/verification); use it for target/native/cactus only" >&2
+    exit 2
+  fi
+  export NO_ASYNC_SCHEDULING=0
+else
+  export NO_ASYNC_SCHEDULING=1
+fi
 export FAST_MTP_NO_THINK="${FAST_MTP_NO_THINK:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export MTP_TOKENS=3
@@ -128,5 +139,5 @@ case "$name" in
     ;;
 esac
 
-echo "[ReMTP][Compare] method=$name model=$MODEL_PATH quantization=${QUANTIZATION:-none} engine_opt=$ENGINE_OPT port=$PORT"
+echo "[ReMTP][Compare] method=$name model=$MODEL_PATH quantization=${QUANTIZATION:-none} engine_opt=$ENGINE_OPT async_scheduling=$([[ $NO_ASYNC_SCHEDULING == 0 ]] && echo 1 || echo 0) port=$PORT"
 exec "$PROJECT_DIR/scripts/serve_fastmtp_verified.sh"
