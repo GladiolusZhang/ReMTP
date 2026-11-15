@@ -60,37 +60,46 @@ class DeviceTree:
     ready: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
-    def allocate(self, device: torch.device, vocabulary: int) -> None:
-        if self.tokens is not None and self.probs is not None and self.probs.shape[1] == vocabulary:
+    def allocate(self, device: torch.device, vocabulary: int, capacity: int = CAPACITY,
+                 sibling_width: int = 2) -> None:
+        if (self.tokens is not None and self.probs is not None and self.probs.shape[1] == vocabulary
+                and self.tokens.shape[0] == capacity and self.siblings.shape[1] == sibling_width):
             return
         i64 = torch.int64
-        self.tokens = torch.zeros(CAPACITY, dtype=i64, device=device)
-        self.probs = torch.zeros(CAPACITY, vocabulary, dtype=torch.float32, device=device)
-        self.valid = torch.zeros(CAPACITY, dtype=torch.bool, device=device)
-        self.depth = torch.ones(CAPACITY, dtype=i64, device=device)
-        self.parent = torch.full((CAPACITY,), -1, dtype=i64, device=device)
+        self.tokens = torch.zeros(capacity, dtype=i64, device=device)
+        self.probs = torch.zeros(capacity, vocabulary, dtype=torch.float32, device=device)
+        self.valid = torch.zeros(capacity, dtype=torch.bool, device=device)
+        self.depth = torch.ones(capacity, dtype=i64, device=device)
+        self.parent = torch.full((capacity,), -1, dtype=i64, device=device)
         self.trunk = torch.zeros(TRUNK, dtype=i64, device=device)
-        self.siblings = torch.full((TRUNK, 2), -1, dtype=i64, device=device)
+        self.siblings = torch.full((TRUNK, sibling_width), -1, dtype=i64, device=device)
         self.accepted = torch.zeros(TRUNK, dtype=i64, device=device)
         self.moves = torch.zeros((), dtype=i64, device=device)
         self.leaf_row = torch.zeros((), dtype=i64, device=device)
-        self.mask = torch.zeros(CAPACITY + 1, CAPACITY + 1, dtype=torch.float32, device=device)
-        self.bank = torch.zeros(CAPACITY, dtype=i64, device=device)
+        self.mask = torch.zeros(capacity + 1, capacity + 1, dtype=torch.float32, device=device)
+        self.bank = torch.zeros(capacity, dtype=i64, device=device)
 
 
 STATE = DeviceTree()
-_CAPACITY_TOPOLOGY: Any = None
+_CAPACITY_TOPOLOGIES: dict[int, Any] = {}
 
 
-def capacity_topology() -> Any:
-    """Host topology with 9 nodes; used only for counts and shapes in async mode."""
-    global _CAPACITY_TOPOLOGY
-    if _CAPACITY_TOPOLOGY is None:
+def capacity_topology(capacity: int = CAPACITY) -> Any:
+    """Host topology with ``capacity`` nodes; used only for counts and shapes in async mode."""
+    topology = _CAPACITY_TOPOLOGIES.get(capacity)
+    if topology is None:
         from remtp.dynamic_mtp_tree import DynamicTreeTopology
 
-        _CAPACITY_TOPOLOGY = DynamicTreeTopology.from_paths(
-            ((0,), (1,), (2,), (0, 0), (0, 1), (1, 0), (0, 0, 0), (0, 0, 1), (0, 1, 0)))
-    return _CAPACITY_TOPOLOGY
+        if capacity == CAPACITY:
+            paths = ((0,), (1,), (2,), (0, 0), (0, 1), (1, 0), (0, 0, 0), (0, 0, 1), (0, 1, 0))
+        else:   # caterpillar: trunk plus (capacity - 3) / 3 siblings per depth
+            j = (capacity - 3) // 3
+            if 3 + 3 * j != capacity:
+                raise ValueError(f"no capacity topology for {capacity} nodes")
+            paths = tuple([(0,)] + [(r,) for r in range(1, j + 1)] + [(0, 0)] + [(0, r) for r in range(1, j + 1)]
+                          + [(0, 0, 0)] + [(0, 0, r) for r in range(1, j + 1)])
+        topology = _CAPACITY_TOPOLOGIES[capacity] = DynamicTreeTopology.from_paths(paths)
+    return topology
 
 
 def tree_mask(valid: torch.Tensor, parent: torch.Tensor) -> torch.Tensor:
@@ -247,8 +256,8 @@ def write_target_mask(runner: Any) -> None:
 
 
 def set_target_positions(positions: torch.Tensor) -> None:
-    """positions[1:10] = positions[0] + depth, on the device."""
-    rows = CAPACITY + 1
+    """positions[1:N+1] = positions[0] + depth, on the device."""
+    rows = STATE.tokens.shape[0] + 1
     if positions.ndim == 1:
         positions[1:rows] = positions[0:1] + STATE.depth.to(positions.dtype)
     else:

@@ -14,7 +14,8 @@
 #
 # Override with environment variables: MODEL_PATH, QUANTIZATION, LOAD_FORMAT,
 # PORT, MAX_MODEL_LEN, GPU_MEMORY_UTILIZATION, ENGINE_OPT, SPIN_WAIT, GPU_BUILD,
-# GPU_BUILD_FUSED (exact|fast), FAST_COMMIT (2|3), ASYNC_SCHED (0|1).
+# GPU_BUILD_FUSED (exact|fast), FAST_COMMIT (2|3), ASYNC_SCHED (0|1),
+# TREE_KAPPA, TREE_TAU_MIN (sibling selection threshold).
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -94,8 +95,8 @@ case "$name" in
     export REMTP_DYNAMIC_TREE_MAX_NODES=9
     export REMTP_DYNAMIC_TREE_MAX_CHILDREN=3
     export REMTP_DYNAMIC_TREE_MIN_SIBLING_RATIO=0.01
-    export REMTP_DYNAMIC_TREE_TAU_MIN=0.001
-    export REMTP_DYNAMIC_TREE_KAPPA=1.5
+    export REMTP_DYNAMIC_TREE_TAU_MIN="${TREE_TAU_MIN:-0.001}"
+    export REMTP_DYNAMIC_TREE_KAPPA="${TREE_KAPPA:-1.5}"
     export REMTP_DYNAMIC_TREE_MU=0.5
     export REMTP_DYNAMIC_TREE_ETA=0.0
     export REMTP_DYNAMIC_TREE_ALLOCATION=residual_coverage
@@ -133,6 +134,11 @@ case "$name" in
       export REMTP_DYNAMIC_TREE_ASYNC_HOST=1
       export REMTP_DYNAMIC_TREE_GPU_BUILD="${GPU_BUILD:-1}"
       export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-0}"   # exact|fast (2026-11-15)
+      if [[ "$ASYNC_SCHED" == "1" && "${CATERPILLAR:-0}" != "0" ]]; then
+        # Experimental (2026-11-15): trunk + CATERPILLAR siblings per depth, capacity 3 + 3j.
+        export REMTP_DYNAMIC_TREE_CATERPILLAR="$CATERPILLAR"
+        export REMTP_DYNAMIC_TREE_MAX_NODES=$((3 + 3 * CATERPILLAR))
+      fi
       if [[ "$ASYNC_SCHED" == "1" ]]; then
         export REMTP_DYNAMIC_TREE_ASYNC=1 REMTP_DYNAMIC_TREE_DEVICE_VERIFY=1
         export REMTP_DYNAMIC_TREE_VERIFY_FUSED="${VERIFY_FUSED:-1}"
@@ -140,7 +146,8 @@ case "$name" in
         export REMTP_DYNAMIC_TREE_BATCHED_BRANCH_NOISE="${BATCHED_BRANCH_NOISE:-1}"
         export REMTP_DYNAMIC_TREE_FAST_COMMIT=3
       fi
-      graph_config FULL "[1,2,3,4,5,6,7,8,9,10]"
+      # Capture sizes 1..N+1 for the target tree (N = MAX_NODES).
+      graph_config FULL "[$(seq -s, 1 $((REMTP_DYNAMIC_TREE_MAX_NODES + 1)))]"
     fi
     ;;
 esac

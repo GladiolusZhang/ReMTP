@@ -546,6 +546,36 @@ def _prelaunch_trunk(topology: DynamicTreeTopology, trunk: list[int], ids: torch
     return dict(rows=rows, values=values, offsets=offsets)
 
 
+SIBLING_DIAG = os.getenv("REMTP_SIBLING_DIAG_JSONL", "")
+_DIAG_WIDTH = 16
+
+
+def _log_sibling_diagnostic(q_row: torch.Tensor, residual: torch.Tensor, trunk_token: int, correction: int,
+                            position: int, sibling_tokens: list[int]) -> None:
+    """Analysis only (REMTP_SIBLING_DIAG_JSONL): at a trunk rejection, the residual mass that the
+    j most draft-likely non-trunk tokens would cover (j = 1..16), i.e. the hit probability with j
+    siblings chosen by q, plus the correction's q-rank and the current siblings.  Adds host reads."""
+    import json
+
+    q = q_row.clone()
+    q[trunk_token] = -1.0
+    values, order = torch.topk(q, _DIAG_WIDTH)
+    mass = residual.index_select(0, order).cumsum(0)
+    rank = int((q > q[correction]).sum()) if correction != trunk_token else -1
+    record = {"depth": position, "siblings": len(sibling_tokens), "hit": correction in sibling_tokens,
+              "rank": rank, "mass": [round(float(x), 6) for x in mass.tolist()],
+              "q_top": [round(float(x), 6) for x in values.tolist()[:4]]}
+    with open(SIBLING_DIAG, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+
+
+def _log_round(first_reject: int | None) -> None:
+    import json
+
+    with open(SIBLING_DIAG, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"round": True, "reject_depth": first_reject}) + "\n")
+
+
 def residual_hit_tree_verify_fast(
     topology: DynamicTreeTopology,
     draft_token_ids: torch.Tensor,
@@ -723,6 +753,9 @@ def residual_hit_tree_verify_fast(
         return keep, correction, row
 
     def result(output, terminal, surviving, score):
+        if SIBLING_DIAG:
+            rejected = [statuses[n] == "REJECT" for n in trunk]
+            _log_round(rejected.index(True) + 1 if any(rejected) else None)
         return TreeVerifyResult(
             output_token_ids=tuple(ids_list[index] for index in accepted) + output,
             accepted_node_indices=tuple(accepted),
@@ -755,6 +788,9 @@ def residual_hit_tree_verify_fast(
             sibling for sibling in topology.children_of(topology.nodes[trunk_node].parent)
             if sibling != trunk_node
         )
+        if SIBLING_DIAG:
+            _log_sibling_diagnostic(draft[trunk_node], correction_probs, ids_list[trunk_node], correction,
+                                    position, [ids_list[s] for s in siblings])
         hit_node = next((sibling for sibling in siblings if ids_list[sibling] == correction), None)
         residual_values = (
             correction_probs[to_device([ids_list[s] for s in siblings], torch.int64, device)].tolist()

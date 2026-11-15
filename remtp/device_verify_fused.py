@@ -69,9 +69,10 @@ def _stats_partial(t_ptr, t_stride, d_ptr, d_stride, trunk_ptr, part_ptr, V, CHU
 
 @triton.jit
 def _trunk_scalars(t_ptr, t_stride, d_ptr, d_stride, tokens_ptr, trunk_ptr, part_ptr, consts_ptr, delta_ptr,
-                   stats_ptr, scal_ptr, NT: tl.constexpr, NR: tl.constexpr, S: tl.constexpr, GATE: tl.constexpr):
+                   stats_ptr, scal_ptr, NT: tl.constexpr, NR: tl.constexpr, S: tl.constexpr, GATE: tl.constexpr,
+                   RB: tl.constexpr):
     # totals and maxima of all rows (fixed order over splits)
-    r = tl.arange(0, 16)
+    r = tl.arange(0, RB)
     rm = r < NR
     s = tl.arange(0, S)
     sums = tl.load(part_ptr + (r[:, None] * S + s[None, :]) * 2 + 0, mask=rm[:, None], other=0.0)
@@ -220,7 +221,8 @@ def _reduce_argmax(part_ptr, row, which: tl.constexpr, S: tl.constexpr):
 
 @triton.jit
 def _decide(uniform_ptr, scal_ptr, part_ptr, tokens_ptr, trunk_ptr, siblings_ptr,
-            out_ptr, accepted_ptr, moves_ptr, leaf_ptr, W: tl.constexpr, WB: tl.constexpr, S: tl.constexpr):
+            out_ptr, accepted_ptr, moves_ptr, leaf_ptr, count_ptr, W: tl.constexpr, WB: tl.constexpr, S: tl.constexpr,
+            J: tl.constexpr, COUNT: tl.constexpr):
     k = tl.arange(0, 4)
     km = k < 3
     s = tl.arange(0, S)
@@ -236,11 +238,11 @@ def _decide(uniform_ptr, scal_ptr, part_ptr, tokens_ptr, trunk_ptr, siblings_ptr
     at = tl.minimum(first, 2)
     rsum = tl.sum(tl.load(part_ptr + (at * S + s) * 6 + 4), axis=0)
     correction = tl.where(rsum > 1e-30, _reduce_argmax(part_ptr, at, 0, S), _reduce_argmax(part_ptr, at, 2, S))
-    cand0 = tl.load(siblings_ptr + at * 2 + 0)
-    cand1 = tl.load(siblings_ptr + at * 2 + 1)
-    hit0 = (cand0 >= 0) & (tl.load(tokens_ptr + tl.maximum(cand0, 0)) == correction)
-    hit1 = (cand1 >= 0) & (tl.load(tokens_ptr + tl.maximum(cand1, 0)) == correction)
-    hit_node = tl.where(hit0, cand0, tl.where(hit1, cand1, -1))
+    hit_node = tl.full([], -1, dtype=tl.int64)
+    for t in tl.static_range(J):          # first sibling (topology order) whose token is the correction
+        cand = tl.load(siblings_ptr + at * J + t)
+        hit = (cand >= 0) & (tl.load(tokens_ptr + tl.maximum(cand, 0)) == correction) & (hit_node < 0)
+        hit_node = tl.where(hit, cand, hit_node)
     has_hit = (~full) & (hit_node >= 0)
     leaf_bonus = _reduce_argmax(part_ptr, 3 + tl.load(trunk_ptr + 2), 0, S)
     hit_anchor = _reduce_argmax(part_ptr, 3 + tl.maximum(hit_node, 0), 0, S)
@@ -258,6 +260,20 @@ def _decide(uniform_ptr, scal_ptr, part_ptr, tokens_ptr, trunk_ptr, siblings_ptr
     tl.store(moves_ptr, moves)
     leaf = tl.sum(tl.where(k == tl.maximum(moves - 1, 0), accepted, 0), axis=0)
     tl.store(leaf_ptr, tl.where(moves > 0, leaf + 1, 0))
+    if COUNT:
+        # [rounds, reached d1..d3, accepted d1..d3, hit d1..d3, siblings at the rejected depth, tokens]
+        n_sib = tl.zeros([], dtype=tl.int64)
+        for t in tl.static_range(J):
+            n_sib += (tl.load(siblings_ptr + at * J + t) >= 0).to(tl.int64)
+        tl.store(count_ptr + 0, tl.load(count_ptr + 0) + 1)
+        reached = km & (k <= first)
+        acc = km & (k < first)
+        hitk = km & (k == first) & has_hit
+        tl.store(count_ptr + 1 + k, tl.load(count_ptr + 1 + k, mask=km, other=0) + reached.to(tl.int64), mask=km)
+        tl.store(count_ptr + 4 + k, tl.load(count_ptr + 4 + k, mask=km, other=0) + acc.to(tl.int64), mask=km)
+        tl.store(count_ptr + 7 + k, tl.load(count_ptr + 7 + k, mask=km, other=0) + hitk.to(tl.int64), mask=km)
+        tl.store(count_ptr + 10, tl.load(count_ptr + 10) + tl.where(full, 0, n_sib))
+        tl.store(count_ptr + 11, tl.load(count_ptr + 11) + tl.sum((out >= 0).to(tl.int64), axis=0))
 
 
 _CONSTS: dict[Any, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -302,7 +318,7 @@ def verify_async_fused(state: Any, target_probs_by_input: torch.Tensor, output_w
     rows_t, vocabulary = target.shape
     count = state.tokens.shape[0]
     if rows_t != count + 1 or state.trunk.shape[0] != 3:
-        raise RuntimeError("fused async verification expects 10 target rows and a depth-3 trunk")
+        raise RuntimeError("fused async verification expects count + 1 target rows and a depth-3 trunk")
     uniforms = torch.rand(3, device=device, generator=generator)
     noise = torch.empty(3 + count, vocabulary, device=device, dtype=torch.float32)
     noise.exponential_(generator=generator)
@@ -314,13 +330,43 @@ def verify_async_fused(state: Any, target_probs_by_input: torch.Tensor, output_w
     consts, deltas = _constants(config, device)
     _trunk_scalars[(1,)](target, target.stride(0), draft, draft.stride(0), state.tokens, state.trunk,
                          buffers["stats_part"], consts, deltas, buffers["stats"], buffers["scalars"],
-                         NT=rows_t, NR=rows_t + 3, S=SPLITS, GATE=bool(config.target_support_gate), num_warps=4)
+                         NT=rows_t, NR=rows_t + 3, S=SPLITS, GATE=bool(config.target_support_gate),
+                         RB=triton.next_power_of_2(rows_t + 3), num_warps=4)
     _draw_partial[(3 + count, SPLITS)](target, target.stride(0), draft, draft.stride(0), noise, noise.stride(0),
                                        state.trunk, buffers["stats"], buffers["scalars"], buffers["draw_part"],
                                        vocabulary, chunk, S=SPLITS, BLOCK=BLOCK, num_warps=4)
     out = torch.empty(1, output_width, dtype=torch.int32, device=device)
+    counters = _counters(device)
     _decide[(1,)](uniforms, buffers["scalars"], buffers["draw_part"], state.tokens, state.trunk, state.siblings,
-                  out, state.accepted, state.moves, state.leaf_row, W=output_width,
-                  WB=triton.next_power_of_2(output_width), S=SPLITS, num_warps=1)
+                  out, state.accepted, state.moves, state.leaf_row,
+                  counters if counters is not None else state.moves, COUNT=counters is not None, W=output_width,
+                  WB=triton.next_power_of_2(output_width), S=SPLITS, J=int(state.siblings.shape[1]), num_warps=1)
     device_verify.STATS["rounds"] += 1
+    if counters is not None and device_verify.STATS["rounds"] % _STATS_EVERY == 0:
+        _flush_counters(counters)
     return out
+
+
+_STATS_PATH = os.getenv("REMTP_ASYNC_STATS_JSONL", "")
+_STATS_EVERY = int(os.getenv("REMTP_ASYNC_STATS_EVERY", "1000"))
+_COUNTERS: dict[str, torch.Tensor] = {}
+
+
+def _counters(device: torch.device) -> torch.Tensor | None:
+    """Analysis only (REMTP_ASYNC_STATS_JSONL): per-depth trunk outcomes accumulated on the device."""
+    if not _STATS_PATH:
+        return None
+    key = str(device)
+    if key not in _COUNTERS:
+        _COUNTERS[key] = torch.zeros(16, dtype=torch.int64, device=device)
+    return _COUNTERS[key]
+
+
+def _flush_counters(counters: torch.Tensor) -> None:
+    import json
+
+    values = counters.tolist()          # one host read every _STATS_EVERY rounds
+    record = {"rounds": values[0], "reached": values[1:4], "accepted": values[4:7], "hits": values[7:10],
+              "siblings_at_reject": values[10], "tokens": values[11]}
+    with open(_STATS_PATH, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")

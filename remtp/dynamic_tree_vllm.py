@@ -627,6 +627,11 @@ def _dynamic_propose_tree(
         raise ValueError(
             "sampled-primary tree modes need at least one node per trunk depth"
         )
+    from remtp import caterpillar
+    if caterpillar.enabled() and sampled_primary_mode:
+        return caterpillar.propose(
+            self, logits=logits, positions=positions, hidden_states=hidden_states,
+            common_attn_metadata=common_attn_metadata, sampling_metadata=sampling_metadata, config=config)
     if _GPU_BUILD and sampled_primary_mode:
         from remtp import raven_fast_path as fast
         temperature = fast.cached_temperature(sampling_metadata)
@@ -1105,7 +1110,15 @@ def install_mimo_dynamic_tree() -> None:
         print("[ReMTP][DynamicTree] dead draft KV skipped: no final tree rematerialization, no draft KV commit", flush=True)
     if os.getenv("REMTP_DYNAMIC_TREE_PATH_ORDERED_FIRST_PASS", "0") == "1":
         print("[ReMTP][DynamicTree] first MTP pass reordered to the accepted path (changes proposals)", flush=True)
-    if os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD", "0") == "1":
+    from remtp import caterpillar as _caterpillar
+    if _caterpillar.enabled():
+        if not (config.support_mode == "residual_hit_anchor" and config.max_depth == 3
+                and config.max_nodes == _caterpillar.capacity() and os.getenv("REMTP_DYNAMIC_TREE_ASYNC", "0") == "1"):
+            raise ValueError("REMTP_DYNAMIC_TREE_CATERPILLAR needs residual_hit_anchor, D=3, "
+                             "MAX_NODES=3+3j and REMTP_DYNAMIC_TREE_ASYNC=1")
+        print(f"[ReMTP][DynamicTree] caterpillar proposal: trunk + {_caterpillar.width()} siblings per depth "
+              f"(q >= tau_min), capacity {_caterpillar.capacity()}, no descendants of non-trunk nodes", flush=True)
+    elif os.getenv("REMTP_DYNAMIC_TREE_GPU_BUILD", "0") == "1":
         from remtp import gpu_tree
         ok, reason = gpu_tree.supported(config)
         if not ok:
