@@ -1,11 +1,11 @@
-"""The fused decision step equals gpu_tree._level (2026-11-15)."""
+"""The split-parallel decision step equals gpu_tree._level (2026-11-15)."""
 from __future__ import annotations
 
 import pytest
 import torch
 
 from remtp import gpu_tree
-from remtp import gpu_tree_fused as fused
+from remtp import gpu_tree_fused_split as fused
 from remtp.dynamic_mtp_tree import DynamicTreeConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

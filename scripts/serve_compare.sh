@@ -14,7 +14,7 @@
 #
 # Override with environment variables: MODEL_PATH, QUANTIZATION, LOAD_FORMAT,
 # PORT, MAX_MODEL_LEN, GPU_MEMORY_UTILIZATION, ENGINE_OPT, SPIN_WAIT, GPU_BUILD,
-# GPU_BUILD_FUSED (exact|fast), FAST_COMMIT (2|3), ASYNC_SCHED (0|1),
+# GPU_BUILD_FUSED (1|exact|fast|0), FAST_COMMIT (2|3), ASYNC_SCHED or ASYNC_SCHEDULING (0|1),
 # TREE_KAPPA, TREE_TAU_MIN (sibling selection threshold).
 set -euo pipefail
 
@@ -32,9 +32,10 @@ export PORT="${PORT:-8000}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 export ENABLE_PREFIX_CACHING=0
-# ASYNC_SCHED=1 (2026-11-15): vLLM async scheduling for every method, sync-free
-# draft sampling; RAVEN additionally keeps each round on the device.
-ASYNC_SCHED="${ASYNC_SCHED:-0}"
+# ASYNC_SCHED=1 (alias ASYNC_SCHEDULING=1; 2026-11-15/16): vLLM async scheduling for
+# every method with sync-free draft sampling.  RAVEN supports it since its tree,
+# verification and KV commit stay on the device (REMTP_DYNAMIC_TREE_ASYNC, set below).
+ASYNC_SCHED="${ASYNC_SCHED:-${ASYNC_SCHEDULING:-0}}"
 if [[ "$ASYNC_SCHED" == "1" ]]; then
   export NO_ASYNC_SCHEDULING=0
   export REMTP_SYNC_FREE_SAMPLING=1
@@ -133,7 +134,7 @@ case "$name" in
       export REMTP_TREE_CUDAGRAPH=1
       export REMTP_DYNAMIC_TREE_ASYNC_HOST=1
       export REMTP_DYNAMIC_TREE_GPU_BUILD="${GPU_BUILD:-1}"
-      export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-0}"   # exact|fast (2026-11-15)
+      export REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED="${GPU_BUILD_FUSED:-1}"   # 1 (default) | exact | fast | 0
       if [[ "$ASYNC_SCHED" == "1" && "${CATERPILLAR:-0}" != "0" ]]; then
         # Experimental (2026-11-15): trunk + CATERPILLAR siblings per depth, capacity 3 + 3j.
         export REMTP_DYNAMIC_TREE_CATERPILLAR="$CATERPILLAR"
@@ -152,5 +153,5 @@ case "$name" in
     ;;
 esac
 
-echo "[ReMTP][Compare] method=$name model=$MODEL_PATH quantization=${QUANTIZATION:-none} engine_opt=$ENGINE_OPT port=$PORT"
+echo "[ReMTP][Compare] method=$name model=$MODEL_PATH quantization=${QUANTIZATION:-none} engine_opt=$ENGINE_OPT async_scheduling=$([[ $NO_ASYNC_SCHEDULING == 0 ]] && echo 1 || echo 0) port=$PORT"
 exec "$PROJECT_DIR/scripts/serve_fastmtp_verified.sh"

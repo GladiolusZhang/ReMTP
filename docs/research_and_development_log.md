@@ -3,6 +3,23 @@
 最后更新：2026-11-15（UTC+8）
 当前工作分支：`jetson-r39-residual-adapt`；上游研究分支：`research/residual-aligned-tree-mtp`
 
+## 2026-11-15（下午）：融合建树的小 kernel、KV 提交与拓扑缓存
+
+- 依据 4090 的分析：剩余差距主要是 GPU 建树每轮约 973 个小 kernel 的固定开销。Jetson 上用 CUDA event 确认：三层图重放每轮 3.8 ms。
+- 改动（输出逐 token 不变）：
+  - `remtp/gpu_tree_fused.py`：每层一个 Triton kernel 完成排序、阈值、兄弟规则、备选和保留，熵项也合成一个 kernel；求和、除法、min、topk 仍用 PyTorch，所有输出与原实现逐位相同；
+  - KV 提交缓存注意力层；
+  - `DynamicTreeTopology` 缓存。
+- 4090 运行说明新增 `ASYNC_SCHEDULING=1`，只用于基线；三种基线在 Jetson 上开异步后输出与同步逐 token 相同。
+- HumanEval-100 五组（同一时段）：
+  - AR 61/100、16.17 tok/s；
+  - Native 56/100、MAL 2.852、23.01；
+  - Cactus 55/100、3.092、24.85；
+  - RAVEN 主机建树 57/100、3.246、22.75（−8.5%）；
+  - RAVEN GPU 建树 + 融合 57/100、3.253、23.91（−3.8%）。
+- 融合版本与前一晚的 GPU 建树 100/100 题逐 token 相同。
+- 详见 `doc/RESULT-RAVEN-V4-TARGET-GATE-2026-11-13.md` 第 12 节。
+
 ## 2026-11-15（凌晨）：建树搬到 GPU（通宵试做）
 
 - 用户同意用一晚在 Jetson 上试做"把建树搬到 GPU"。只做第一步：根节点和各层的候选选择、保留、下一层输入准备都在 GPU 上完成，提议阶段只读回一次；验证仍在主机上，随机数流不变。
@@ -5295,3 +5312,21 @@ kernel/轮）、建树约 0.79 ms（约 450 个 kernel/轮）。
 - 验证：CPU 下完整 `pytest -q tests/` 687 通过、42 跳过（GPU 测试跳过；上一提交时 GPU 下 729 通过）。GPU 冒烟
   （RAVEN、`ASYNC_SCHED=1`、三个数据集各 2 题、输出上限 2048）全流程通过，横幅显示 `tau_min=1e-06 kappa=50`；
   该次运行时另一用户的进程在同一 GPU 上，速度数据不采用。
+
+### 2026-11-16：合并远端 `jetson-r39-residual-adapt`（7b5c0c3、01c4e91、b4b42c2）
+
+状态：`已合并并验证（GPU 测试 + 运行冒烟）`
+
+远端在 ab82919 之后新增 3 个提交（Jetson 侧：基线可选异步调度、默认开启的融合建树决策步骤与 KV 提交/拓扑缓存、
+结果记录），与本地 6 个提交有重叠，以合并提交整合：
+
+- `remtp/gpu_tree_fused.py` 两边同名新增：保留远端版本（`REMTP_DYNAMIC_TREE_GPU_BUILD_FUSED=1`，默认，与 `_level`
+  逐位相同）；本地版本改名为 `remtp/gpu_tree_fused_split.py`，对应取值 `exact`/`fast`（异步模式默认 `fast`）。
+  `gpu_tree._level_impl` 按取值分发（`1`、`exact`、`fast`、`0`），`_GraphedLevels` 采用远端结构并把模式加入缓存键。
+- `scripts/serve_compare.sh`：远端的 `ASYNC_SCHEDULING`（仅基线、RAVEN 报错退出）与本地的 `ASYNC_SCHED` 合并为一个开关
+  （两个名字都可用）；RAVEN 不再拒绝，因为其树、验证和 KV 提交已可留在 GPU 上。非异步时 `GPU_BUILD_FUSED` 默认改为远端
+  的 `1`。`doc/RUN-ON-4090-2026-11-15.md` 中对应说明同步更新。
+- 远端的 `raven_fast_commit`（层缓存）、`DynamicTreeTopology` 缓存、`gpu_event_timing`、测试与文档按原样保留；开发日志
+  两边条目均保留（远端条目在文件开头）。
+- 验证：`pytest -q tests/` 737 通过、1 跳过（GPU 上）；RAVEN 冒烟（HumanEval 2 题）异步与同步两种配置均正常完成，
+  横幅显示 `tau_min=1e-06 kappa=50`、异步模式 `fast` 决策步骤。另一用户的进程当时在同一 GPU 上，冒烟速度不作结论。
