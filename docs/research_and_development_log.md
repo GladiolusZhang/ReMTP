@@ -5330,3 +5330,39 @@ kernel/轮）、建树约 0.79 ms（约 450 个 kernel/轮）。
   两边条目均保留（远端条目在文件开头）。
 - 验证：`pytest -q tests/` 737 通过、1 跳过（GPU 上）；RAVEN 冒烟（HumanEval 2 题）异步与同步两种配置均正常完成，
   横幅显示 `tau_min=1e-06 kappa=50`、异步模式 `fast` 决策步骤。另一用户的进程当时在同一 GPU 上，冒烟速度不作结论。
+
+### 2026-11-16：正式对比——AR / Native / Cactus / RAVEN，HumanEval、GSM8K、MBPP 各 50 题
+
+状态：`已验证（GPU 独占，各方法一次运行）`
+
+设置：RTX 4090，BF16 FastMTP，`ENGINE_OPT=1`，所有方法 `ASYNC_SCHED=1`（vLLM 异步调度；RAVEN 用设备端建树与验证、
+融合 kernel，默认兄弟阈值 κ=50、τ_min=1e-6），温度 0.6，生成种子 42（请求种子按题号派生），输出上限 2048，
+`MAX_MODEL_LEN=4096`，no-think 模板，tokenizer 默认 system。抽样：HumanEval 种子 20260802、GSM8K 20260730、MBPP（test
+split 11–510）20261116，各 50 题；HumanEval/MBPP 在受限 Docker 中判分，GSM8K 取末行 `####` 答案。命令：
+`DATASETS="humaneval gsm8k mbpp" SAMPLES=50 MAX_TOKENS=2048 ASYNC_SCHED=1 scripts/run_compare.sh`，结果在本地
+`results/formal_20261116`。运行期间按进程属主监控 GPU，没有其他用户的进程。
+
+| 数据集 | 方法 | 准确率 | MAL | ms/轮 | decode tok/s | 相对 AR | 截断 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| HumanEval | AR | 36/50 | — | 16.8 | 59.69 | 1.00× | 4 |
+| HumanEval | Native | 36/50 | 3.147 | 23.4 | 134.76 | 2.26× | 4 |
+| HumanEval | Cactus | 35/50 | 3.422 | 23.4 | 146.08 | 2.45× | 5 |
+| HumanEval | RAVEN | 35/50 | 3.539 | 23.6 | 149.81 | 2.51× | 3 |
+| GSM8K | AR | 44/50 | — | 16.9 | 59.32 | 1.00× | 6 |
+| GSM8K | Native | 46/50 | 3.103 | 23.4 | 133.04 | 2.24× | 5 |
+| GSM8K | Cactus | 46/50 | 3.458 | 23.5 | 147.49 | 2.49× | 6 |
+| GSM8K | RAVEN | 44/50 | 3.547 | 24.0 | 147.69 | 2.49× | 8 |
+| MBPP | AR | 24/50 | — | 17.0 | 58.89 | 1.00× | 5 |
+| MBPP | Native | 22/50 | 2.917 | 23.5 | 124.13 | 2.11× | 5 |
+| MBPP | Cactus | 22/50 | 3.316 | 23.7 | 140.26 | 2.38× | 6 |
+| MBPP | RAVEN | 21/50 | 3.403 | 24.2 | 140.78 | 2.39× | 7 |
+
+- MAL：RAVEN 比 Cactus 高 3.4%（HumanEval）、2.6%（GSM8K）、2.6%（MBPP）；每轮多 0.2–0.5 ms，decode 吞吐比 Cactus
+  高 2.6%、0.1%、0.4%。三种推测方法相对 AR 为 2.1–2.5×。
+- 准确率：150 题合计 AR 104、Native 104、Cactus 103、RAVEN 100。逐题配对：RAVEN 对而 Cactus 错 10 题、反之 13 题
+  （符号检验 p=0.68）；RAVEN 对 Native 13:17（p=0.58）；RAVEN 对 AR 10:14（p=0.54）；Cactus 对 AR 9:10（p=1.0）。
+  50 题单样本区分不了方法。
+- 截断：输出上限 2048 下仍有 3–8 题截断，GSM8K 上四种方法都有（AR 6 题），均为重复生成到上限；RAVEN 在 GSM8K
+  上 8 题截断，与其他方法的截断题部分重合（810、1004 等），输出 token 总数因此较多（31636 对 24176–26976）。
+- 过程说明：第一次运行时 GPU 监控按进程名判断“其他进程”，把本方的 vLLM（显示为 `VLLM::EngineCore`）误判为干扰，
+  12 次运行全部被删除重跑；改为按进程属主判断后重跑一次，即上表。被删除的那些运行期间实际没有其他用户的进程。
