@@ -5276,3 +5276,22 @@ kernel/轮）、建树约 0.79 ms（约 450 个 kernel/轮）。
 
 限制与下一步：毛毛虫 j=4 的额外开销主要来自目标侧 16 行的概率计算和每个节点一行的锚点噪声/argmax，可改为只算
 需要的行（主干父行、叶子行与命中兄弟行）和单行锚点抽样；未实现。各项改动都不是默认配置。
+
+### 2026-11-16：兄弟选择阈值改为默认 κ=50、τ_min=1e-6；多数据集对比脚本与 MBPP 运行器
+
+状态：`代码已验证（CPU 测试 + GPU 冒烟）；正式对比见下一条`
+
+- `scripts/serve_compare.sh`：RAVEN 的 `TREE_KAPPA` 默认 50、`TREE_TAU_MIN` 默认 1e-6（原 1.5、0.001），依据见 2026-11-15
+  的兄弟覆盖诊断与命中率计数；只改变提议哪几个兄弟，接受规则、松弛额度、树预算不变。
+- `remtp/mbpp_benchmark.py`、`remtp/mbpp_evaluator.py`（新）：MBPP test split（task 11–510）按种子抽样，提示给出任务
+  描述与三条官方断言，回复中的代码在受限 Docker 容器里与 setup 代码和断言一起执行（复用 HumanEval 的容器执行）。
+  数据用 `router_benchmark_download` 下载的固定版本（sha256 `ccf64ceae9c5…`，974 行）。`tests/test_mbpp_benchmark.py`
+  4 项通过。
+- `scripts/run_compare.sh`：`DATASETS`（humaneval、gsm8k、mbpp），每种方法一个服务跑完全部数据集，结果在
+  `$OUT/<method>/<dataset>`，每个数据集一张表（准确率或 pass@1、MAL、每轮秒、decode/E2E tok/s、输出 token、截断数、
+  相对 AR）；同一命令可续跑（已完成的数据集跳过，未完成的从 checkpoint 继续）。GSM8K 抽样种子 20260730，MBPP 20261116，
+  HumanEval 20260802。
+- `doc/RUN-ON-4090-2026-11-15.md` 增加第 8 节说明以上变化。
+- 验证：CPU 下完整 `pytest -q tests/` 687 通过、42 跳过（GPU 测试跳过；上一提交时 GPU 下 729 通过）。GPU 冒烟
+  （RAVEN、`ASYNC_SCHED=1`、三个数据集各 2 题、输出上限 2048）全流程通过，横幅显示 `tau_min=1e-06 kappa=50`；
+  该次运行时另一用户的进程在同一 GPU 上，速度数据不采用。

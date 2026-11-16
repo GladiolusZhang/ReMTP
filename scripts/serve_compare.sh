@@ -95,8 +95,8 @@ case "$name" in
     export REMTP_DYNAMIC_TREE_MAX_NODES=9
     export REMTP_DYNAMIC_TREE_MAX_CHILDREN=3
     export REMTP_DYNAMIC_TREE_MIN_SIBLING_RATIO=0.01
-    export REMTP_DYNAMIC_TREE_TAU_MIN="${TREE_TAU_MIN:-0.001}"
-    export REMTP_DYNAMIC_TREE_KAPPA="${TREE_KAPPA:-1.5}"
+    export REMTP_DYNAMIC_TREE_TAU_MIN="${TREE_TAU_MIN:-1e-6}"     # 2026-11-16 default (was 0.001)
+    export REMTP_DYNAMIC_TREE_KAPPA="${TREE_KAPPA:-50}"          # 2026-11-16 default (was 1.5): two siblings per depth
     export REMTP_DYNAMIC_TREE_MU=0.5
     export REMTP_DYNAMIC_TREE_ETA=0.0
     export REMTP_DYNAMIC_TREE_ALLOCATION=residual_coverage
